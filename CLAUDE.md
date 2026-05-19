@@ -23,7 +23,7 @@ module load cray-python/3.11.7
 source /lustrefs/disk/project/zz991000-zdeva/zz991021/venv/bin/activate
 ```
 
-All models are pre-downloaded to `SHARED/.hf_cache/`. Always set offline flags on compute nodes:
+All models are pre-downloaded to `SHARED/.hf_cache/` (bge-m3, bge-reranker-v2-m3, Qwen2.5-7B). Always set offline flags on compute nodes:
 ```bash
 export HF_HOME=/lustrefs/disk/project/zz991000-zdeva/zz991021/.hf_cache
 export HF_HUB_OFFLINE=1
@@ -36,15 +36,19 @@ SLURM logs go to `PROJECT/logs/`.
 
 **Submit inference jobs** (SLURM, run from PROJECT root):
 ```bash
-sbatch textsum/submit_lanta.sh        # baseline: Qwen2.5-7B + dense retrieval → textsum/result/
-sbatch textsum/submit_eval_train.sh   # baseline inference + score on train set
-sbatch exp02/submit_lanta.sh          # exp02: Qwen3-32B-AWQ + BM25/bge-m3 RRF → exp02/result/
-sbatch exp02/submit_eval_train.sh     # exp02 inference + score on train set
+sbatch textsum/submit_lanta.sh        # main pipeline: inference on test set → textsum/result/
+sbatch textsum/submit_eval_train.sh   # main pipeline: inference + score on train set
 ```
+Experiments live in `expNN/` directories with the same submit-script layout; see `IDEAS.md` for the roadmap.
 
 **Evaluate a submission locally** (requires GPU for bge-m3 SS-score):
 ```bash
 python3 textsum/eval_train/score.py textsum/eval_train/result/submission.csv
+```
+
+**Fast retrieval-only eval** (no LLM; run `sbatch eval_retrieval/submit_embed.sh` once first):
+```bash
+python3 eval_retrieval/eval.py
 ```
 
 **Build and push Docker image** (via GitHub Actions — manual trigger `workflow_dispatch`):
@@ -56,29 +60,34 @@ python3 textsum/eval_train/score.py textsum/eval_train/result/submission.csv
 
 ### Pipeline (two phases)
 
-1. **Retrieval**: For each query, find the top-K relevant paragraphs from the document referenced by `doc_id`.
-2. **Generation**: Pass retrieved paragraphs as context to an LLM; generate a Thai-language abstractive summary.
+1. **Retrieval**: For each query, build a candidate pool from the `doc_id` document (dense bge-m3 + BM25), rerank it with a cross-encoder (bge-reranker-v2-m3), and keep the top-K paragraph(s).
+2. **Generation**: Pass the retrieved paragraph(s) as context to an LLM (Qwen2.5-7B via vLLM); generate a Thai-language abstractive summary.
 
 ### Experiments
 
-| Path | Retrieval | LLM | Train score | Notes |
-|------|-----------|-----|-------------|-------|
-| `textsum/model/run.py` | Dense-only (bge-m3), TOP_K=1 | Qwen2.5-7B + vLLM | 0.5584 | Honest TOP_K=1; embed CPU |
-| `exp02/run.py` | BM25 + bge-m3 → RRF, TOP_K=1 | Qwen3-32B-AWQ + vLLM | 0.5487 | Extractive prompt; honest TOP_K=1 |
+`textsum/model/run.py` is the **main pipeline** — it currently runs the exp01 rerank pipeline (current best, 0.6148). Experiment history:
+
+| Experiment | Change | Train composite |
+|------------|--------|-----------------|
+| baseline | dense-only retrieval (bge-m3), TOP_K=1, Qwen2.5-7B | 0.5584 |
+| `exp01/` — rerank (E1) | + BM25 candidate pool + cross-encoder rerank | **0.6148** |
+| `exp02/` — E5 | + feed LLM top-5, self-citation drives `refs` | (pending) |
+
+See `IDEAS.md` for the full experiment roadmap and `eval_retrieval/` for the fast retrieval harness.
 
 **Score breakdown (train set):**
 
-| | textsum (TOP_K=1) | exp02 (TOP_K=1) |
+| | baseline (dense) | exp01 (rerank) |
 |--|--|--|
-| RougeL | 0.3387 | 0.3336 |
-| SS-score | 0.7667 | 0.7623 |
-| IoU | 0.4744 | 0.4445 |
-| **Composite** | **0.5584** | **0.5487** |
+| RougeL | 0.3387 | 0.3723 |
+| SS-score | 0.7667 | 0.8016 |
+| IoU | 0.4744 | 0.6190 |
+| **Composite** | **0.5584** | **0.6148** |
 
 **Key design decisions:**
+- Two-stage retrieval: dense (bge-m3) + BM25 build a candidate pool (top-20 each), a cross-encoder (bge-reranker-v2-m3) reranks it
 - `TOP_K=1`: retrieve, generate from, and report exactly 1 paragraph (honest IoU reporting)
-- Extractive prompt in exp02: removes "สรุป" to prevent paraphrasing; instructs model to copy verbatim
-- Embedding on CPU before loading vLLM (avoids CUDA fork/OOM issues)
+- bge-m3 embeds on CPU; the cross-encoder runs on GPU and is freed (`del` + `empty_cache`) before vLLM loads — avoids CUDA contention
 
 ### Data format
 

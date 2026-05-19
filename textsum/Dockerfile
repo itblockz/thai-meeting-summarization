@@ -13,7 +13,8 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 RUN python3 -c "\
 from huggingface_hub import snapshot_download; \
 snapshot_download('BAAI/bge-m3'); \
-snapshot_download('Qwen/Qwen2.5-7B-Instruct')"
+snapshot_download('Qwen/Qwen2.5-7B-Instruct'); \
+snapshot_download('BAAI/bge-reranker-v2-m3')"
 
 ENV HF_HOME=/root/.cache/huggingface \
     HF_HUB_OFFLINE=1 \

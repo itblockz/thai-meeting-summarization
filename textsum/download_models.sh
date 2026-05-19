@@ -21,4 +21,11 @@ snapshot_download('Qwen/Qwen2.5-7B-Instruct')
 print('Qwen2.5-7B done')
 "
 
+echo "Downloading BAAI/bge-reranker-v2-m3 (~2.3GB)..."
+python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download('BAAI/bge-reranker-v2-m3')
+print('bge-reranker-v2-m3 done')
+"
+
 echo "All models downloaded to $HF_HOME"
