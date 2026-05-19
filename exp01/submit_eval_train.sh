@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=exp02_eval
+#SBATCH --job-name=exp01_eval
 #SBATCH --partition=gpu
 #SBATCH --account=zz991021
 #SBATCH --nodes=1
@@ -8,8 +8,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=04:00:00
-#SBATCH --output=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047/logs/exp02_eval_%j.out
-#SBATCH --error=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047/logs/exp02_eval_%j.err
+#SBATCH --output=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047/logs/exp01_eval_%j.out
+#SBATCH --error=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047/logs/exp01_eval_%j.err
 
 PROJECT=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047
 SHARED=/lustrefs/disk/project/zz991000-zdeva/zz991021
@@ -19,7 +19,7 @@ module load cray-python/3.11.7
 source "$SHARED/venv/bin/activate"
 
 export TEST_DIR="$PROJECT/textsum/eval_train"
-export RESULT_DIR="$PROJECT/exp02/eval_result"
+export RESULT_DIR="$PROJECT/exp01/eval_result"
 export PROGRESS_LIB="$PROJECT/textsum/benchmark_lib/progress"
 
 export HF_HOME="$SHARED/.hf_cache"
@@ -30,9 +30,9 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 mkdir -p "$RESULT_DIR" "$PROJECT/logs"
 
-echo "=== exp02: inference on train set ==="
-cd "$PROJECT/exp02"
+echo "=== exp01: inference on train set ==="
+cd "$PROJECT/exp01"
 python3 run.py
 
-echo "=== exp02: scoring ==="
+echo "=== exp01: scoring ==="
 python3 "$PROJECT/textsum/eval_train/score.py" "$RESULT_DIR/submission.csv"
