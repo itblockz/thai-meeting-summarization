@@ -1,0 +1,1 @@
+echo "Environment variable DATASET_NAME=${DATASET_NAME} , Progress=$1"

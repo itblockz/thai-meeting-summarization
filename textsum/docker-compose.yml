@@ -1,0 +1,20 @@
+services:
+  model:
+    image: "mb"
+    build: .
+    platform: "linux/amd64"
+    volumes:
+      - ./data/iterdir:/model/test:ro
+      - ./result:/result:rw
+      - ./benchmark_lib:/benchmark_lib:ro
+      - ./model_cache:/root/.cache/huggingface:rw
+    working_dir: /model
+    environment:
+      DATASET_NAME: iterdir
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
