@@ -10,9 +10,11 @@ The score is a weighted composite: `0.45 × SS-score + 0.35 × RougeL + 0.20 × 
 
 ## Environment
 
-This runs on LANTA HPC (SLURM + Lustre). The project root is:
+This runs on LANTA HPC (SLURM + Lustre).
+
 ```
-/lustrefs/disk/project/zz991000-zdeva/zz991021
+PROJECT = /lustrefs/disk/project/zz991000-zdeva/zz991021/ua047   ← this repo
+SHARED  = /lustrefs/disk/project/zz991000-zdeva/zz991021          ← venv, .hf_cache (shared with ua048)
 ```
 
 Activate the shared venv before running anything:
@@ -21,33 +23,23 @@ module load cray-python/3.11.7
 source /lustrefs/disk/project/zz991000-zdeva/zz991021/venv/bin/activate
 ```
 
-All models are pre-downloaded to `.hf_cache/`. Always set offline flags when running on compute nodes:
+All models are pre-downloaded to `SHARED/.hf_cache/`. Always set offline flags on compute nodes:
 ```bash
-export HF_HOME=$PROJECT/.hf_cache
+export HF_HOME=/lustrefs/disk/project/zz991000-zdeva/zz991021/.hf_cache
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 ```
 
+SLURM logs go to `PROJECT/logs/`.
+
 ## Key commands
 
-**Set up venv from scratch** (run on login node, needs internet):
+**Submit inference jobs** (SLURM, run from PROJECT root):
 ```bash
-bash textsum/setup_env.sh
-```
-
-**Download models** (needs internet):
-```bash
-bash textsum/download_models.sh          # bge-m3 + Qwen2.5-7B-Instruct
-bash toey/exp01/download_models.sh       # bge-m3 + Qwen3-32B-AWQ
-```
-
-**Submit inference jobs** (SLURM):
-```bash
-sbatch textsum/submit_lanta.sh           # baseline: Qwen2.5-7B + dense retrieval
-sbatch toey/exp01/submit_lanta.sh        # exp01: Qwen3-32B-AWQ + BM25/bge-m3 RRF (BROKEN: cuda/12.6 module bug)
-sbatch exp02/submit_lanta.sh             # exp02: same as exp01 + extractive prompt + GEN_K=5/REF_K=1
-sbatch textsum/submit_eval_train.sh      # run baseline inference + score against train set
-sbatch exp02/submit_eval_train.sh        # run exp02 inference + score against train set
+sbatch textsum/submit_lanta.sh        # baseline: Qwen2.5-7B + dense retrieval → textsum/result/
+sbatch textsum/submit_eval_train.sh   # baseline inference + score on train set
+sbatch exp02/submit_lanta.sh          # exp02: Qwen3-32B-AWQ + BM25/bge-m3 RRF → exp02/result/
+sbatch exp02/submit_eval_train.sh     # exp02 inference + score on train set
 ```
 
 **Evaluate a submission locally** (requires GPU for bge-m3 SS-score):
@@ -57,12 +49,7 @@ python3 textsum/eval_train/score.py textsum/eval_train/result/submission.csv
 
 **Build and push Docker image** (via GitHub Actions — manual trigger `workflow_dispatch`):
 ```
-.github/workflows/build-push.yml → registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v2
-```
-
-**Run via Apptainer** (uses pre-built `.sif` image):
-```bash
-sbatch textsum/submit_apptainer.sh
+.github/workflows/build-push.yml → registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v3
 ```
 
 ## Architecture
@@ -74,21 +61,28 @@ sbatch textsum/submit_apptainer.sh
 
 ### Experiments
 
-| Path | Retrieval | LLM | Notes |
-|------|-----------|-----|-------|
-| `textsum/model/run.py` | Dense-only (bge-m3 cosine) | Qwen2.5-7B-Instruct | Baseline; score=0.530; HF `pipeline`, batch=4 |
-| `toey/exp01/run.py` | BM25 + bge-m3 → RRF, TOP_K=3 | Qwen3-32B-AWQ | BROKEN: `module load cuda/12.6` causes driver mismatch |
-| `exp02/run.py` | BM25 + bge-m3 → RRF, GEN_K=5/REF_K=1 | Qwen3-32B-AWQ | Extractive prompt; IoU-optimised refs; target score ~0.630 |
+| Path | Retrieval | LLM | Train score | Notes |
+|------|-----------|-----|-------------|-------|
+| `textsum/model/run.py` | Dense-only (bge-m3), TOP_K=1 | Qwen2.5-7B + vLLM | 0.5584 | Honest TOP_K=1; embed CPU |
+| `exp02/run.py` | BM25 + bge-m3 → RRF, TOP_K=1 | Qwen3-32B-AWQ + vLLM | 0.5487 | Extractive prompt; honest TOP_K=1 |
 
-**exp02 key changes vs exp01:**
-- `GEN_K=5`: passes 5 paragraphs to LLM (wider context for better RougeL)
-- `REF_K=1`: reports only top-1 as refs (58.7% of train queries have 1 gold ref → IoU improvement)
-- Extractive system prompt: removes "สรุป" which triggers paraphrasing; instructs model to copy words directly from source
-- CUDA fix: no `module load cuda/12.6` in SLURM script
+**Score breakdown (train set):**
+
+| | textsum (TOP_K=1) | exp02 (TOP_K=1) |
+|--|--|--|
+| RougeL | 0.3387 | 0.3336 |
+| SS-score | 0.7667 | 0.7623 |
+| IoU | 0.4744 | 0.4445 |
+| **Composite** | **0.5584** | **0.5487** |
+
+**Key design decisions:**
+- `TOP_K=1`: retrieve, generate from, and report exactly 1 paragraph (honest IoU reporting)
+- Extractive prompt in exp02: removes "สรุป" to prevent paraphrasing; instructs model to copy verbatim
+- Embedding on CPU before loading vLLM (avoids CUDA fork/OOM issues)
 
 ### Data format
 
-`dataset/train_set.json` and `model/test/test.json` share this schema:
+`textsum/eval_train/test.json` (symlink → train_set.json) and `textsum/model/test/test.json` share this schema:
 ```json
 {
   "docs":    [{ "doc_id": "...", "paragraphs": [{ "para_id": "...", "text": "..." }] }],
@@ -99,14 +93,12 @@ Train set additionally has `"abstractive"` and `"refs"` fields on each query (gr
 
 ### Evaluation metrics
 
-`textsum/eval_train/score.py` and `evaluate_sample/eval.py` implement:
+`textsum/eval_train/score.py` implements:
 - **RougeL**: Thai word-tokenized with `pythainlp` (`newmm` engine), then space-split for ROUGE
 - **SS-score**: Cosine similarity of bge-m3 embeddings between prediction and reference
 - **IoU**: Jaccard overlap between predicted `refs` para IDs and ground-truth `refs`
 
-The `textsum/eval_train/test.json` is a symlink to `train_set.json` so the same inference script works unchanged on the training set.
-
-### Environment variables (configure paths per run context)
+### Environment variables
 
 | Variable | Default (Docker) | LANTA override |
 |----------|-----------------|----------------|
