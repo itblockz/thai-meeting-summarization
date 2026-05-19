@@ -26,6 +26,7 @@ export HF_HOME="$SHARED/.hf_cache"
 export TRANSFORMERS_CACHE="$SHARED/.hf_cache"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 mkdir -p "$RESULT_DIR" "$PROJECT/logs"
 
