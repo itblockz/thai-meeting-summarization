@@ -3,7 +3,8 @@ Thai document summarization pipeline.
 
 Retrieval is two-stage: dense (bge-m3) + BM25 build a candidate pool, a
 cross-encoder (bge-reranker-v2-m3) re-scores it, the top-1 paragraph is
-kept. Generation: Qwen2.5-7B summarizes the retrieved paragraph via vLLM.
+kept. Generation: Qwen2.5-7B via transformers pipeline (not vLLM — the
+benchmark container fails on vLLM-based images for unknown reasons).
 Output: submission.csv with columns ID, abstractive, refs.
 """
 from pathlib import Path
@@ -18,19 +19,21 @@ import torch.nn.functional as F
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from rank_bm25 import BM25Okapi
 from pythainlp.tokenize import word_tokenize
-from vllm import LLM, SamplingParams
+from transformers import pipeline
 
 TEST_DIR     = os.environ.get("TEST_DIR",     "/model/test")
 RESULT_DIR   = os.environ.get("RESULT_DIR",   "/result/")
 PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
 
-TOP_K          = 1      # paragraphs retrieved, passed to LLM, and reported in refs
-POOL_N         = 20     # top-N from each stage-1 retriever before rerank
-EMBED_BATCH    = 64
-MAX_NEW_TOKENS = 512
-EMBED_MODEL    = "BAAI/bge-m3"
-RERANK_MODEL   = "BAAI/bge-reranker-v2-m3"
-MODEL_NAME     = os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+TOP_K              = 1
+POOL_N             = 20
+EMBED_BATCH        = 64
+GEN_BATCH          = 4
+GEN_MAX_NEW_TOKENS = 512
+EMBED_MODEL  = "BAAI/bge-m3"
+RERANK_MODEL = "BAAI/bge-reranker-v2-m3"
+MODEL_NAME   = os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 
 SYSTEM_MSG = (
     "คุณเป็นผู้ช่วยสรุปเอกสารภาษาไทย "
@@ -89,9 +92,9 @@ def main():
     n = len(queries)
     print(f"{n} queries, {len(doc_index)} docs", flush=True)
 
-    # ── Stage 1a: embed paragraphs + queries (CPU), build BM25 ────────────
-    embed_model = SentenceTransformer(EMBED_MODEL, device="cpu")
-    doc_para_data = {}   # doc_id -> (valid_paras, para_embs, bm25)
+    # ── Stage 1a: embed (GPU) + BM25 ──────────────────────────────────────
+    embed_model = SentenceTransformer(EMBED_MODEL, device=DEVICE)
+    doc_para_data = {}
     for doc_id, paragraphs in doc_index.items():
         valid = filter_valid_paragraphs(paragraphs)
         if valid:
@@ -104,10 +107,13 @@ def main():
 
     query_embs = encode_texts(embed_model, [q["query"] for q in queries])
     del embed_model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     print("Embeddings + BM25 done.", flush=True)
 
-    # ── Stage 1b: build candidate pools, collect (query, paragraph) pairs ──
-    pools = []                       # per query: list of para_id in the pool
+    # ── Stage 1b: build candidate pools ───────────────────────────────────
+    pools = []
     pair_texts, pair_qidx = [], []
     for i, query in enumerate(queries):
         valid, para_embs, bm25 = doc_para_data.get(
@@ -119,28 +125,27 @@ def main():
         dense_idx = torch.topk(sims, k=min(POOL_N, len(valid))).indices.tolist()
         bm25_scores = np.asarray(bm25.get_scores(tokenize_th(query["query"])))
         bm25_idx = np.argsort(-bm25_scores)[:POOL_N].tolist()
-        pool_idx = list(dict.fromkeys(dense_idx + bm25_idx))   # union, order-preserving
+        pool_idx = list(dict.fromkeys(dense_idx + bm25_idx))
         pools.append([valid[j]["para_id"] for j in pool_idx])
         for j in pool_idx:
             pair_texts.append((query["query"], valid[j]["text"]))
             pair_qidx.append(i)
 
     # ── Stage 1c: cross-encoder rerank (GPU) ──────────────────────────────
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    reranker = CrossEncoder(RERANK_MODEL, max_length=512, device=device)
+    reranker = CrossEncoder(RERANK_MODEL, max_length=512, device=DEVICE)
     pair_scores = reranker.predict(pair_texts, batch_size=64, show_progress_bar=False)
     del reranker
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    print(f"Reranked {len(pair_texts)} pairs ({device}).", flush=True)
+    print(f"Reranked {len(pair_texts)} pairs.", flush=True)
 
-    scores_by_q = {}                 # query index -> scores aligned with pools[i]
+    scores_by_q = {}
     for qi, s in zip(pair_qidx, pair_scores):
         scores_by_q.setdefault(qi, []).append(float(s))
 
     # ── assemble retrieval results + LLM messages ─────────────────────────
-    items = []                       # (ID, ref_ids, messages_or_None, query_text)
+    items = []
     for i, query in enumerate(queries):
         benchmark_lib(i)
         pool_pids = pools[i]
@@ -165,22 +170,46 @@ def main():
             messages = None
         items.append((query["ID"], ref_ids, messages, q_text))
 
-    # ── Stage 2: vLLM batch generation ────────────────────────────────────
-    llm = LLM(model=MODEL_NAME, max_model_len=4096, gpu_memory_utilization=0.90, dtype="half")
-    tokenizer = llm.get_tokenizer()
-    sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS, repetition_penalty=1.05)
+    # ── Stage 2: transformers pipeline batch generation ───────────────────
+    llm_pipe = pipeline(
+        "text-generation",
+        model=MODEL_NAME,
+        device_map="auto",
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    )
+    llm_pipe.tokenizer.pad_token_id = llm_pipe.tokenizer.eos_token_id
+    llm_pipe.tokenizer.padding_side = "left"
 
-    prompts = []
-    for it in items:
-        msgs = it[2] if it[2] is not None else [{"role": "user", "content": it[3]}]
-        prompts.append(tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True))
+    summaries = {}
+    has_ctx = [(i, it) for i, it in enumerate(items) if it[2] is not None]
+    no_ctx  = [(i, it) for i, it in enumerate(items) if it[2] is None]
 
-    outputs = llm.generate(prompts, sampling)
+    for i, it in no_ctx:
+        summaries[i] = it[3]
 
-    results = []
-    for it, out in zip(items, outputs):
-        summary = out.outputs[0].text.strip() or it[3]
-        results.append({"ID": it[0], "abstractive": summary, "refs": ",".join(it[1])})
+    for batch_start in range(0, len(has_ctx), GEN_BATCH):
+        batch = has_ctx[batch_start : batch_start + GEN_BATCH]
+        batch_msgs = [it[2] for _, it in batch]
+        outputs = llm_pipe(
+            batch_msgs,
+            max_new_tokens=GEN_MAX_NEW_TOKENS,
+            do_sample=False,
+            temperature=None,
+            top_p=None,
+            batch_size=GEN_BATCH,
+        )
+        for (orig_i, _), out in zip(batch, outputs):
+            generated = out[0]["generated_text"]
+            if isinstance(generated, list):
+                text = generated[-1]["content"].strip()
+            else:
+                text = str(generated).strip()
+            summaries[orig_i] = text or items[orig_i][3]
+
+    results = [
+        {"ID": it[0], "abstractive": summaries[i], "refs": ",".join(it[1])}
+        for i, it in enumerate(items)
+    ]
 
     out_path = Path(RESULT_DIR) / "submission.csv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -195,4 +224,4 @@ def main():
 
 if __name__ == "__main__":
     n = main()
-    benchmark_lib(n)  # must be last operation
+    benchmark_lib(n)

@@ -18,8 +18,7 @@ snapshot_download('BAAI/bge-reranker-v2-m3')"
 
 ENV HF_HOME=/root/.cache/huggingface \
     HF_HUB_OFFLINE=1 \
-    TRANSFORMERS_OFFLINE=1 \
-    VLLM_WORKER_MULTIPROC_METHOD=spawn
+    TRANSFORMERS_OFFLINE=1
 
 COPY model /model
 WORKDIR /model
