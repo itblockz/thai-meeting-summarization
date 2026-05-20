@@ -5,3 +5,6 @@ __pycache__/
 eval_result/
 result/
 logs/
+apptainer_tmp/
+textsum_*_result/
+eval_retrieval/cache/rerank_train_pool*.json

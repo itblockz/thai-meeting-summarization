@@ -7,3 +7,4 @@ protobuf>=3.20.0
 numpy>=1.24.0
 rank-bm25>=0.2.2
 pythainlp>=5.0.0
+tzdata>=2024.1

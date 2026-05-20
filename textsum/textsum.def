@@ -3,21 +3,24 @@ From: nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
 %files
     requirements.txt /requirements.txt
+    model /model
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update && apt-get install -y python3.11 python3-pip && rm -rf /var/lib/apt/lists/*
+    ln -sf /usr/bin/python3.11 /usr/bin/python3
+    pip3 install --no-cache-dir torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+    pip3 install --no-cache-dir -r /requirements.txt
+    python3 -c "from huggingface_hub import snapshot_download; \
+snapshot_download('BAAI/bge-m3'); \
+snapshot_download('Qwen/Qwen2.5-7B-Instruct'); \
+snapshot_download('BAAI/bge-reranker-v2-m3')"
 
 %environment
-    export DEBIAN_FRONTEND=noninteractive
+    export HF_HOME=/root/.cache/huggingface
     export HF_HUB_OFFLINE=1
     export TRANSFORMERS_OFFLINE=1
 
-%post
-    apt-get update && apt-get install -y python3.11 python3-pip && \
-        rm -rf /var/lib/apt/lists/*
-    ln -sf /usr/bin/python3.11 /usr/bin/python3
-
-    pip3 install --no-cache-dir \
-        torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
-
-    pip3 install --no-cache-dir -r /requirements.txt
-
 %runscript
-    exec python3 /model/run.py
+    cd /model
+    exec python3 run.py
