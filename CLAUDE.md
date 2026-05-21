@@ -23,7 +23,7 @@ module load cray-python/3.11.7
 source /lustrefs/disk/project/zz991000-zdeva/zz991021/venv/bin/activate
 ```
 
-All models are pre-downloaded to `SHARED/.hf_cache/` (bge-m3, bge-reranker-v2-m3, Qwen2.5-7B). Always set offline flags on compute nodes:
+All models are pre-downloaded to `SHARED/.hf_cache/` (bge-m3, bge-reranker-v2-m3, Qwen2.5-7B, Qwen3-32B-AWQ). Always set offline flags on compute nodes:
 ```bash
 export HF_HOME=/lustrefs/disk/project/zz991000-zdeva/zz991021/.hf_cache
 export HF_HUB_OFFLINE=1
@@ -53,31 +53,37 @@ python3 eval_retrieval/eval.py
 
 **Build and push Docker image** (via GitHub Actions — manual trigger `workflow_dispatch`):
 ```
-.github/workflows/build-push.yml → registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v6
+.github/workflows/build-push.yml → registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v8
 ```
 
-**Test a container image locally** (debug `Exit StatusCode 1` failures from benchmark):
+**Test a container image locally** (verify before pushing, or debug `Exit StatusCode 1`):
 ```bash
-# pull image to local SIF (interactive prompt for registry password)
+# A. build from .def on the login node (no internet on compute partitions)
+sbatch -t 1:00:00 -p compute --wrap "false"   # (placeholder; use the script below)
+# Actual local-build flow:
+PROJECT=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047
+export APPTAINER_TMPDIR=$PROJECT/apptainer_tmp APPTAINER_CACHEDIR=$PROJECT/apptainer_tmp/cache
 module load Apptainer/1.1.6
-APPTAINER_TMPDIR=$PROJECT/apptainer_tmp APPTAINER_CACHEDIR=$PROJECT/apptainer_tmp/cache \
-  apptainer pull --docker-login $PROJECT/textsum_v6.sif \
-  docker://registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v6
+cd $PROJECT/textsum
+nohup apptainer build --force $PROJECT/textsum_v8_local.sif textsum.def \
+  > $PROJECT/logs/v8_build.log 2>&1 & disown
+# ~30–40 min; pip downloads + HF snapshot_download (~25 GB embedded)
 
-# run via SLURM with GPU; --containall blocks default mounts so env matches Docker
-apptainer exec --nv --containall \
-  --bind $PROJECT/textsum/model/test:/model/test \
-  --bind /tmp/result:/result \
-  $PROJECT/textsum_v6.sif python3 /model/run.py
+# B. or pull a tag already pushed by CI
+apptainer pull --docker-login $PROJECT/textsum_v8.sif \
+  docker://registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v8
+
+# Run via SLURM with GPU; --containall mirrors what the benchmark backend gives:
+sbatch textsum/submit_apptainer_test_v8.sh   # only test-data, benchmark_lib, result binds
 ```
-Both `APPTAINER_TMPDIR` and `APPTAINER_CACHEDIR` MUST point at Lustre — `/tmp` on the login node is too small to unpack the image (~15 GB).
+Both `APPTAINER_TMPDIR` and `APPTAINER_CACHEDIR` MUST point at Lustre — `/tmp` on the login node is too small to unpack the image (~30 GB). Apptainer build must run on the **login node** (compute partitions have no internet to pull the base image / wheels).
 
 ## Architecture
 
 ### Pipeline (two phases)
 
 1. **Retrieval**: For each query, build a candidate pool from the `doc_id` document (dense bge-m3 + BM25, top-20 each), rerank it with a cross-encoder (bge-reranker-v2-m3), and keep the top-K paragraph(s).
-2. **Generation**: Pass the retrieved paragraph(s) as context to an LLM, which produces a Thai-language abstractive summary. The LANTA experiments use vLLM (Qwen3-32B-AWQ); the Docker pipeline at `textsum/model/run.py` uses `transformers.pipeline` (see "Docker container issues" below).
+2. **Generation**: Pass the retrieved paragraph(s) as context to vLLM running Qwen3-32B-AWQ; it produces a Thai-language abstractive summary. The Docker pipeline (`textsum/model/run.py`) is now equivalent to exp03 — same retrieval + same LLM — and additionally passes `enforce_eager=True` to skip the V1-engine torch.compile path, which crashes silently inside Apptainer/Docker containers on vllm 0.9.2 (see "Docker container issues").
 
 ### Experiments
 
@@ -92,7 +98,7 @@ LANTA experiment history (train-set composite, ↑ better):
 | `exp04/` — E9 model swap | exp03 retrieval + Typhoon2.1-Gemma3-12B | 0.6248 |
 | `exp05/` — E10 prompt | exp03 + direct-QA prompt rewrite | 0.6216 *(failed)* |
 
-**Current best**: `exp03/` (Qwen3-32B-AWQ + rerank). The Docker submission pipeline (`textsum/model/run.py`) is NOT exp03 — it still runs the exp01 setup (Qwen2.5-7B + rerank) because the Docker image is currently broken; see "Docker container issues".
+**Current best**: `exp03/` (Qwen3-32B-AWQ + rerank). The Docker submission pipeline (`textsum/model/run.py`) now matches exp03 (vLLM + Qwen3-32B-AWQ + rerank) as of image tag v8; the only intentional drift is `enforce_eager=True` (see "Docker container issues").
 
 See `IDEAS.md` for the full experiment roadmap and `eval_retrieval/` for the fast retrieval harness.
 
@@ -130,16 +136,26 @@ See `IDEAS.md` for the full experiment roadmap and `eval_retrieval/` for the fas
 
 ### Docker container issues
 
-`textsum/model/run.py` runs end-to-end in LANTA SLURM but the corresponding Docker images fail in the competition benchmark backend with `Exit StatusCode 1` (no logs returned). Status:
+History of `Exit StatusCode 1` in the benchmark backend (now resolved at v8):
 
-| Tag | Changes vs previous working version | Benchmark result |
-|-----|-------------------------------------|------------------|
-| v3 (in parent repo, predates this dir) | dense-only, `transformers.pipeline` LLM | ✅ ran |
+| Tag | Changes vs previous | Benchmark / local Apptainer |
+|-----|---------------------|----------------------------|
+| v3 (parent repo) | dense-only, `transformers.pipeline` LLM | ✅ ran |
 | v4 | + rerank pipeline, switched LLM to vLLM | ❌ exit 1 |
 | v5 | v4 + `VLLM_WORKER_MULTIPROC_METHOD=spawn` env | ❌ exit 1 |
-| v6 | reverted LLM back to `transformers.pipeline`; rerank pipeline kept | ❌ exit 1 |
+| v6 | reverted LLM to `transformers.pipeline`; rerank kept | ❌ exit 1 |
+| v7 | v6 + `tzdata` in requirements (pythainlp needed it) | ✅ local Apptainer |
+| v8 | back to vLLM + Qwen3-32B-AWQ; five gotchas pinned | ✅ local Apptainer |
 
-v6 reproduces the v3 LLM pattern but still fails, so the regression is in something the rerank pipeline adds: `rank_bm25`, `pythainlp`, `CrossEncoder` + `bge-reranker-v2-m3`, or the larger image footprint. Debugging is now via Apptainer locally (see "Test a container image locally" above) so we can see the actual error instead of blindly bumping tags.
+**v8 = the five gotchas** (each one alone leaves the container in `Engine core initialization failed. Failed core proc(s): {}` — an empty dict because the worker dies before its first heartbeat):
+
+1. `vllm==0.9.2` pinned in `requirements.txt`. Loose `vllm>=0.6.0` made pip backtrack through ~7 wheels (each ~500 MB) to satisfy `torch==2.6.0`, eventually timing out on PyPI.
+2. `transformers==4.52.4` pinned. transformers ≥ 4.55 has `aimv2` as a built-in config; vllm 0.9.2's `OvisConfig` re-registers it and raises `ValueError: 'aimv2' is already used`.
+3. `python3.11-dev` added to `apt-get install`. Triton runtime-compiles a C extension and gcc errors `fatal error: Python.h: No such file or directory` because the base image is `nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04` (runtime, no headers).
+4. `enforce_eager=True` in the `LLM(...)` call. vllm 0.9.2's V1 engine torch.compile / Inductor path SIGKILLs the worker mid-compile inside Apptainer (Dynamo bytecode transform completes, FixFunctionalizationPass starts, then silent exit). vllm 0.19.1 on the LANTA shared venv has no such issue, but that needs torch 2.10 + cu128 — out of scope for the current base image. Eager mode costs ~0 latency on this workload (50 short prompts, ~15 s total).
+5. `--timeout 300 --retries 5` on pip install. Login-node PyPI fetches are flaky enough that a default-timeout retry will fail the whole build at the very end.
+
+Build locally via `nohup apptainer build … textsum.def` on the **login node** (compute partitions have no internet). Test with `sbatch textsum/submit_apptainer_test_v8.sh` which uses only the binds the benchmark provides (test-data, benchmark_lib, result) — no overlay tricks, so a pass confirms the SIF is self-contained.
 
 ### Data format
 
@@ -166,7 +182,7 @@ Train set additionally has `"abstractive"` and `"refs"` fields on each query (gr
 | `TEST_DIR` | `/model/test` | `$PROJECT/textsum/model/test` |
 | `RESULT_DIR` | `/result` | `$PROJECT/textsum/result` |
 | `PROGRESS_LIB` | `/benchmark_lib/progress` | `$PROJECT/textsum/benchmark_lib/progress` |
-| `LLM_MODEL` | `Qwen/Qwen2.5-7B-Instruct` | set to override |
+| `LLM_MODEL` | `Qwen/Qwen3-32B-AWQ` | set to override |
 | `VLLM_WORKER_MULTIPROC_METHOD` | (unset) | `spawn` — required when CrossEncoder touches CUDA before vLLM |
 
 ### Progress reporting
