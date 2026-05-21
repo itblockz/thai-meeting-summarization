@@ -39,3 +39,22 @@ def rrf_fuse(ranked_lists: list, k: int = 60) -> list:
 def rank_rerank(scored_pool: list) -> list:
     """Rank a cross-encoder-scored pool. scored_pool: list of (para_id, score)."""
     return [pid for pid, _ in sorted(scored_pool, key=lambda x: -x[1])]
+
+
+def colbert_score(q_vecs: np.ndarray, p_vecs: np.ndarray) -> float:
+    """MaxSim: for each query token, take max similarity over paragraph tokens, sum.
+
+    Assumes q_vecs and p_vecs are L2-normalized (bge-m3 returns them so).
+    """
+    if q_vecs.size == 0 or p_vecs.size == 0:
+        return 0.0
+    sim = q_vecs.astype(np.float32) @ p_vecs.astype(np.float32).T
+    return float(sim.max(axis=1).sum())
+
+
+def rank_colbert(q_vecs: np.ndarray, para_vecs_list: list, para_ids: list) -> list:
+    """Late-interaction (ColBERT-style) ranking from per-token embeddings."""
+    if not para_ids:
+        return []
+    scores = np.array([colbert_score(q_vecs, p) for p in para_vecs_list])
+    return [para_ids[i] for i in np.argsort(-scores)]
