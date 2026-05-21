@@ -53,7 +53,7 @@ python3 eval_retrieval/eval.py
 
 **Build and push Docker image** (via GitHub Actions — manual trigger `workflow_dispatch`):
 ```
-.github/workflows/build-push.yml → registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v8
+.github/workflows/build-push.yml → registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v9
 ```
 
 **Test a container image locally** (verify before pushing, or debug `Exit StatusCode 1`):
@@ -70,8 +70,8 @@ nohup apptainer build --force $PROJECT/textsum_v8_local.sif textsum.def \
 # ~30–40 min; pip downloads + HF snapshot_download (~25 GB embedded)
 
 # B. or pull a tag already pushed by CI
-apptainer pull --docker-login $PROJECT/textsum_v8.sif \
-  docker://registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v8
+apptainer pull --docker-login $PROJECT/textsum_v9.sif \
+  docker://registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v9
 
 # Run via SLURM with GPU; --containall mirrors what the benchmark backend gives:
 sbatch textsum/submit_apptainer_test_v8.sh   # only test-data, benchmark_lib, result binds
@@ -143,7 +143,7 @@ See `IDEAS.md` for the full experiment roadmap and `eval_retrieval/` for the fas
 
 ### Docker container issues
 
-History of `Exit StatusCode 1` in the benchmark backend (now resolved at v8):
+History of `Exit StatusCode 1` in the benchmark backend (resolved at v8; v9 = perf):
 
 | Tag | Changes vs previous | Benchmark / local Apptainer |
 |-----|---------------------|----------------------------|
@@ -152,7 +152,8 @@ History of `Exit StatusCode 1` in the benchmark backend (now resolved at v8):
 | v5 | v4 + `VLLM_WORKER_MULTIPROC_METHOD=spawn` env | ❌ exit 1 |
 | v6 | reverted LLM to `transformers.pipeline`; rerank kept | ❌ exit 1 |
 | v7 | v6 + `tzdata` in requirements (pythainlp needed it) | ✅ local Apptainer |
-| v8 | back to vLLM + Qwen3-32B-AWQ; five gotchas pinned | ✅ local Apptainer |
+| v8 | back to vLLM + Qwen3-32B-AWQ; five gotchas pinned | ✅ local Apptainer (4:48) |
+| v9 | bge-m3 encoding moved from CPU to GPU | ✅ local Apptainer (2:57, −39%) |
 
 **v8 = the five gotchas** (each one alone leaves the container in `Engine core initialization failed. Failed core proc(s): {}` — an empty dict because the worker dies before its first heartbeat):
 
