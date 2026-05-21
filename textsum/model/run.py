@@ -89,9 +89,11 @@ def main():
     n = len(queries)
     print(f"{n} queries, {len(doc_index)} docs", flush=True)
 
-    # ── Stage 1a: embed paragraphs + queries (CPU), build BM25 ────────────
-    # CPU so CUDA isn't initialized before vLLM spawns its workers.
-    embed_model = SentenceTransformer(EMBED_MODEL, device="cpu")
+    # ── Stage 1a: embed paragraphs + queries (GPU), build BM25 ────────────
+    # vLLM uses spawn (VLLM_WORKER_MULTIPROC_METHOD), so we may touch CUDA
+    # in the parent without forking corrupted contexts into vLLM workers.
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    embed_model = SentenceTransformer(EMBED_MODEL, device=device)
     doc_para_data = {}   # doc_id -> (valid_paras, para_embs, bm25)
     for doc_id, paragraphs in doc_index.items():
         valid = filter_valid_paragraphs(paragraphs)
@@ -105,7 +107,10 @@ def main():
 
     query_embs = encode_texts(embed_model, [q["query"] for q in queries])
     del embed_model
-    print("Embeddings + BM25 done.", flush=True)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    print(f"Embeddings + BM25 done ({device}).", flush=True)
 
     # ── Stage 1b: build candidate pools, collect (query, paragraph) pairs ──
     pools = []
@@ -127,7 +132,6 @@ def main():
             pair_qidx.append(i)
 
     # ── Stage 1c: cross-encoder rerank (GPU) ──────────────────────────────
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     reranker = CrossEncoder(RERANK_MODEL, max_length=512, device=device)
     pair_scores = reranker.predict(pair_texts, batch_size=64, show_progress_bar=False)
     del reranker
