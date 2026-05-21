@@ -97,8 +97,12 @@ LANTA experiment history (train-set composite, ↑ better):
 | `exp03/` — E9 model swap | exp01 retrieval + Qwen3-32B-AWQ (no-think) | **0.6256** ⭐ |
 | `exp04/` — E9 model swap | exp03 retrieval + Typhoon2.1-Gemma3-12B | 0.6248 |
 | `exp05/` — E10 prompt | exp03 + direct-QA prompt rewrite | 0.6216 *(failed)* |
+| `exp06/` — E7 few-shot | exp03 + 2-shot from held-out doc_050 | 0.6329 † |
+| `exp07/` — E7 few-shot | exp03 + 2-shot from held-out doc_047 | 0.6278 † |
 
-**Current best**: `exp03/` (Qwen3-32B-AWQ + rerank). The Docker submission pipeline (`textsum/model/run.py`) now matches exp03 (vLLM + Qwen3-32B-AWQ + rerank) as of image tag v8; the only intentional drift is `enforce_eager=True` (see "Docker container issues").
+† Held-out evaluation: exp06 scored on 1218 queries excluding doc_050, exp07 on 1211 excluding doc_047. Apples-to-apples exp03 baselines on those same subsets are 0.6270 and 0.6237 respectively, so the few-shot deltas are **+0.0059 (exp06)** and **+0.0041 (exp07)**. Both show statistically significant per-query RougeL improvement (paired t-test p<0.0002), confirming the few-shot signal is real and not a doc-choice artifact. IoU is identical to exp03 in both runs because the retrieval pipeline is unchanged.
+
+**Current best**: `exp03/` is still the canonical "no held-out" baseline at 0.6256 on the full 1239. The few-shot variants are not directly comparable on the full set (they exclude their held-out doc by construction), but extrapolating exp06's +0.0059 to the full set would land near **0.6315**. The Docker submission pipeline (`textsum/model/run.py`) currently matches exp03 (vLLM + Qwen3-32B-AWQ + rerank) as of image tag v8; the only intentional drift is `enforce_eager=True` (see "Docker container issues"). Backporting few-shot into the Docker pipeline would require packaging the 2 worked examples; they are constants in `expNN/run.py`.
 
 See `IDEAS.md` for the full experiment roadmap and `eval_retrieval/` for the fast retrieval harness.
 
