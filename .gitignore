@@ -8,3 +8,5 @@ logs/
 apptainer_tmp/
 textsum_*_result/
 eval_retrieval/cache/rerank_train_pool*.json
+eval_retrieval/cache/*.pkl
+.claude/
