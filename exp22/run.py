@@ -22,6 +22,11 @@ Because the few-shot pair is exactly exp08's, exp22 vs exp08 (both
 held out on doc_050, scored on the same 1218) is a clean E5-vs-TOP_K=1
 comparison. Score the full 1239 with score.py for the headline number
 and score_heldout.py for the leak-free 1218 number.
+
+Parser fix vs exp19/exp20/exp21: split_answer_citation and parse_citation
+now handle [อ้างอิง...] tags emitted inline (one per item in multi-part
+answers), not only a single trailing tag. The old rfind/re.search logic
+leaked earlier inline tags into abstractive and under-counted refs.
 """
 from pathlib import Path
 import os
@@ -146,22 +151,34 @@ def build_messages(query, paras):
 
 
 def parse_citation(text, n_paras):
-    """Extract 0-indexed paragraph indices from the LLM citation tag."""
-    m = re.search(r'\[อ้างอิง[:\s]+([0-9,\s]+)\]', text)
-    if m:
-        nums = [int(x.strip()) for x in re.findall(r'\d+', m.group(1))]
-        valid = [num - 1 for num in nums if 1 <= num <= n_paras]
-        if valid:
-            return valid
-    return [0]  # fallback: top-ranked paragraph
+    """0-indexed paragraph indices from ALL [อ้างอิง...] tags.
+
+    The model emits one tag per item in a multi-part answer; re.search
+    (first tag only) under-counts refs, so collect every tag's numbers.
+    """
+    nums = []
+    for grp in re.findall(r'\[อ้างอิง[:\s]+([0-9,\s]+)\]', text):
+        nums += [int(x) for x in re.findall(r'\d+', grp)]
+    valid, seen = [], set()
+    for num in nums:
+        if 1 <= num <= n_paras and num not in seen:
+            seen.add(num)
+            valid.append(num - 1)
+    return valid or [0]  # fallback: top-ranked paragraph
 
 
 def split_answer_citation(text):
-    """Split LLM output into (answer, raw_citation_tag)."""
+    """Return (answer, raw_citation_tag).
+
+    answer = text with EVERY [อ้างอิง...] tag removed. The model emits a
+    tag inline after each item in multi-part answers, not only at the
+    end, so stripping from the last tag alone (rfind) leaks the earlier
+    tags into abstractive — gold answers carry no such tag.
+    """
     idx = text.rfind('[อ้างอิง')
-    if idx != -1:
-        return text[:idx].strip(), text[idx:]
-    return text.strip(), ""
+    raw_tag = text[idx:] if idx != -1 else ""
+    answer = re.sub(r'\s*\[อ้างอิง[^\]]*\]', '', text).strip()
+    return answer, raw_tag
 
 
 def main():
