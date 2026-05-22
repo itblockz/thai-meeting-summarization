@@ -163,7 +163,9 @@ History of `Exit StatusCode 1` in the benchmark backend (resolved at v8; v9 = pe
 | v8 | back to vLLM + Qwen3-32B-AWQ; five gotchas pinned | ✅ local Apptainer (4:48) |
 | v9 | bge-m3 encoding moved from CPU to GPU | ✅ local Apptainer (2:57, −39%) |
 | v10 | v9 + 2-shot few-shot prompting (exp08); `max_model_len` 4096→8192 | ✅ local Apptainer (test exit 0) |
-| v11 | v10 + E5 self-citation (exp22): top-5 numbered context, `[อ้างอิง:]`-driven `refs`; `max_model_len` 8192→16384 | ⏳ code committed — needs CI build + local Apptainer test |
+| v11 | v10 + E5 self-citation (exp22): top-5 numbered context, `[อ้างอิง:]`-driven `refs`; `max_model_len` 8192→16384 | ✅ local Apptainer (test exit 0) |
+
+**v11 → vllm 0.19.1: attempted, reverted.** To remove the venv (vllm 0.19.1) vs container (0.9.2) greedy-decode drift, v11's stack was bumped to match the venv — `cuda:12.8.1-cudnn` base, `torch 2.10.0+cu128`, `vllm 0.19.1`, `transformers 5.8.1`. It builds, but the vLLM EngineCore worker **segfaults** inside Apptainer right after model load (engine warmup) — the same `Engine core initialization failed. Failed core proc(s): {}` class as v4–v8. Forcing `FLASHINFER` / `TRITON_ATTN` / `FLEX_ATTENTION` backends all segfault too (job 5787048), so it is not the attention kernel; the root cause is deeper. Reverted — v11 stays on vllm 0.9.2. The venv↔container drift (~17/50 sample-test answers diverge under greedy decoding) is accepted, as for v8–v10.
 
 **v8 = the five gotchas** (each one alone leaves the container in `Engine core initialization failed. Failed core proc(s): {}` — an empty dict because the worker dies before its first heartbeat):
 
