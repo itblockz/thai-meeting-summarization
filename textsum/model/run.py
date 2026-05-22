@@ -1,17 +1,29 @@
 """
-Thai document summarization pipeline.
+Thai document summarization pipeline (production / Docker submission).
 
 Retrieval is two-stage: dense (bge-m3) + BM25 build a candidate pool, a
-cross-encoder (bge-reranker-v2-m3) re-scores it, the top-1 paragraph is
-kept. Generation: Qwen3-32B-AWQ via vLLM with 2-shot prompting — two
-worked (question, paragraph, summary) examples are prepended as
-multi-turn chat-template turns (matches exp08; train-set composite
-0.6361, +0.0091 over exp03 on the doc_050-held-out subset). Output:
-submission.csv with columns ID, abstractive, refs.
+cross-encoder (bge-reranker-v2-m3) re-scores it, and the top-GEN_K
+paragraphs are kept. Generation: Qwen3-32B-AWQ via vLLM. The model is
+shown the GEN_K paragraphs as a numbered [1..K] context, answers in
+Thai, then cites which paragraphs it used as [อ้างอิง: X]; the cited
+paragraphs become `refs` (E5 self-citation, adaptive count). Two worked
+few-shot examples are prepended as multi-turn chat turns.
+
+This matches exp22 — exp03 two-stage retrieval + E5 self-citation +
+2-shot few-shot (exp08's example pair, from held-out doc_050). Train-set
+composite 0.6647 leak-free (1218 queries, doc_050 excluded) — the repo
+best, +0.0286 over the previous exp08 production pipeline.
+
+Container-specific settings (vllm 0.9.2 in the image): enforce_eager=True
+skips the V1-engine torch.compile path that crashes silently inside
+Apptainer/Docker; max_model_len=16384 fits the few-shot E5 prompt.
+
+Output: submission.csv with columns ID, abstractive, refs.
 """
 from pathlib import Path
 import os
 import gc
+import re
 import json
 import csv
 
@@ -27,8 +39,8 @@ TEST_DIR     = os.environ.get("TEST_DIR",     "/model/test")
 RESULT_DIR   = os.environ.get("RESULT_DIR",   "/result/")
 PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
 
-TOP_K          = 1      # paragraphs retrieved, passed to LLM, and reported in refs
 POOL_N         = 20     # top-N from each stage-1 retriever before rerank
+GEN_K          = 5      # reranked paragraphs fed to the LLM as numbered context
 EMBED_BATCH    = 64
 MAX_NEW_TOKENS = 512
 EMBED_MODEL    = "BAAI/bge-m3"
@@ -37,40 +49,33 @@ MODEL_NAME     = os.environ.get("LLM_MODEL", "Qwen/Qwen3-32B-AWQ")
 
 SYSTEM_MSG = (
     "คุณเป็นผู้ช่วยสรุปเอกสารภาษาไทย "
-    "ตอบคำถามโดยสรุปจากข้อมูลที่ให้มาเท่านั้น ห้ามแต่งเติม"
+    "ตอบคำถามโดยอ้างอิงจากย่อหน้าที่ให้มาเท่านั้น ห้ามแต่งเติม"
 )
 
-# Two worked (question, paragraph, summary) examples held out from
-# training (doc_050). build_messages renders them as multi-turn turns;
-# each assistant turn carries the bare answer (no "คำตอบ:" marker) so the
-# model learns to reply with just the summary. Example 1's Thai numeral
-# "ชั้น ๔" is faithful to its gold and source paragraph.
-FEW_SHOT = [
-    {
-        "query": "ในการประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้นที่ใด",
-        "paragraph": "ณ ห้องประชุมกรรมาธิการ N 406 ชั้น ๔ อาคารรัฐสภา",
-        "answer": (
-            "การประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้น "
-            "ณ ห้องประชุมกรรมาธิการ N 406 ชั้น ๔ อาคารรัฐสภา"
-        ),
-    },
-    {
-        "query": "การจัดทำแบบสำรวจความพึงพอใจและไม่พึงพอใจของคณะกรรมาธิการจัดขึ้นเพื่ออะไร",
-        "paragraph": (
-            "สำนักงานเลขาธิการสภาผู้แทนราษฎรขอความอนุเคราะห์ตอบแบบสำรวจ"
-            "ความพึงพอใจและความไม่พึงพอใจของคณะกรรมาธิการต่อการบริหารจัดการ"
-            "ด้านการประชุม การศึกษาดูงาน และการจัดสัมมนา "
-            "เพื่อนำผลการประเมินความพึงพอใจและความไม่พึงพอใจที่ได้ "
-            "ไปเป็นข้อมูลในการทบทวนปรับปรุงและพัฒนาการบริหารจัดการ"
-            "ด้านการประชุม การศึกษาดูงาน และการจัดสัมมนา"
-        ),
-        "answer": (
-            "การจัดทำแบบสำรวจความพึงพอใจและไม่พึงพอใจของคณะกรรมการในครั้งนี้ "
-            "มีการจัดทำขึ้นเพื่อนำข้อมูลที่ได้มาทบทวน ปรับปรุง "
-            "รวมถึงนำไปพัฒนาการปฏิบัติงานให้มีประสิทธิภาพยิ่งขึ้น"
-        ),
-    },
+# Two worked few-shot examples (exp08's pair, both from held-out doc_050),
+# rendered in E5 form: a 5-paragraph numbered context and an answer that
+# ends with the [อ้างอิง: N] tag. Both gold answers cite a single
+# paragraph — matching the dataset prior that 71.8% of queries have one
+# gold ref — which keeps the model from over-citing.
+_SHOT1_QUERY = "ในการประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้นที่ใด"
+_SHOT1_PARAS = [
+    "ครั้งที่ ๔๙",
+    "วันพุธที่ ๑๙ มีนาคม ๒๕๖๘",
+    "ณ ห้องประชุมกรรมาธิการ N 406 ชั้น ๔ อาคารรัฐสภา",
+    "_________________________",
+    "กรรมาธิการผู้มาประชุม",
 ]
+_SHOT1_ANSWER = "การประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้น ณ ห้องประชุมกรรมาธิการ N 406 ชั้น ๔ อาคารรัฐสภา [อ้างอิง: 3]"
+
+_SHOT2_QUERY = "การจัดทำแบบสำรวจความพึงพอใจและไม่พึงพอใจของคณะกรรมาธิการจัดขึ้นเพื่ออะไร"
+_SHOT2_PARAS = [
+    "เริ่มประชุมเวลา ๐๙.๔๖ นาฬิกา",
+    "เมื่อกรรมาธิการมาครบองค์ประชุมแล้ว ประธานคณะกรรมาธิการได้กล่าวเปิดประชุม และดำเนินการประชุมตามระเบียบวาระการประชุม สรุปสาระสำคัญได้ ดังนี้",
+    "ระเบียบวาระที่ ๑ เรื่องที่ประธานแจ้งต่อที่ประชุม",
+    "สำนักงานเลขาธิการสภาผู้แทนราษฎรขอความอนุเคราะห์ตอบแบบสำรวจความพึงพอใจและความไม่พึงพอใจของคณะกรรมาธิการต่อการบริหารจัดการด้านการประชุม การศึกษาดูงาน และการจัดสัมมนา เพื่อนำผลการประเมินความพึงพอใจและความไม่พึงพอใจมาเป็นข้อมูลในการทบทวน ปรับปรุง และพัฒนาการปฏิบัติงานให้มีประสิทธิภาพต่อไป",
+    "ที่ประชุมรับทราบ",
+]
+_SHOT2_ANSWER = "การจัดทำแบบสำรวจความพึงพอใจและไม่พึงพอใจของคณะกรรมการในครั้งนี้ มีการจัดทำขึ้นเพื่อนำข้อมูลที่ได้มาทบทวน ปรับปรุง รวมถึงนำไปพัฒนาการปฏิบัติงานให้มีประสิทธิภาพยิ่งขึ้น [อ้างอิง: 4]"
 
 
 def benchmark_lib(i):
@@ -104,38 +109,66 @@ def encode_texts(model, texts, batch_size=EMBED_BATCH):
     )
 
 
-def build_user_turn(query, retrieved_texts):
-    """A single user turn — the exp03 prompt body, ending in 'คำตอบ:'.
-
-    In multi-turn few-shot, each example is rendered as this exact body,
-    and the matching assistant turn carries just the answer text.
-    """
-    if len(retrieved_texts) == 1:
-        paragraph_block = retrieved_texts[0]
-    else:
-        paragraph_block = "\n".join(
-            f"ย่อหน้า {i + 1}: {t}" for i, t in enumerate(retrieved_texts)
-        )
+def build_prompt(query, paras):
+    """E5 prompt — numbered [1..N] context + an inline citation request."""
+    context = "\n".join(
+        f"[{i + 1}] {t}" for i, t in enumerate(paras)
+    )
     return (
         f"คำถาม: {query}\n\n"
-        f"ข้อมูลอ้างอิงจากเอกสาร:\n"
-        f"ย่อหน้า 1: {paragraph_block}\n\n"
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
         f"คำสั่ง: โปรดสรุปคำตอบเป็นภาษาไทยอย่างกระชับและครอบคลุม "
-        f"โดยอ้างอิงจากข้อมูลที่ให้มาเท่านั้น\n"
+        f"โดยอ้างอิงจากข้อมูลที่ให้มาเท่านั้น "
+        f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y]\n"
         f"คำตอบ:"
     )
 
 
-def build_messages(query, retrieved_texts):
-    """System + alternating user/assistant few-shot turns + final user target."""
-    messages = [{"role": "system", "content": SYSTEM_MSG}]
-    for ex in FEW_SHOT:
-        messages.append({"role": "user",
-                         "content": build_user_turn(ex["query"], [ex["paragraph"]])})
-        messages.append({"role": "assistant", "content": ex["answer"]})
-    messages.append({"role": "user",
-                     "content": build_user_turn(query, retrieved_texts)})
-    return messages
+def build_messages(query, paras):
+    """System + 2 few-shot turns + the final user turn.
+
+    Every user turn uses the same build_prompt; the few-shot assistant
+    turns carry the worked [อ้างอิง: N] answer.
+    """
+    return [
+        {"role": "system", "content": SYSTEM_MSG},
+        {"role": "user", "content": build_prompt(_SHOT1_QUERY, _SHOT1_PARAS)},
+        {"role": "assistant", "content": _SHOT1_ANSWER},
+        {"role": "user", "content": build_prompt(_SHOT2_QUERY, _SHOT2_PARAS)},
+        {"role": "assistant", "content": _SHOT2_ANSWER},
+        {"role": "user", "content": build_prompt(query, paras)},
+    ]
+
+
+def parse_citation(text, n_paras):
+    """0-indexed paragraph indices from ALL [อ้างอิง...] tags.
+
+    The model emits one tag per item in a multi-part answer; re.search
+    (first tag only) under-counts refs, so collect every tag's numbers.
+    """
+    nums = []
+    for grp in re.findall(r'\[อ้างอิง[:\s]+([0-9,\s]+)\]', text):
+        nums += [int(x) for x in re.findall(r'\d+', grp)]
+    valid, seen = [], set()
+    for num in nums:
+        if 1 <= num <= n_paras and num not in seen:
+            seen.add(num)
+            valid.append(num - 1)
+    return valid or [0]  # fallback: top-ranked paragraph
+
+
+def split_answer_citation(text):
+    """Return (answer, raw_citation_tag).
+
+    answer = text with EVERY [อ้างอิง...] tag removed. The model emits a
+    tag inline after each item in multi-part answers, not only at the
+    end, so stripping from the last tag alone (rfind) leaks the earlier
+    tags into abstractive — gold answers carry no such tag.
+    """
+    idx = text.rfind('[อ้างอิง')
+    raw_tag = text[idx:] if idx != -1 else ""
+    answer = re.sub(r'\s*\[อ้างอิง[^\]]*\]', '', text).strip()
+    return answer, raw_tag
 
 
 def main():
@@ -146,8 +179,6 @@ def main():
     print(f"{n} queries, {len(doc_index)} docs", flush=True)
 
     # ── Stage 1a: embed paragraphs + queries (GPU), build BM25 ────────────
-    # vLLM uses spawn (VLLM_WORKER_MULTIPROC_METHOD), so we may touch CUDA
-    # in the parent without forking corrupted contexts into vLLM workers.
     device = "cuda" if torch.cuda.is_available() else "cpu"
     embed_model = SentenceTransformer(EMBED_MODEL, device=device)
     doc_para_data = {}   # doc_id -> (valid_paras, para_embs, bm25)
@@ -169,7 +200,7 @@ def main():
     print(f"Embeddings + BM25 done ({device}).", flush=True)
 
     # ── Stage 1b: build candidate pools, collect (query, paragraph) pairs ──
-    pools = []
+    pools = []   # per query: list of (para_id, text)
     pair_texts, pair_qidx = [], []
     for i, query in enumerate(queries):
         valid, para_embs, bm25 = doc_para_data.get(
@@ -182,7 +213,7 @@ def main():
         bm25_scores = np.asarray(bm25.get_scores(tokenize_th(query["query"])))
         bm25_idx = np.argsort(-bm25_scores)[:POOL_N].tolist()
         pool_idx = list(dict.fromkeys(dense_idx + bm25_idx))   # union, order-preserving
-        pools.append([valid[j]["para_id"] for j in pool_idx])
+        pools.append([(valid[j]["para_id"], valid[j]["text"]) for j in pool_idx])
         for j in pool_idx:
             pair_texts.append((query["query"], valid[j]["text"]))
             pair_qidx.append(i)
@@ -200,47 +231,52 @@ def main():
     for qi, s in zip(pair_qidx, pair_scores):
         scores_by_q.setdefault(qi, []).append(float(s))
 
-    # ── assemble retrieval results + LLM messages ─────────────────────────
-    items = []   # (ID, ref_ids, messages_or_None, query_text)
+    # ── assemble: top-GEN_K reranked paragraphs per query ─────────────────
+    items = []   # (ID, gen_pids, gen_texts, messages_or_None, query_text)
     for i, query in enumerate(queries):
         benchmark_lib(i)
-        pool_pids = pools[i]
+        pool = pools[i]
         q_text = query["query"]
-        if pool_pids:
+        if pool:
             scores = scores_by_q.get(i, [])
-            order = sorted(range(len(pool_pids)), key=lambda j: -scores[j])
-            ref_ids = [pool_pids[j] for j in order[:TOP_K]]
+            order = sorted(range(len(pool)), key=lambda j: -scores[j])[:GEN_K]
+            gen_pids  = [pool[j][0] for j in order]
+            gen_texts = [pool[j][1] for j in order]
+            messages = build_messages(q_text, gen_texts)
         else:
-            ref_ids = []
-
-        para_text_map = {p["para_id"]: p["text"] for p in doc_index.get(query["doc_id"], [])}
-        retrieved_texts = [para_text_map[pid] for pid in ref_ids
-                           if para_text_map.get(pid, "").strip()]
-
-        if retrieved_texts:
-            messages = build_messages(q_text, retrieved_texts)
-        else:
-            messages = None
-        items.append((query["ID"], ref_ids, messages, q_text))
+            gen_pids, gen_texts, messages = [], [], None
+        items.append((query["ID"], gen_pids, gen_texts, messages, q_text))
 
     # ── Stage 2: vLLM batch generation ────────────────────────────────────
-    llm = LLM(model=MODEL_NAME, quantization="awq_marlin", max_model_len=8192,
+    llm = LLM(model=MODEL_NAME, quantization="awq_marlin", max_model_len=16384,
               gpu_memory_utilization=0.90, dtype="half", enforce_eager=True)
     tokenizer = llm.get_tokenizer()
     sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS, repetition_penalty=1.05)
 
     prompts = []
     for it in items:
-        msgs = it[2] if it[2] is not None else [{"role": "user", "content": it[3]}]
+        msgs = it[3] if it[3] is not None else [{"role": "user", "content": it[4]}]
         prompts.append(tokenizer.apply_chat_template(
             msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False))
 
     outputs = llm.generate(prompts, sampling)
 
+    # ── Stage 3: parse answer + citations ([อ้างอิง: X] format) ───────────
     results = []
     for it, out in zip(items, outputs):
-        summary = out.outputs[0].text.strip() or it[3]
-        results.append({"ID": it[0], "abstractive": summary, "refs": ",".join(it[1])})
+        qid, gen_pids, gen_texts, _, q_text = it
+        raw = out.outputs[0].text.strip()
+        answer, _ = split_answer_citation(raw)
+        cited_idx = parse_citation(raw, len(gen_pids))   # 0-indexed, fallback [0]
+        if gen_pids:
+            ref_ids = [gen_pids[j] for j in cited_idx if j < len(gen_pids)]
+            if not ref_ids:
+                ref_ids = [gen_pids[0]]      # fallback: top-1 reranked
+        else:
+            ref_ids = []
+        if not answer:
+            answer = gen_texts[0] if gen_texts else q_text
+        results.append({"ID": qid, "abstractive": answer, "refs": ",".join(ref_ids)})
 
     out_path = Path(RESULT_DIR) / "submission.csv"
     out_path.parent.mkdir(parents=True, exist_ok=True)

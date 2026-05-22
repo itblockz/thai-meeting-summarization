@@ -53,7 +53,7 @@ python3 eval_retrieval/eval.py
 
 **Build and push Docker image** (via GitHub Actions — manual trigger `workflow_dispatch`):
 ```
-.github/workflows/build-push.yml → registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v10
+.github/workflows/build-push.yml → registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v11
 ```
 
 **Test a container image locally** (verify before pushing, or debug `Exit StatusCode 1`):
@@ -82,8 +82,8 @@ Both `APPTAINER_TMPDIR` and `APPTAINER_CACHEDIR` MUST point at Lustre — `/tmp`
 
 ### Pipeline (two phases)
 
-1. **Retrieval**: For each query, build a candidate pool from the `doc_id` document (dense bge-m3 + BM25, top-20 each), rerank it with a cross-encoder (bge-reranker-v2-m3), and keep the top-K paragraph(s).
-2. **Generation**: Pass the retrieved paragraph(s) as context to vLLM running Qwen3-32B-AWQ; it produces a Thai-language abstractive summary. The Docker pipeline (`textsum/model/run.py`) matches exp08 — exp03 retrieval + LLM plus 2-shot multi-turn-chat few-shot prompting — and additionally passes `enforce_eager=True` to skip the V1-engine torch.compile path, which crashes silently inside Apptainer/Docker containers on vllm 0.9.2 (see "Docker container issues").
+1. **Retrieval**: For each query, build a candidate pool from the `doc_id` document (dense bge-m3 + BM25, top-20 each), rerank it with a cross-encoder (bge-reranker-v2-m3), and keep the top-`GEN_K` paragraphs.
+2. **Generation**: Pass the `GEN_K` paragraphs as a numbered `[1..K]` context to vLLM running Qwen3-32B-AWQ; it answers in Thai and cites which paragraphs it used as `[อ้างอิง: X]` (E5 self-citation — the cited paragraphs become `refs`). The Docker pipeline (`textsum/model/run.py`) matches exp22 — exp03 retrieval + E5 self-citation + 2-shot multi-turn-chat few-shot — and additionally passes `enforce_eager=True` to skip the V1-engine torch.compile path, which crashes silently inside Apptainer/Docker containers on vllm 0.9.2 (see "Docker container issues").
 
 ### Experiments
 
@@ -105,23 +105,27 @@ LANTA experiment history (train-set composite, ↑ better):
 
 **E7 sweep (exp09–exp16)**: a #-shots ablation (exp09/exp11 = 1/4-shot, exp10 = 3-shot) confirmed 2-shot is the inverted-U peak; exp12–exp13 reproduced the gain on a different held-out doc (doc_002); dynamic per-query k-NN few-shot (`exp14/`) gives the most *reproducible* gain, **+0.0052** on the full 1239 — exp08's +0.0091 is a high outlier. Criteria-based example selection (exp15–exp16) underperformed and is a dead end (see "What does NOT help"). exp08's hand-picked pair is the chosen production few-shot.
 
-**Current best**: `exp03/` remains the canonical full-1239 baseline at 0.6256. Few-shot wins are measured on held-out subsets and are not directly comparable on the full set; exp08's **+0.0091** over exp03 is the largest, but it is a high outlier — the reproducible figure is **~+0.0052** (exp14 dynamic k-NN). The Docker submission pipeline (`textsum/model/run.py`) matches **exp08** — exp03 retrieval + Qwen3-32B-AWQ + 2-shot multi-turn few-shot — as of image tag **v10**. Intentional drift from the exp08 experiment: `enforce_eager=True` (see "Docker container issues") and `max_model_len=8192` (the few-shot prompt no longer fits 4096). The two worked examples are the `FEW_SHOT` constant in `textsum/model/run.py`.
+**E5 sweep (exp17–exp22)**: revisited E5 self-citation — feed the LLM the top-`GEN_K=5` reranked paragraphs, it cites which it used → adaptive `refs` — the idea `exp02/` abandoned. exp02 failed only because Qwen2.5-7B could not follow the citation format; Qwen3-32B-AWQ follows it 99%+ of the time. Leak-free results (1218 queries, doc_050 held out): E5 alone is roughly break-even with exp03 (exp17/exp18 ≈ 0.625/0.630), but E5 + 2-shot few-shot lifts it sharply. exp19→exp21 is a single-variable ladder (few-shot **+0.0076**, system-prompt wording **+0.0025**, removing a stray per-paragraph length cap **+0.0169** — the cap, not over-citation, was the dominant IoU drag). `exp22/` swaps in exp08's few-shot pair (both single-ref, which keeps the model's avg cited refs near the 71.8%-single-ref dataset prior) and is the **repo best**.
+
+**Current best**: `exp22/` — exp03 retrieval + E5 self-citation + 2-shot few-shot — at **0.6647** leak-free (1218 queries, doc_050 held out), **+0.0377** over exp03 on the same subset (0.6270). `exp03/` remains the canonical no-few-shot reference (0.6256 full-1239). The Docker submission pipeline (`textsum/model/run.py`) matches **exp22** as of image tag **v11**. Intentional container settings: `enforce_eager=True` (see "Docker container issues") and `max_model_len=16384` (the few-shot E5 prompt needs it). The worked examples are the `_SHOT1_*`/`_SHOT2_*` constants in `textsum/model/run.py` — exp08's hand-picked pair rendered in E5 form.
 
 See `IDEAS.md` for the full experiment roadmap and `eval_retrieval/` for the fast retrieval harness.
 
-**Score breakdown (train set):**
+**Score breakdown:**
 
-|          | baseline | exp01    | exp03 (best) |
-|----------|----------|----------|--------------|
-| RougeL   | 0.3387   | 0.3723   | 0.3928       |
-| SS-score | 0.7667   | 0.8016   | 0.8096       |
-| IoU      | 0.4744   | 0.6190   | 0.6190       |
-| **Composite** | **0.5584** | **0.6148** | **0.6256** |
+|          | baseline | exp01  | exp03  | exp22 (best) |
+|----------|----------|--------|--------|--------------|
+| RougeL   | 0.3387   | 0.3723 | 0.3928 | 0.4454       |
+| SS-score | 0.7667   | 0.8016 | 0.8096 | 0.8384       |
+| IoU      | 0.4744   | 0.6190 | 0.6190 | 0.6575       |
+| **Composite** | **0.5584** | **0.6148** | **0.6256** | **0.6647** |
+
+baseline/exp01/exp03 are full-1239; exp22 is leak-free (1218, doc_050 held out — the few-shot examples come from it). exp03 on that same 1218 subset = 0.6270, so exp22 is **+0.0377**.
 
 **Key design decisions:**
 - Two-stage retrieval: dense (bge-m3) + BM25 build a candidate pool (top-20 each), a cross-encoder (bge-reranker-v2-m3) reranks it.
-- `TOP_K=1`: retrieve, generate from, and report exactly 1 paragraph (honest IoU reporting).
-- bge-m3 embeds on CPU in LANTA jobs (so CUDA isn't initialized in the parent process before vLLM spawns workers). Cross-encoder runs on GPU and is freed (`del` + `empty_cache`) before the LLM loads.
+- `GEN_K=5`: feed the LLM the top-5 reranked paragraphs (the elbow of the rerank recall curve — hit@5 = 0.912 vs hit@1 = 0.739); E5 self-citation then reports the subset actually used as `refs`. `exp03/` and the `exp04`–`exp16` line instead use `TOP_K=1` — retrieve, generate from, and report exactly one paragraph.
+- bge-m3 and the cross-encoder both run on GPU; the cross-encoder is freed (`del` + `empty_cache`) before the LLM loads. (`exp03/` and earlier `expNN` embed bge-m3 on CPU — a pre-v9 convention to keep CUDA uninitialised until vLLM spawns its workers.)
 - LANTA SLURM scripts set `VLLM_WORKER_MULTIPROC_METHOD=spawn` — required when CrossEncoder touches CUDA before vLLM init, otherwise the forked worker crashes.
 
 ### What does NOT help (verified, don't retry without new evidence)
@@ -129,7 +133,7 @@ See `IDEAS.md` for the full experiment roadmap and `eval_retrieval/` for the fas
 - **Switching the reranker** to Qwen3-Reranker-0.6B / jina-reranker-v3 / Qwen3-Reranker-4B. On MIRACL Thai nDCG@10 our current `bge-reranker-v2-m3` (82.29) already beats them all at 0.6B and matches Qwen3-Reranker-4B (82.00). Reranker swap is a dead end for Thai.
 - **Expanding the candidate pool** (`POOL_N=20 → 40`). hit@1 dropped 0.7401 → 0.7393; the rerank misranks the extra candidates and adds noise.
 - **Rewriting the system prompt** to "direct QA, you may rephrase" (exp05). Composite dropped −0.0040; Qwen3-32B-AWQ already interprets the original "summarize concisely" prompt correctly, and granting explicit rephrase permission pushed outputs further from gold.
-- **E5 self-citation with Qwen2.5-7B** (exp02). The model didn't follow the citation format reliably and IoU collapsed 0.6190 → 0.4870.
+- **E5 self-citation fed to a small model** (exp02, Qwen2.5-7B). The 7B model didn't follow the citation format reliably and IoU collapsed 0.6190 → 0.4870. This is model-specific and **not** a verdict on E5 itself — with Qwen3-32B-AWQ the format is followed 99%+ of the time and E5 + few-shot (`exp22/`) is the current best (see "E5 sweep"). The lesson: don't feed E5 self-citation to a <10B model.
 - **E6 adaptive K from rerank score gap**. bge-reranker scores don't correlate with correctness; three strategies (abs gap, threshold, top1 ratio) all lose to K=1, and oracle K=|gold| only +0.0045 composite — not worth chasing.
 - **E8 length calibration / truncation**. Pred is ~1.18x gold at the median, and corr(RougeL, |pred − gold|) = −0.414, but post-hoc truncation of exp03 predictions LOSES RougeL at every cap, including the oracle cap = |gold tokens| (−0.0025). The verbose preds carry recall-matching content; truncating drops recall faster than precision rises. Length is correlated with low RougeL but not causal — likely confounded by query difficulty.
 - **E2 bge-m3 ColBERT (multi-vector) reranking**. Tested 3 fusion strategies on exp03's pool: pure ColBERT (hit@1 −0.127 vs CE baseline), CE+ColBERT z-score fusion (peak at α=0.9 only +0.0036 iou@1, well within 1σ noise of 0.014), and pool expansion with ColBERT top-20 (+0.0033 pool recall, negligible). bge-m3 ColBERT and bge-reranker-v2-m3 share too much of the underlying signal to be complementary on Thai. Not worth a full LLM run.
@@ -147,7 +151,7 @@ See `IDEAS.md` for the full experiment roadmap and `eval_retrieval/` for the fas
 
 ### Docker container issues
 
-History of `Exit StatusCode 1` in the benchmark backend (resolved at v8; v9 = perf; v10 = few-shot):
+History of `Exit StatusCode 1` in the benchmark backend (resolved at v8; v9 = perf; v10 = few-shot; v11 = E5):
 
 | Tag | Changes vs previous | Benchmark / local Apptainer |
 |-----|---------------------|----------------------------|
@@ -159,6 +163,7 @@ History of `Exit StatusCode 1` in the benchmark backend (resolved at v8; v9 = pe
 | v8 | back to vLLM + Qwen3-32B-AWQ; five gotchas pinned | ✅ local Apptainer (4:48) |
 | v9 | bge-m3 encoding moved from CPU to GPU | ✅ local Apptainer (2:57, −39%) |
 | v10 | v9 + 2-shot few-shot prompting (exp08); `max_model_len` 4096→8192 | ✅ local Apptainer (test exit 0) |
+| v11 | v10 + E5 self-citation (exp22): top-5 numbered context, `[อ้างอิง:]`-driven `refs`; `max_model_len` 8192→16384 | ⏳ code committed — needs CI build + local Apptainer test |
 
 **v8 = the five gotchas** (each one alone leaves the container in `Engine core initialization failed. Failed core proc(s): {}` — an empty dict because the worker dies before its first heartbeat):
 

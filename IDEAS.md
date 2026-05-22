@@ -145,7 +145,7 @@
 
 ### Tier B — Refs reporting / IoU
 
-#### E5 — แยก context กับ refs + ให้ LLM อ้างอิงเอง ⭐
+#### E5 — แยก context กับ refs + ให้ LLM อ้างอิงเอง ✅ ทำแล้ว (exp17–exp22)
 
 - **สมมติฐาน**: TOP_K=3 เดิมพิสูจน์แล้วว่า context เยอะ → generation ดีขึ้น (SS 0.794, RougeL 0.349)
   ที่พังคือรายงาน refs 3 อันเสมอ → IoU ตก ทางแก้: **ป้อน N ย่อหน้าให้ LLM แต่รายงานเฉพาะที่ใช้จริง**
@@ -158,6 +158,12 @@
 - **วิธีวัด**: full eval — ดู SS, RougeL (context) และ IoU (adaptive K) พร้อมกัน
 - **คาดการณ์**: composite **+0.02 ถึง +0.05**
 - **ต้นทุน**: ต่ำ — context ยาวขึ้นเล็กน้อย (ย่อหน้าสั้น ไม่ชน max_model_len)
+- **ผลแล้ว (exp17–exp22, leak-free 1218 query, hold out doc_050)**: E5 ล้วน ≈ เสมอตัวกับ exp03
+  (exp17/exp18 = 0.625/0.630) — ป้อน 5 ย่อหน้าทำให้ SS/RougeL ขึ้นแต่ IoU ตกพอกัน. **E5 + 2-shot
+  few-shot** คือตัวที่ดันขึ้นจริง: `exp22/` = **0.6647** (+0.0377 เหนือ exp03 บน subset เดียวกัน)
+  เป็น production pipeline ตั้งแต่ image **v11**. คาดการณ์ +0.02–0.05 ถูกต้องเมื่อรวม few-shot.
+  กุญแจสำคัญ: ตัวอย่าง few-shot ต้องเป็น single-ref เพื่อตรึง avg refs ให้ใกล้ prior 71.8% ของ
+  dataset — กัน over-citation ที่ฉุด IoU. ดู `eval_train/score_heldout.py` สำหรับการวัดแบบ leak-free.
 
 #### E6 — Adaptive K predictor
 
@@ -224,7 +230,7 @@
 | E0 | retrieval eval harness | (เครื่องมือ) | — | ต่ำ | **ทำก่อน** |
 | E1 | cross-encoder rerank | recall@1 → IoU+SS+RougeL | +0.04 – 0.08 | กลาง | ⭐ 1 |
 | E2 | bge-m3 colbert rerank | recall@1 | +0.02 – 0.04 | ต่ำ | 2 |
-| E5 | แยก context/refs + cite | IoU + SS + RougeL | +0.02 – 0.05 | ต่ำ | ⭐ 3 |
+| E5 | แยก context/refs + cite | IoU + SS + RougeL | **+0.038 (exp22)** | ต่ำ | ✅ ทำแล้ว |
 | E4 | จูน hybrid fusion | recall@1 | +0.005 – 0.02 | ต่ำมาก | 4 |
 | E6 | adaptive K | IoU | +0.01 – 0.03 | ต่ำมาก | 5 |
 | E10 | prompt abstractive QA | RougeL + SS | +0.01 – 0.03 | ต่ำมาก | 6 |
