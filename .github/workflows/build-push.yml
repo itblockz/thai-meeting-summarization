@@ -32,4 +32,4 @@ jobs:
         with:
           context: ./textsum
           push: true
-          tags: registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v9
+          tags: registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v10
