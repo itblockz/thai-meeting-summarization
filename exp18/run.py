@@ -196,8 +196,12 @@ def main():
         items.append((query["ID"], gen_pids, gen_texts, messages, q_text))
 
     # ── Stage 2: vLLM batch generation ────────────────────────────────────
+    # enforce_eager=True: skip vLLM's torch.compile + CUDA-graph capture. With
+    # bge-m3 embedding on GPU (the parent process retains ~1.5 GB) plus
+    # max_model_len=8192, graph capture OOMs the 40 GB A100. Matches toey/exp01;
+    # eager costs ~0 latency on this batched workload.
     llm = LLM(model=MODEL_NAME, quantization="awq_marlin", max_model_len=8192,
-              gpu_memory_utilization=0.90, dtype="half")
+              gpu_memory_utilization=0.90, dtype="half", enforce_eager=True)
     tokenizer = llm.get_tokenizer()
     sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS, repetition_penalty=1.05)
 
