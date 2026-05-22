@@ -53,7 +53,7 @@ python3 eval_retrieval/eval.py
 
 **Build and push Docker image** (via GitHub Actions — manual trigger `workflow_dispatch`):
 ```
-.github/workflows/build-push.yml → registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v9
+.github/workflows/build-push.yml → registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v10
 ```
 
 **Test a container image locally** (verify before pushing, or debug `Exit StatusCode 1`):
@@ -76,14 +76,14 @@ apptainer pull --docker-login $PROJECT/textsum_v9.sif \
 # Run via SLURM with GPU; --containall mirrors what the benchmark backend gives:
 sbatch textsum/submit_apptainer_test_v8.sh   # only test-data, benchmark_lib, result binds
 ```
-Both `APPTAINER_TMPDIR` and `APPTAINER_CACHEDIR` MUST point at Lustre — `/tmp` on the login node is too small to unpack the image (~30 GB). Apptainer build must run on the **login node** (compute partitions have no internet to pull the base image / wheels).
+Both `APPTAINER_TMPDIR` and `APPTAINER_CACHEDIR` MUST point at Lustre — `/tmp` on the login node is too small to unpack the image (~30 GB). Apptainer build must run on the **login node** (compute partitions have no internet to pull the base image / wheels). The `%post` section of `textsum.def` additionally exports `TMPDIR=/buildtmp` (a path inside the sandbox rootfs): Apptainer bind-mounts the host `/tmp` into `%post`, so when the login-node root filesystem is full pip's wheel-unpack hits `ENOSPC` without this.
 
 ## Architecture
 
 ### Pipeline (two phases)
 
 1. **Retrieval**: For each query, build a candidate pool from the `doc_id` document (dense bge-m3 + BM25, top-20 each), rerank it with a cross-encoder (bge-reranker-v2-m3), and keep the top-K paragraph(s).
-2. **Generation**: Pass the retrieved paragraph(s) as context to vLLM running Qwen3-32B-AWQ; it produces a Thai-language abstractive summary. The Docker pipeline (`textsum/model/run.py`) is now equivalent to exp03 — same retrieval + same LLM — and additionally passes `enforce_eager=True` to skip the V1-engine torch.compile path, which crashes silently inside Apptainer/Docker containers on vllm 0.9.2 (see "Docker container issues").
+2. **Generation**: Pass the retrieved paragraph(s) as context to vLLM running Qwen3-32B-AWQ; it produces a Thai-language abstractive summary. The Docker pipeline (`textsum/model/run.py`) matches exp08 — exp03 retrieval + LLM plus 2-shot multi-turn-chat few-shot prompting — and additionally passes `enforce_eager=True` to skip the V1-engine torch.compile path, which crashes silently inside Apptainer/Docker containers on vllm 0.9.2 (see "Docker container issues").
 
 ### Experiments
 
@@ -99,10 +99,13 @@ LANTA experiment history (train-set composite, ↑ better):
 | `exp05/` — E10 prompt | exp03 + direct-QA prompt rewrite | 0.6216 *(failed)* |
 | `exp06/` — E7 few-shot | exp03 + 2-shot from held-out doc_050 | 0.6329 † |
 | `exp07/` — E7 few-shot | exp03 + 2-shot from held-out doc_047 | 0.6278 † |
+| `exp08/` — E7 few-shot | exp06 + multi-turn chat-template (fixes "คำตอบ:" leak) | 0.6361 † |
 
-† Held-out evaluation: exp06 scored on 1218 queries excluding doc_050, exp07 on 1211 excluding doc_047. Apples-to-apples exp03 baselines on those same subsets are 0.6270 and 0.6237 respectively, so the few-shot deltas are **+0.0059 (exp06)** and **+0.0041 (exp07)**. Both show statistically significant per-query RougeL improvement (paired t-test p<0.0002), confirming the few-shot signal is real and not a doc-choice artifact. IoU is identical to exp03 in both runs because the retrieval pipeline is unchanged.
+† Held-out evaluation: exp06 scored on 1218 queries excluding doc_050, exp07 on 1211 excluding doc_047, exp08 on the same 1218 as exp06. Apples-to-apples exp03 baselines on those subsets are 0.6270 (doc_050) and 0.6237 (doc_047), so the few-shot deltas are **+0.0059 (exp06)**, **+0.0041 (exp07)** and **+0.0091 (exp08)**. All show statistically significant per-query RougeL improvement (paired t-test p<0.0002), confirming the few-shot signal is real and not a doc-choice artifact. IoU is identical to exp03 because the retrieval pipeline is unchanged.
 
-**Current best**: `exp03/` is still the canonical "no held-out" baseline at 0.6256 on the full 1239. The few-shot variants are not directly comparable on the full set (they exclude their held-out doc by construction), but extrapolating exp06's +0.0059 to the full set would land near **0.6315**. The Docker submission pipeline (`textsum/model/run.py`) currently matches exp03 (vLLM + Qwen3-32B-AWQ + rerank) as of image tag v8; the only intentional drift is `enforce_eager=True` (see "Docker container issues"). Backporting few-shot into the Docker pipeline would require packaging the 2 worked examples; they are constants in `expNN/run.py`.
+**E7 sweep (exp09–exp16)**: a #-shots ablation (exp09/exp11 = 1/4-shot, exp10 = 3-shot) confirmed 2-shot is the inverted-U peak; exp12–exp13 reproduced the gain on a different held-out doc (doc_002); dynamic per-query k-NN few-shot (`exp14/`) gives the most *reproducible* gain, **+0.0052** on the full 1239 — exp08's +0.0091 is a high outlier. Criteria-based example selection (exp15–exp16) underperformed and is a dead end (see "What does NOT help"). exp08's hand-picked pair is the chosen production few-shot.
+
+**Current best**: `exp03/` remains the canonical full-1239 baseline at 0.6256. Few-shot wins are measured on held-out subsets and are not directly comparable on the full set; exp08's **+0.0091** over exp03 is the largest, but it is a high outlier — the reproducible figure is **~+0.0052** (exp14 dynamic k-NN). The Docker submission pipeline (`textsum/model/run.py`) matches **exp08** — exp03 retrieval + Qwen3-32B-AWQ + 2-shot multi-turn few-shot — as of image tag **v10**. Intentional drift from the exp08 experiment: `enforce_eager=True` (see "Docker container issues") and `max_model_len=8192` (the few-shot prompt no longer fits 4096). The two worked examples are the `FEW_SHOT` constant in `textsum/model/run.py`.
 
 See `IDEAS.md` for the full experiment roadmap and `eval_retrieval/` for the fast retrieval harness.
 
@@ -130,6 +133,7 @@ See `IDEAS.md` for the full experiment roadmap and `eval_retrieval/` for the fas
 - **E6 adaptive K from rerank score gap**. bge-reranker scores don't correlate with correctness; three strategies (abs gap, threshold, top1 ratio) all lose to K=1, and oracle K=|gold| only +0.0045 composite — not worth chasing.
 - **E8 length calibration / truncation**. Pred is ~1.18x gold at the median, and corr(RougeL, |pred − gold|) = −0.414, but post-hoc truncation of exp03 predictions LOSES RougeL at every cap, including the oracle cap = |gold tokens| (−0.0025). The verbose preds carry recall-matching content; truncating drops recall faster than precision rises. Length is correlated with low RougeL but not causal — likely confounded by query difficulty.
 - **E2 bge-m3 ColBERT (multi-vector) reranking**. Tested 3 fusion strategies on exp03's pool: pure ColBERT (hit@1 −0.127 vs CE baseline), CE+ColBERT z-score fusion (peak at α=0.9 only +0.0036 iou@1, well within 1σ noise of 0.014), and pool expansion with ColBERT top-20 (+0.0033 pool recall, negligible). bge-m3 ColBERT and bge-reranker-v2-m3 share too much of the underlying signal to be complementary on Thai. Not worth a full LLM run.
+- **Criteria-based few-shot example selection** (exp15–exp16). Scoring candidate (query, paragraph, answer) examples by restate-pattern strength, length proximity, centrality and query-type frequency, then picking the top pair, underperforms exp08's hand-picked pair (+0.0049 / +0.0034 vs +0.0091). Maximising the "restate" proxy (answer echoes the question's opening tokens) selects mechanically templated examples that lift RougeL but leave SS-score flat. The proxy does not capture what makes a good teaching example; both exp08's pair and exp14's dynamic k-NN retrieval beat it.
 
 ### Failure analysis (exp03 train set, 322 queries with IoU=0)
 
@@ -143,7 +147,7 @@ See `IDEAS.md` for the full experiment roadmap and `eval_retrieval/` for the fas
 
 ### Docker container issues
 
-History of `Exit StatusCode 1` in the benchmark backend (resolved at v8; v9 = perf):
+History of `Exit StatusCode 1` in the benchmark backend (resolved at v8; v9 = perf; v10 = few-shot):
 
 | Tag | Changes vs previous | Benchmark / local Apptainer |
 |-----|---------------------|----------------------------|
@@ -154,6 +158,7 @@ History of `Exit StatusCode 1` in the benchmark backend (resolved at v8; v9 = pe
 | v7 | v6 + `tzdata` in requirements (pythainlp needed it) | ✅ local Apptainer |
 | v8 | back to vLLM + Qwen3-32B-AWQ; five gotchas pinned | ✅ local Apptainer (4:48) |
 | v9 | bge-m3 encoding moved from CPU to GPU | ✅ local Apptainer (2:57, −39%) |
+| v10 | v9 + 2-shot few-shot prompting (exp08); `max_model_len` 4096→8192 | ✅ local Apptainer (test exit 0) |
 
 **v8 = the five gotchas** (each one alone leaves the container in `Engine core initialization failed. Failed core proc(s): {}` — an empty dict because the worker dies before its first heartbeat):
 

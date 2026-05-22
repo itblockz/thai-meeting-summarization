@@ -3,8 +3,11 @@ Thai document summarization pipeline.
 
 Retrieval is two-stage: dense (bge-m3) + BM25 build a candidate pool, a
 cross-encoder (bge-reranker-v2-m3) re-scores it, the top-1 paragraph is
-kept. Generation: Qwen3-32B-AWQ via vLLM (matches exp03, best train-set
-composite 0.6256). Output: submission.csv with columns ID, abstractive, refs.
+kept. Generation: Qwen3-32B-AWQ via vLLM with 2-shot prompting — two
+worked (question, paragraph, summary) examples are prepended as
+multi-turn chat-template turns (matches exp08; train-set composite
+0.6361, +0.0091 over exp03 on the doc_050-held-out subset). Output:
+submission.csv with columns ID, abstractive, refs.
 """
 from pathlib import Path
 import os
@@ -36,6 +39,38 @@ SYSTEM_MSG = (
     "คุณเป็นผู้ช่วยสรุปเอกสารภาษาไทย "
     "ตอบคำถามโดยสรุปจากข้อมูลที่ให้มาเท่านั้น ห้ามแต่งเติม"
 )
+
+# Two worked (question, paragraph, summary) examples held out from
+# training (doc_050). build_messages renders them as multi-turn turns;
+# each assistant turn carries the bare answer (no "คำตอบ:" marker) so the
+# model learns to reply with just the summary. Example 1's Thai numeral
+# "ชั้น ๔" is faithful to its gold and source paragraph.
+FEW_SHOT = [
+    {
+        "query": "ในการประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้นที่ใด",
+        "paragraph": "ณ ห้องประชุมกรรมาธิการ N 406 ชั้น ๔ อาคารรัฐสภา",
+        "answer": (
+            "การประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้น "
+            "ณ ห้องประชุมกรรมาธิการ N 406 ชั้น ๔ อาคารรัฐสภา"
+        ),
+    },
+    {
+        "query": "การจัดทำแบบสำรวจความพึงพอใจและไม่พึงพอใจของคณะกรรมาธิการจัดขึ้นเพื่ออะไร",
+        "paragraph": (
+            "สำนักงานเลขาธิการสภาผู้แทนราษฎรขอความอนุเคราะห์ตอบแบบสำรวจ"
+            "ความพึงพอใจและความไม่พึงพอใจของคณะกรรมาธิการต่อการบริหารจัดการ"
+            "ด้านการประชุม การศึกษาดูงาน และการจัดสัมมนา "
+            "เพื่อนำผลการประเมินความพึงพอใจและความไม่พึงพอใจที่ได้ "
+            "ไปเป็นข้อมูลในการทบทวนปรับปรุงและพัฒนาการบริหารจัดการ"
+            "ด้านการประชุม การศึกษาดูงาน และการจัดสัมมนา"
+        ),
+        "answer": (
+            "การจัดทำแบบสำรวจความพึงพอใจและไม่พึงพอใจของคณะกรรมการในครั้งนี้ "
+            "มีการจัดทำขึ้นเพื่อนำข้อมูลที่ได้มาทบทวน ปรับปรุง "
+            "รวมถึงนำไปพัฒนาการปฏิบัติงานให้มีประสิทธิภาพยิ่งขึ้น"
+        ),
+    },
+]
 
 
 def benchmark_lib(i):
@@ -69,17 +104,38 @@ def encode_texts(model, texts, batch_size=EMBED_BATCH):
     )
 
 
-def build_prompt(query, retrieved_texts):
-    context = "\n".join(
-        f"ย่อหน้า {i + 1}: {text}" for i, text in enumerate(retrieved_texts)
-    )
+def build_user_turn(query, retrieved_texts):
+    """A single user turn — the exp03 prompt body, ending in 'คำตอบ:'.
+
+    In multi-turn few-shot, each example is rendered as this exact body,
+    and the matching assistant turn carries just the answer text.
+    """
+    if len(retrieved_texts) == 1:
+        paragraph_block = retrieved_texts[0]
+    else:
+        paragraph_block = "\n".join(
+            f"ย่อหน้า {i + 1}: {t}" for i, t in enumerate(retrieved_texts)
+        )
     return (
         f"คำถาม: {query}\n\n"
-        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n"
+        f"ย่อหน้า 1: {paragraph_block}\n\n"
         f"คำสั่ง: โปรดสรุปคำตอบเป็นภาษาไทยอย่างกระชับและครอบคลุม "
         f"โดยอ้างอิงจากข้อมูลที่ให้มาเท่านั้น\n"
         f"คำตอบ:"
     )
+
+
+def build_messages(query, retrieved_texts):
+    """System + alternating user/assistant few-shot turns + final user target."""
+    messages = [{"role": "system", "content": SYSTEM_MSG}]
+    for ex in FEW_SHOT:
+        messages.append({"role": "user",
+                         "content": build_user_turn(ex["query"], [ex["paragraph"]])})
+        messages.append({"role": "assistant", "content": ex["answer"]})
+    messages.append({"role": "user",
+                     "content": build_user_turn(query, retrieved_texts)})
+    return messages
 
 
 def main():
@@ -162,16 +218,13 @@ def main():
                            if para_text_map.get(pid, "").strip()]
 
         if retrieved_texts:
-            messages = [
-                {"role": "system", "content": SYSTEM_MSG},
-                {"role": "user", "content": build_prompt(q_text, retrieved_texts)},
-            ]
+            messages = build_messages(q_text, retrieved_texts)
         else:
             messages = None
         items.append((query["ID"], ref_ids, messages, q_text))
 
     # ── Stage 2: vLLM batch generation ────────────────────────────────────
-    llm = LLM(model=MODEL_NAME, quantization="awq_marlin", max_model_len=4096,
+    llm = LLM(model=MODEL_NAME, quantization="awq_marlin", max_model_len=8192,
               gpu_memory_utilization=0.90, dtype="half", enforce_eager=True)
     tokenizer = llm.get_tokenizer()
     sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS, repetition_penalty=1.05)
