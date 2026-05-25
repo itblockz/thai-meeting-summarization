@@ -82,8 +82,8 @@ Both `APPTAINER_TMPDIR` and `APPTAINER_CACHEDIR` MUST point at Lustre — `/tmp`
 
 ### Pipeline (two phases)
 
-1. **Retrieval**: For each query, build a candidate pool from the `doc_id` document (dense bge-m3 + BM25, top-20 each), rerank it with a cross-encoder (bge-reranker-v2-m3), and keep the top-`GEN_K` paragraphs.
-2. **Generation**: Pass the `GEN_K` paragraphs as a numbered `[1..K]` context to vLLM running Qwen3-32B-AWQ; it answers in Thai and cites which paragraphs it used as `[อ้างอิง: X]` (E5 self-citation — the cited paragraphs become `refs`). The Docker pipeline (`textsum/model/run.py`) matches exp22 — exp03 retrieval + E5 self-citation + 2-shot multi-turn-chat few-shot — and additionally passes `enforce_eager=True` to skip the V1-engine torch.compile path, which crashes silently inside Apptainer/Docker containers on vllm 0.9.2 (see "Docker container issues").
+1. **Retrieval**: For each query, build a candidate pool from the `doc_id` document (dense bge-m3 + BM25, top-20 each), rerank it with a cross-encoder (bge-reranker-v2-m3). The current best (`exp30/`) keeps the **full reranked union pool** (mean ~28 paragraphs); earlier configs truncated to `GEN_K` (5 or 20).
+2. **Generation**: Pass the reranked paragraphs as a numbered `[1..K]` context to vLLM running Qwen3-32B-AWQ; it answers in Thai and cites which paragraphs it used as `[อ้างอิง: X]` (E5 self-citation — the cited paragraphs become `refs`). The Docker pipeline (`textsum/model/run.py`) still matches **exp22** (GEN_K=5) — exp03 retrieval + E5 self-citation + 2-shot multi-turn-chat few-shot — at image tag **v11**. exp30 (NEW BEST) is not yet ported to the container. Both pass `enforce_eager=True` to skip the V1-engine torch.compile path, which crashes silently inside Apptainer/Docker containers on vllm 0.9.2 (see "Docker container issues").
 
 ### Experiments
 
@@ -100,43 +100,73 @@ LANTA experiment history (train-set composite, ↑ better):
 | `exp06/` — E7 few-shot | exp03 + 2-shot from held-out doc_050 | 0.6329 † |
 | `exp07/` — E7 few-shot | exp03 + 2-shot from held-out doc_047 | 0.6278 † |
 | `exp08/` — E7 few-shot | exp06 + multi-turn chat-template (fixes "คำตอบ:" leak) | 0.6361 † |
+| `exp22/` — E5 + few-shot (**v11 prod**) | exp03 + E5 self-cite (GEN_K=5) + exp08 2-shot | 0.6647 † |
+| `exp23/` — E1' reranker swap | exp22 + Qwen3-Reranker-8B (in place of bge) | 0.6663 † *(+0.0016)* |
+| `exp25/` — GEN_K sweep | exp22 + GEN_K=10 | 0.6717 † |
+| `exp26/` — GEN_K sweep | exp22 + GEN_K=15 | 0.6734 † |
+| `exp27/` — GEN_K sweep | exp22 + GEN_K=20 | 0.6777 † |
+| `exp28/` — fusion ablation | exp27 minus cross-encoder, RRF order only | 0.6743 † |
+| `exp29/` — full pool RRF | exp28 + no GEN_K cap (full pool, RRF order) | 0.6762 † |
+| `exp30/` — full pool rerank (**BEST**) | exp27 + no GEN_K cap (full pool, rerank order) | **0.6783** † ⭐ |
+| `exp32/` — E3 HyDE | exp30 + HyDE-blended dense (α=0.5) | 0.6779 † *(−0.0004)* |
 
 † Held-out evaluation: exp06 scored on 1218 queries excluding doc_050, exp07 on 1211 excluding doc_047, exp08 on the same 1218 as exp06. Apples-to-apples exp03 baselines on those subsets are 0.6270 (doc_050) and 0.6237 (doc_047), so the few-shot deltas are **+0.0059 (exp06)**, **+0.0041 (exp07)** and **+0.0091 (exp08)**. All show statistically significant per-query RougeL improvement (paired t-test p<0.0002), confirming the few-shot signal is real and not a doc-choice artifact. IoU is identical to exp03 because the retrieval pipeline is unchanged.
 
 **E7 sweep (exp09–exp16)**: a #-shots ablation (exp09/exp11 = 1/4-shot, exp10 = 3-shot) confirmed 2-shot is the inverted-U peak; exp12–exp13 reproduced the gain on a different held-out doc (doc_002); dynamic per-query k-NN few-shot (`exp14/`) gives the most *reproducible* gain, **+0.0052** on the full 1239 — exp08's +0.0091 is a high outlier. Criteria-based example selection (exp15–exp16) underperformed and is a dead end (see "What does NOT help"). exp08's hand-picked pair is the chosen production few-shot.
 
-**E5 sweep (exp17–exp22)**: revisited E5 self-citation — feed the LLM the top-`GEN_K=5` reranked paragraphs, it cites which it used → adaptive `refs` — the idea `exp02/` abandoned. exp02 failed only because Qwen2.5-7B could not follow the citation format; Qwen3-32B-AWQ follows it 99%+ of the time. Leak-free results (1218 queries, doc_050 held out): E5 alone is roughly break-even with exp03 (exp17/exp18 ≈ 0.625/0.630), but E5 + 2-shot few-shot lifts it sharply. exp19→exp21 is a single-variable ladder (few-shot **+0.0076**, system-prompt wording **+0.0025**, removing a stray per-paragraph length cap **+0.0169** — the cap, not over-citation, was the dominant IoU drag). `exp22/` swaps in exp08's few-shot pair (both single-ref, which keeps the model's avg cited refs near the 71.8%-single-ref dataset prior) and is the **repo best**.
+**E5 sweep (exp17–exp22)**: revisited E5 self-citation — feed the LLM the top-`GEN_K=5` reranked paragraphs, it cites which it used → adaptive `refs` — the idea `exp02/` abandoned. exp02 failed only because Qwen2.5-7B could not follow the citation format; Qwen3-32B-AWQ follows it 99%+ of the time. Leak-free results (1218 queries, doc_050 held out): E5 alone is roughly break-even with exp03 (exp17/exp18 ≈ 0.625/0.630), but E5 + 2-shot few-shot lifts it sharply. exp19→exp21 is a single-variable ladder (few-shot **+0.0076**, system-prompt wording **+0.0025**, removing a stray per-paragraph length cap **+0.0169** — the cap, not over-citation, was the dominant IoU drag). `exp22/` swaps in exp08's few-shot pair (both single-ref, which keeps the model's avg cited refs near the 71.8%-single-ref dataset prior) — the **production pipeline at image v11**.
 
-**Current best**: `exp22/` — exp03 retrieval + E5 self-citation + 2-shot few-shot — at **0.6647** leak-free (1218 queries, doc_050 held out), **+0.0377** over exp03 on the same subset (0.6270). `exp03/` remains the canonical no-few-shot reference (0.6256 full-1239). The Docker submission pipeline (`textsum/model/run.py`) matches **exp22** as of image tag **v11**. Intentional container settings: `enforce_eager=True` (see "Docker container issues") and `max_model_len=16384` (the few-shot E5 prompt needs it). The worked examples are the `_SHOT1_*`/`_SHOT2_*` constants in `textsum/model/run.py` — exp08's hand-picked pair rendered in E5 form.
+**Reranker swap (exp23, leak-free)**: replacing bge-reranker-v2-m3 with **Qwen3-Reranker-8B** lifts retrieval metrics dramatically (hit@1 0.7401→0.7579 +0.018, hit@5 0.9112→0.9314 +0.020, MRR 0.8155→0.8345 +0.019, iou@1 0.6190→0.6344 +0.015) but the composite barely moves: **0.6647 → 0.6663 (+0.0016)**. At GEN_K=5 both rerankers put gold in top-5 ≥91% of the time; the reordering within top-5 doesn't change what E5 self-cite picks. IoU actually drops −0.0062 — Qwen3-8B's rank distribution differs enough that the LLM cites a slightly different set. Not the headline gain the retrieval numbers suggested. *(Whether the gain transfers to exp30's full-pool setup is open — see exp33 below.)*
+
+**GEN_K sweep (exp25–exp27, leak-free)**: lift GEN_K from 5 → 10 → 15 → 20 on top of exp22; each step monotonically improves IoU, RougeL, SS:
+| GEN_K | RougeL | SS | IoU | composite |
+|-------|--------|------|------|-----------|
+| 5 (exp22) | 0.4454 | 0.8384 | 0.6575 | 0.6647 |
+| 10 (exp25) | 0.4516 | 0.8445 | 0.6680 | 0.6717 |
+| 15 (exp26) | 0.4530 | 0.8453 | 0.6725 | 0.6734 |
+| 20 (exp27) | 0.4585 | 0.8460 | 0.6824 | **0.6777** |
+The avg dense∪BM25 union is ~28.6 — GEN_K=20 already captures the bulk; further expansion has diminishing returns. The earlier exp02 verdict that "feeding more context hurts" was a Qwen2.5-7B artefact; Qwen3-32B-AWQ exploits the extra context cleanly.
+
+**Order-vs-selection ablation (exp28–exp29, leak-free)**: at GEN_K=20, drop the cross-encoder and order by RRF instead — exp28 = 0.6743 (loses to exp27 by −0.0034). At full pool (no GEN_K cap) with RRF order — exp29 = 0.6762 (still loses to rerank). The cross-encoder's value at K≥20 is ordering quality (RougeL/SS lift from gold at rank 1), not selection — selection at K≥20 is solved by union recall.
+
+**Full-pool + rerank order — exp30 (NEW BEST, leak-free)**: feed the full dense∪BM25 union (mean 28.57 paragraphs) ordered by bge-reranker score, no GEN_K cap. Combines exp27's order quality with exp29's pool inclusion → **0.6783** (+0.0006 over exp27, +0.0136 over exp22 production). RougeL 0.4584 / SS 0.8467 / IoU 0.6844. This is the current repo best.
+
+**HyDE (exp31 retrieval-only, exp32 LLM, leak-free)**: Qwen3-32B-AWQ writes a hypothetical paragraph per query (preserving numeric/named entities), embed with bge-m3, blend with original query embedding at α=0.5 before dense retrieval. Retrieval-only: hit@1 +0.035, hit@20 +0.006 (`eval_retrieval/hyde_eval.py`). But exp32 = exp30 + HyDE blend gives **0.6779 — basically flat (−0.0004)**. Rerank uses the original query, so HyDE's dense-ranking lift is mostly washed out; pool composition barely changes (BM25 catches what HyDE adds). E3 closed.
+
+**Current best**: `exp30/` — exp22 retrieval pool + bge-reranker order on the full union + E5 self-cite + exp08 few-shot — at **0.6783** leak-free, **+0.0136** over the v11 container (exp22 = 0.6647 leak-free). `exp03/` remains the canonical no-few-shot reference (0.6256 full-1239). The Docker submission pipeline (`textsum/model/run.py`) still matches **exp22** as of image tag **v11**; porting exp30 to the container needs `GEN_K` removed and the per-query LLM context to grow from ~1.5K to ~5K tokens (already inside `max_model_len=16384`). Intentional container settings: `enforce_eager=True` (see "Docker container issues") and `max_model_len=16384` (the few-shot E5 prompt needs it). The worked examples are the `_SHOT1_*`/`_SHOT2_*` constants — exp08's hand-picked pair rendered in E5 form.
 
 See `IDEAS.md` for the full experiment roadmap and `eval_retrieval/` for the fast retrieval harness.
 
 **Score breakdown:**
 
-|          | baseline | exp01  | exp03  | exp22 (best) |
-|----------|----------|--------|--------|--------------|
-| RougeL   | 0.3387   | 0.3723 | 0.3928 | 0.4454       |
-| SS-score | 0.7667   | 0.8016 | 0.8096 | 0.8384       |
-| IoU      | 0.4744   | 0.6190 | 0.6190 | 0.6575       |
-| **Composite** | **0.5584** | **0.6148** | **0.6256** | **0.6647** |
+|          | baseline | exp01  | exp03  | exp22 (prod) | exp27  | **exp30 (best)** |
+|----------|----------|--------|--------|--------------|--------|------------------|
+| RougeL   | 0.3387   | 0.3723 | 0.3928 | 0.4454       | 0.4585 | **0.4584**       |
+| SS-score | 0.7667   | 0.8016 | 0.8096 | 0.8384       | 0.8460 | **0.8467**       |
+| IoU      | 0.4744   | 0.6190 | 0.6190 | 0.6575       | 0.6824 | **0.6844**       |
+| **Composite** | **0.5584** | **0.6148** | **0.6256** | **0.6647** | **0.6777** | **0.6783** |
 
-baseline/exp01/exp03 are full-1239; exp22 is leak-free (1218, doc_050 held out — the few-shot examples come from it). exp03 on that same 1218 subset = 0.6270, so exp22 is **+0.0377**.
+baseline/exp01/exp03 are full-1239; exp22/exp27/exp30 are leak-free (1218, doc_050 held out — the few-shot examples come from it). exp03 on that same 1218 subset = 0.6270, so exp30 is **+0.0513** over exp03 and **+0.0136** over the v11 container (exp22).
 
 **Key design decisions:**
 - Two-stage retrieval: dense (bge-m3) + BM25 build a candidate pool (top-20 each), a cross-encoder (bge-reranker-v2-m3) reranks it.
-- `GEN_K=5`: feed the LLM the top-5 reranked paragraphs (the elbow of the rerank recall curve — hit@5 = 0.912 vs hit@1 = 0.739); E5 self-citation then reports the subset actually used as `refs`. `exp03/` and the `exp04`–`exp16` line instead use `TOP_K=1` — retrieve, generate from, and report exactly one paragraph.
+- **exp30 (current best)** feeds the LLM the *full reranked union pool* (mean 28.57 paras) — no GEN_K cap; E5 self-citation reports the subset actually cited as `refs`. The GEN_K sweep (exp22→exp25→exp26→exp27→exp30 = 5→10→15→20→full) showed monotonic gain; the v11 container still uses **GEN_K=5** (exp22).
+- `GEN_K=5` (production v11) was the elbow of the rerank recall curve — hit@5 = 0.912 vs hit@1 = 0.739; the gain past K=5 only materialised once we switched to Qwen3-32B-AWQ (the 7B model in exp02 couldn't exploit the extra context).
+- `exp03/` and the `exp04`–`exp16` line instead use `TOP_K=1` — retrieve, generate from, and report exactly one paragraph.
 - bge-m3 and the cross-encoder both run on GPU; the cross-encoder is freed (`del` + `empty_cache`) before the LLM loads. (`exp03/` and earlier `expNN` embed bge-m3 on CPU — a pre-v9 convention to keep CUDA uninitialised until vLLM spawns its workers.)
 - LANTA SLURM scripts set `VLLM_WORKER_MULTIPROC_METHOD=spawn` — required when CrossEncoder touches CUDA before vLLM init, otherwise the forked worker crashes.
 
 ### What does NOT help (verified, don't retry without new evidence)
 
-- **Switching the reranker** to Qwen3-Reranker-0.6B / jina-reranker-v3 / Qwen3-Reranker-4B. On MIRACL Thai nDCG@10 our current `bge-reranker-v2-m3` (82.29) already beats them all at 0.6B and matches Qwen3-Reranker-4B (82.00). Reranker swap is a dead end for Thai.
-- **Expanding the candidate pool** (`POOL_N=20 → 40`). hit@1 dropped 0.7401 → 0.7393; the rerank misranks the extra candidates and adds noise.
+- **Switching the reranker** to Qwen3-Reranker-0.6B / jina-reranker-v3 / Qwen3-Reranker-4B. On MIRACL Thai nDCG@10 our current `bge-reranker-v2-m3` (82.29) already beats them all at 0.6B and matches Qwen3-Reranker-4B (82.00). Reranker swap is a dead end for Thai at those sizes. **Qwen3-Reranker-8B is a separate story**: it lifts every retrieval metric (hit@1 +0.018, iou@1 +0.015, MRR +0.019) but at GEN_K=5 only adds +0.0016 composite (exp23) because both rerankers already put gold in top-5 ≥91% of the time. Whether the gain transfers to exp30's full-pool setup is the only open question on the reranker axis.
+- **Expanding the candidate pool** (`POOL_N=20 → 40`). hit@1 dropped 0.7401 → 0.7393; the rerank misranks the extra candidates and adds noise. *Pool-recall sweep on `eval_retrieval/pool_recall_eval.py` confirms only **pool size** moves the needle on pool inclusion (`union_40` +0.0105 pool_recall, +0.0413 ref_recall vs `union_20`) — **fusion strategy** at matched pool size (RRF k=10/30/60/100, weighted score fusion α=0–1) is dead end (all within ±0.005 of `union_20`, mostly worse). E4 fusion-tuning closed.*
 - **Rewriting the system prompt** to "direct QA, you may rephrase" (exp05). Composite dropped −0.0040; Qwen3-32B-AWQ already interprets the original "summarize concisely" prompt correctly, and granting explicit rephrase permission pushed outputs further from gold.
 - **E5 self-citation fed to a small model** (exp02, Qwen2.5-7B). The 7B model didn't follow the citation format reliably and IoU collapsed 0.6190 → 0.4870. This is model-specific and **not** a verdict on E5 itself — with Qwen3-32B-AWQ the format is followed 99%+ of the time and E5 + few-shot (`exp22/`) is the current best (see "E5 sweep"). The lesson: don't feed E5 self-citation to a <10B model.
 - **E6 adaptive K from rerank score gap**. bge-reranker scores don't correlate with correctness; three strategies (abs gap, threshold, top1 ratio) all lose to K=1, and oracle K=|gold| only +0.0045 composite — not worth chasing.
 - **E8 length calibration / truncation**. Pred is ~1.18x gold at the median, and corr(RougeL, |pred − gold|) = −0.414, but post-hoc truncation of exp03 predictions LOSES RougeL at every cap, including the oracle cap = |gold tokens| (−0.0025). The verbose preds carry recall-matching content; truncating drops recall faster than precision rises. Length is correlated with low RougeL but not causal — likely confounded by query difficulty.
 - **E2 bge-m3 ColBERT (multi-vector) reranking**. Tested 3 fusion strategies on exp03's pool: pure ColBERT (hit@1 −0.127 vs CE baseline), CE+ColBERT z-score fusion (peak at α=0.9 only +0.0036 iou@1, well within 1σ noise of 0.014), and pool expansion with ColBERT top-20 (+0.0033 pool recall, negligible). bge-m3 ColBERT and bge-reranker-v2-m3 share too much of the underlying signal to be complementary on Thai. Not worth a full LLM run.
+- **E3 HyDE / query expansion** (exp31 retrieval-only, exp32 LLM). Qwen3-32B-AWQ writes a hypothetical paragraph per query, embed with bge-m3, blend at α=0.5 with the original query before dense retrieval. Retrieval-only: hit@1 +0.0348, hit@20 +0.0057. **exp32 = exp30 + HyDE-blend dropped to 0.6779 (−0.0004)** — the lift washes out because (a) cross-encoder rerank still uses the *raw* query so it ignores HyDE entirely, and (b) BM25 already covers what HyDE adds to the pool. Cache at `eval_retrieval/cache/hyde_train.json` is preserved for any future ablation.
+- **RRF replacing the cross-encoder** at high K (exp28/exp29). At GEN_K=20 RRF (k=60) loses to bge-reranker by −0.0034; at full pool RRF loses by −0.0021. The cross-encoder's value at K≥20 is *ordering* quality (gold at rank 1 → higher LLM attention → RougeL/SS lift), not pool selection.
 - **Criteria-based few-shot example selection** (exp15–exp16). Scoring candidate (query, paragraph, answer) examples by restate-pattern strength, length proximity, centrality and query-type frequency, then picking the top pair, underperforms exp08's hand-picked pair (+0.0049 / +0.0034 vs +0.0091). Maximising the "restate" proxy (answer echoes the question's opening tokens) selects mechanically templated examples that lift RougeL but leave SS-score flat. The proxy does not capture what makes a good teaching example; both exp08's pair and exp14's dynamic k-NN retrieval beat it.
 
 ### Failure analysis (exp03 train set, 322 queries with IoU=0)
