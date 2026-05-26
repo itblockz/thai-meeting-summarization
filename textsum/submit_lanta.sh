@@ -7,7 +7,7 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=02:00:00
+#SBATCH --time=06:00:00
 #SBATCH --output=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047/logs/textsum_%j.out
 #SBATCH --error=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047/logs/textsum_%j.err
 
@@ -22,6 +22,7 @@ source "$SHARED/venv/bin/activate"
 export TEST_DIR="$PROJECT/textsum/model/test"
 export RESULT_DIR="$PROJECT/textsum/result"
 export PROGRESS_LIB="$PROJECT/textsum/benchmark_lib/progress"
+export MAX_MODEL_LEN="32768"
 
 export HF_HOME="$SHARED/.hf_cache"
 export TRANSFORMERS_CACHE="$SHARED/.hf_cache"

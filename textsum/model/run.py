@@ -1,50 +1,49 @@
 """
 Thai document summarization pipeline (production / Docker submission).
 
-Retrieval is two-stage: dense (bge-m3) + BM25 build a candidate pool, a
-cross-encoder (bge-reranker-v2-m3) re-scores it, and the top-GEN_K
-paragraphs are kept. Generation: Qwen3-32B-AWQ via vLLM. The model is
-shown the GEN_K paragraphs as a numbered [1..K] context, answers in
-Thai, then cites which paragraphs it used as [อ้างอิง: X]; the cited
-paragraphs become `refs` (E5 self-citation, adaptive count). Two worked
-few-shot examples are prepended as multi-turn chat turns.
+NO RETRIEVAL: the full list of *valid* paragraphs from `doc_id` is fed to
+Qwen3-32B-AWQ in original document order. The model is shown the
+paragraphs as a numbered [1..N] context, answers in Thai, then cites
+which paragraphs it used as [อ้างอิง: X]; the cited paragraphs become
+`refs` (E5 self-citation, adaptive count). Two worked few-shot examples
+are prepended as multi-turn chat turns.
 
-This matches exp22 — exp03 two-stage retrieval + E5 self-citation +
-2-shot few-shot (exp08's example pair, from held-out doc_050). Train-set
-composite 0.6647 leak-free (1218 queries, doc_050 excluded) — the repo
-best, +0.0286 over the previous exp08 production pipeline.
+This matches exp35 — full-doc context (no retrieval) + E5 self-citation
++ 2-shot few-shot (exp08's example pair, from held-out doc_050).
+Train-set composite 0.6929 leak-free (1218 queries, doc_050 excluded) —
+the repo best, +0.0282 over the previous exp22 production pipeline.
+
+Why drop retrieval: the cross-encoder rerank was the main failure mode
+in exp03's IoU=0 cases (83.5% had gold in the pool but ranked low).
+Giving the LLM the entire document — preserving narrative/meeting flow
+in document order — beats every retrieval variant we tried. exp36
+(same setup, rerank order) lost −0.011 to exp35: order matters,
+selection doesn't.
+
+Token math (Qwen3 tokenizer, full system + 2-shot + full-doc + query +
+chat template): min=8916, median=14139, p95=23069, max=28646 on the
+train set. max_model_len=32768 leaves headroom.
 
 Container-specific settings (vllm 0.9.2 in the image): enforce_eager=True
 skips the V1-engine torch.compile path that crashes silently inside
-Apptainer/Docker; max_model_len=16384 fits the few-shot E5 prompt.
+Apptainer/Docker.
 
 Output: submission.csv with columns ID, abstractive, refs.
 """
 from pathlib import Path
 import os
-import gc
 import re
 import json
 import csv
 
-import numpy as np
-import torch
-import torch.nn.functional as F
-from sentence_transformers import SentenceTransformer, CrossEncoder
-from rank_bm25 import BM25Okapi
-from pythainlp.tokenize import word_tokenize
 from vllm import LLM, SamplingParams
 
 TEST_DIR     = os.environ.get("TEST_DIR",     "/model/test")
 RESULT_DIR   = os.environ.get("RESULT_DIR",   "/result/")
 PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
 
-POOL_N         = 20     # top-N from each stage-1 retriever before rerank
-GEN_K          = 5      # reranked paragraphs fed to the LLM as numbered context
-EMBED_BATCH    = 64
 MAX_NEW_TOKENS = 512
-EMBED_MODEL    = "BAAI/bge-m3"
-RERANK_MODEL   = "BAAI/bge-reranker-v2-m3"
+MAX_MODEL_LEN  = int(os.environ.get("MAX_MODEL_LEN", "32768"))
 MODEL_NAME     = os.environ.get("LLM_MODEL", "Qwen/Qwen3-32B-AWQ")
 
 SYSTEM_MSG = (
@@ -98,22 +97,9 @@ def filter_valid_paragraphs(paragraphs):
     return [p for p in paragraphs if is_valid(p)]
 
 
-def tokenize_th(text):
-    return word_tokenize(text, engine="newmm", keep_whitespace=False)
-
-
-def encode_texts(model, texts, batch_size=EMBED_BATCH):
-    return model.encode(
-        texts, batch_size=batch_size, convert_to_tensor=True,
-        normalize_embeddings=True, show_progress_bar=False,
-    )
-
-
 def build_prompt(query, paras):
     """E5 prompt — numbered [1..N] context + an inline citation request."""
-    context = "\n".join(
-        f"[{i + 1}] {t}" for i, t in enumerate(paras)
-    )
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
     return (
         f"คำถาม: {query}\n\n"
         f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
@@ -154,7 +140,7 @@ def parse_citation(text, n_paras):
         if 1 <= num <= n_paras and num not in seen:
             seen.add(num)
             valid.append(num - 1)
-    return valid or [0]  # fallback: top-ranked paragraph
+    return valid or [0]  # fallback: first paragraph
 
 
 def split_answer_citation(text):
@@ -176,79 +162,34 @@ def main():
     doc_index = {doc["doc_id"]: doc["paragraphs"] for doc in data["docs"]}
     queries = data["queries"]
     n = len(queries)
-    print(f"{n} queries, {len(doc_index)} docs", flush=True)
+    print(f"{n} queries, {len(doc_index)} docs "
+          f"(NO RETRIEVAL — full doc, max_model_len={MAX_MODEL_LEN})", flush=True)
 
-    # ── Stage 1a: embed paragraphs + queries (GPU), build BM25 ────────────
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    embed_model = SentenceTransformer(EMBED_MODEL, device=device)
-    doc_para_data = {}   # doc_id -> (valid_paras, para_embs, bm25)
+    # Pre-build full-doc paragraph lists (in document order) once per doc.
+    doc_paras = {}
     for doc_id, paragraphs in doc_index.items():
-        valid = filter_valid_paragraphs(paragraphs)
-        if valid:
-            embs = encode_texts(embed_model, [p["text"] for p in valid])
-            bm25 = BM25Okapi([tokenize_th(p["text"]) for p in valid])
-        else:
-            embs = torch.zeros((0, embed_model.get_sentence_embedding_dimension()))
-            bm25 = None
-        doc_para_data[doc_id] = (valid, embs, bm25)
+        doc_paras[doc_id] = filter_valid_paragraphs(paragraphs)
 
-    query_embs = encode_texts(embed_model, [q["query"] for q in queries])
-    del embed_model
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    print(f"Embeddings + BM25 done ({device}).", flush=True)
-
-    # ── Stage 1b: build candidate pools, collect (query, paragraph) pairs ──
-    pools = []   # per query: list of (para_id, text)
-    pair_texts, pair_qidx = [], []
-    for i, query in enumerate(queries):
-        valid, para_embs, bm25 = doc_para_data.get(
-            query["doc_id"], ([], torch.zeros((0, 1)), None))
-        if not valid:
-            pools.append([])
-            continue
-        sims = F.cosine_similarity(query_embs[i].unsqueeze(0), para_embs, dim=1)
-        dense_idx = torch.topk(sims, k=min(POOL_N, len(valid))).indices.tolist()
-        bm25_scores = np.asarray(bm25.get_scores(tokenize_th(query["query"])))
-        bm25_idx = np.argsort(-bm25_scores)[:POOL_N].tolist()
-        pool_idx = list(dict.fromkeys(dense_idx + bm25_idx))   # union, order-preserving
-        pools.append([(valid[j]["para_id"], valid[j]["text"]) for j in pool_idx])
-        for j in pool_idx:
-            pair_texts.append((query["query"], valid[j]["text"]))
-            pair_qidx.append(i)
-
-    # ── Stage 1c: cross-encoder rerank (GPU) ──────────────────────────────
-    reranker = CrossEncoder(RERANK_MODEL, max_length=512, device=device)
-    pair_scores = reranker.predict(pair_texts, batch_size=64, show_progress_bar=False)
-    del reranker
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    print(f"Reranked {len(pair_texts)} pairs ({device}).", flush=True)
-
-    scores_by_q = {}
-    for qi, s in zip(pair_qidx, pair_scores):
-        scores_by_q.setdefault(qi, []).append(float(s))
-
-    # ── assemble: top-GEN_K reranked paragraphs per query ─────────────────
     items = []   # (ID, gen_pids, gen_texts, messages_or_None, query_text)
+    pool_sizes = []
     for i, query in enumerate(queries):
         benchmark_lib(i)
-        pool = pools[i]
+        valid = doc_paras.get(query["doc_id"], [])
         q_text = query["query"]
-        if pool:
-            scores = scores_by_q.get(i, [])
-            order = sorted(range(len(pool)), key=lambda j: -scores[j])[:GEN_K]
-            gen_pids  = [pool[j][0] for j in order]
-            gen_texts = [pool[j][1] for j in order]
+        if valid:
+            gen_pids  = [p["para_id"] for p in valid]
+            gen_texts = [p["text"]    for p in valid]
+            pool_sizes.append(len(valid))
             messages = build_messages(q_text, gen_texts)
         else:
             gen_pids, gen_texts, messages = [], [], None
         items.append((query["ID"], gen_pids, gen_texts, messages, q_text))
 
-    # ── Stage 2: vLLM batch generation ────────────────────────────────────
-    llm = LLM(model=MODEL_NAME, quantization="awq_marlin", max_model_len=16384,
+    if pool_sizes:
+        print(f"pool sizes — mean={sum(pool_sizes)/len(pool_sizes):.2f}, "
+              f"min={min(pool_sizes)}, max={max(pool_sizes)}", flush=True)
+
+    llm = LLM(model=MODEL_NAME, quantization="awq_marlin", max_model_len=MAX_MODEL_LEN,
               gpu_memory_utilization=0.90, dtype="half", enforce_eager=True)
     tokenizer = llm.get_tokenizer()
     sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS, repetition_penalty=1.05)
@@ -261,22 +202,32 @@ def main():
 
     outputs = llm.generate(prompts, sampling)
 
-    # ── Stage 3: parse answer + citations ([อ้างอิง: X] format) ───────────
+    cite_re = re.compile(r'\[อ้างอิง[:\s]+[0-9,\s]+\]')
     results = []
+    n_explicit = 0
+    ref_counts = []
     for it, out in zip(items, outputs):
         qid, gen_pids, gen_texts, _, q_text = it
         raw = out.outputs[0].text.strip()
         answer, _ = split_answer_citation(raw)
-        cited_idx = parse_citation(raw, len(gen_pids))   # 0-indexed, fallback [0]
+        cited_idx = parse_citation(raw, len(gen_pids))
         if gen_pids:
             ref_ids = [gen_pids[j] for j in cited_idx if j < len(gen_pids)]
             if not ref_ids:
-                ref_ids = [gen_pids[0]]      # fallback: top-1 reranked
+                ref_ids = [gen_pids[0]]
         else:
             ref_ids = []
+        if cite_re.search(raw):
+            n_explicit += 1
         if not answer:
             answer = gen_texts[0] if gen_texts else q_text
+        ref_counts.append(len(ref_ids))
         results.append({"ID": qid, "abstractive": answer, "refs": ",".join(ref_ids)})
+
+    print(f"citations: {n_explicit}/{len(results)} emitted an [อ้างอิง: …] tag, "
+          f"{len(results) - n_explicit} fell back to top-1", flush=True)
+    if ref_counts:
+        print(f"avg refs/query: {sum(ref_counts) / len(ref_counts):.2f}", flush=True)
 
     out_path = Path(RESULT_DIR) / "submission.csv"
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -16,10 +16,10 @@ From: nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
     ln -sf /usr/bin/python3.11 /usr/bin/python3
     pip3 install --no-cache-dir --timeout 300 --retries 5 torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
     pip3 install --no-cache-dir --timeout 300 --retries 5 -r /requirements.txt
+    # v12 (exp35): no-retrieval pipeline; only the LLM weights are needed.
+    # bge-m3 / bge-reranker-v2-m3 dropped — shaves ~3 GB off the SIF.
     python3 -c "from huggingface_hub import snapshot_download; \
-snapshot_download('BAAI/bge-m3'); \
-snapshot_download('Qwen/Qwen3-32B-AWQ'); \
-snapshot_download('BAAI/bge-reranker-v2-m3')"
+snapshot_download('Qwen/Qwen3-32B-AWQ')"
     rm -rf /buildtmp
 
 %environment

@@ -7,7 +7,7 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=04:00:00
+#SBATCH --time=06:00:00
 #SBATCH --output=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047/logs/eval_train_%j.out
 #SBATCH --error=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047/logs/eval_train_%j.err
 
@@ -22,6 +22,7 @@ source "$SHARED/venv/bin/activate"
 export TEST_DIR="$PROJECT/textsum/eval_train"
 export RESULT_DIR="$PROJECT/textsum/eval_train/result"
 export PROGRESS_LIB="$PROJECT/textsum/benchmark_lib/progress"
+export MAX_MODEL_LEN="32768"
 export HF_HOME="$SHARED/.hf_cache"
 export TRANSFORMERS_CACHE="$SHARED/.hf_cache"
 export HF_HUB_OFFLINE=1
@@ -34,5 +35,9 @@ echo "=== Running inference on train set ==="
 cd "$PROJECT/textsum/model"
 python3 run.py
 
-echo "=== Computing evaluation metrics ==="
+echo "=== Computing evaluation metrics (full 1239, has doc_050 few-shot leak) ==="
 python3 "$PROJECT/textsum/eval_train/score.py" "$RESULT_DIR/submission.csv"
+
+echo "=== Leak-free scoring (hold out doc_050, 1218 queries) ==="
+cd "$PROJECT/textsum/eval_train"
+python3 score_heldout.py "$RESULT_DIR/submission.csv" doc_050
