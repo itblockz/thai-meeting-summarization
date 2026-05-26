@@ -29,7 +29,7 @@ apptainer exec --nv --containall --pwd /model \
     --bind "$PROJECT/textsum/benchmark_lib:/benchmark_lib:ro" \
     --bind "$RESULT:/result" \
     --env VLLM_WORKER_MULTIPROC_METHOD=spawn \
-    --env VLLM_USE_V1=0 \
+    --env VLLM_ENABLE_V1_MULTIPROCESSING=0 \
     --env MAX_MODEL_LEN=32768 \
     "$PROJECT/textsum_v15_local.sif" python3 /model/run.py
 
