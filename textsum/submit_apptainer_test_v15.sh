@@ -28,8 +28,11 @@ apptainer exec --nv --containall --pwd /model \
     --bind "$PROJECT/textsum/model/test:/model/test:ro" \
     --bind "$PROJECT/textsum/benchmark_lib:/benchmark_lib:ro" \
     --bind "$RESULT:/result" \
-    --env VLLM_WORKER_MULTIPROC_METHOD=spawn \
-    --env VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+    --env VLLM_WORKER_MULTIPROC_METHOD=fork \
+    --env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False \
+    --env VLLM_DISABLE_CUSTOM_ALL_REDUCE=1 \
+    --env CUDA_LAUNCH_BLOCKING=1 \
+    --env TORCH_USE_CUDA_DSA=1 \
     --env MAX_MODEL_LEN=32768 \
     "$PROJECT/textsum_v15_local.sif" python3 /model/run.py
 
