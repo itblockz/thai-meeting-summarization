@@ -8,15 +8,26 @@ which paragraphs it used as [อ้างอิง: X]; the cited paragraphs bec
 `refs` (E5 self-citation, adaptive count). Two worked few-shot examples
 are prepended as multi-turn chat turns.
 
-This matches exp35 — full-doc context (no retrieval) + E5 self-citation
-+ 2-shot few-shot (exp08's example pair, from held-out doc_050).
-Train-set composite 0.6929 leak-free (1218 queries, doc_050 excluded) —
-the repo best, +0.0282 over the previous exp22 production pipeline.
+This matches exp37 — full-doc context (no retrieval) + E5 self-citation
++ 2-shot few-shot (exp08's example pair, from held-out doc_050) +
+**context-first prompt order** (doc context placed BEFORE the per-query
+text, so vLLM's prefix cache can reuse the ~14K-token full-doc prefix
+across all queries from the same doc — was ~5% cache hit with the
+query-first order of exp35).
+Train-set composite **0.6944 leak-free** (1218 queries, doc_050
+excluded) — the repo best, +0.0015 over exp35 and +0.0297 over exp22.
 
-v13 throughput optimisations (no model-output change vs v12):
+v14 = v13 infra (sort by doc_id, streaming progress, KV opts) PLUS
+context-first prompt order. The infra changes alone were no-op for
+output (verified container-vs-venv drift ≤1/50). The prompt-order swap
+in v14 is the actual score win.
+
+v13 throughput optimisations (carry over):
 - Sort queries by doc_id before submitting to vLLM — queries from the
   same doc share the ~14K-token full-doc prefix, so vLLM's
   enable_prefix_caching reuses the prefilled KV blocks across them.
+  With v14's context-first prompt, cache hit ceiling rises from ~5%
+  (v13) to ~90% (the doc context is now in the shared prefix).
 - max_num_batched_tokens 8192 → 16384 — single-chunk prefill for the
   median ~14K-tok prompt (was 2 chunks). Bigger (32768) OOM'd at MLP
   forward because Qwen3-32B's intermediate dim 27648 needs ~1.5GB
@@ -25,8 +36,8 @@ v13 throughput optimisations (no model-output change vs v12):
   benchmark `progress` binary is called as each request *finishes* (not
   during prompt prep, which was instant) so the backend sees real-time
   progress and a SLURM log shows a heartbeat.
-- gpu_memory_utilization kept at 0.90 (raising to 0.95 left no room for
-  activations and OOM'd — see v13a failure note above).
+- gpu_memory_utilization kept at 0.90 (0.95 left no room for
+  activations and OOM'd — v13a failure on lanta-g-006).
 
 Container-specific settings (vllm 0.9.2 in the image): enforce_eager=True
 skips the V1-engine torch.compile path that crashes silently inside
@@ -113,11 +124,17 @@ def filter_valid_paragraphs(paragraphs):
 
 
 def build_prompt(query, paras):
-    """E5 prompt — numbered [1..N] context + an inline citation request."""
+    """E5 prompt — CONTEXT FIRST, then query, then instruction.
+
+    Context-first lets vLLM's prefix cache match the full ~14K-token doc
+    block across all queries from the same doc (the query is the
+    divergence point, not the cache-killer at the start). Instruction
+    stays at the end for recency bias on the citation directive.
+    """
     context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
     return (
-        f"คำถาม: {query}\n\n"
         f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
         f"คำสั่ง: โปรดสรุปคำตอบเป็นภาษาไทยอย่างกระชับและครอบคลุม "
         f"โดยอ้างอิงจากข้อมูลที่ให้มาเท่านั้น "
         f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y]\n"
