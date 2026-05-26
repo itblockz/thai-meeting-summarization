@@ -24,8 +24,12 @@ mkdir -p "$RESULT" "$PROJECT/logs"
 # vllm-0.9.2 container's actual score, since exp37's 0.6944 was on the
 # vllm-0.19.1 venv and v14 container drifted 33/50 vs venv on test set.
 echo "=== v14 container — train eval (1239 queries via Apptainer) ==="
+# eval_train/test.json is an absolute symlink → SHARED/dataset/train_set.json.
+# Symlink target is outside any --bind so it breaks inside --containall. Bind
+# the resolved file directly as /model/test/test.json (the /model/test dir
+# already exists in the SIF from COPY model /model at build time).
 apptainer exec --nv --containall --pwd /model \
-    --bind "$PROJECT/textsum/eval_train:/model/test:ro" \
+    --bind "$SHARED/dataset/train_set.json:/model/test/test.json:ro" \
     --bind "$PROJECT/textsum/benchmark_lib:/benchmark_lib:ro" \
     --bind "$RESULT:/result" \
     --env VLLM_WORKER_MULTIPROC_METHOD=spawn \
