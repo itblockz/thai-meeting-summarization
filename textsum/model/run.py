@@ -17,13 +17,16 @@ v13 throughput optimisations (no model-output change vs v12):
 - Sort queries by doc_id before submitting to vLLM — queries from the
   same doc share the ~14K-token full-doc prefix, so vLLM's
   enable_prefix_caching reuses the prefilled KV blocks across them.
-- gpu_memory_utilization 0.90 → 0.95 — more KV cache, higher concurrency.
-- max_num_batched_tokens 8192 → 32768 — single-chunk prefill for the
-  full-doc prompts (was 4 chunks per ~28K-tok prompt).
+- max_num_batched_tokens 8192 → 16384 — single-chunk prefill for the
+  median ~14K-tok prompt (was 2 chunks). Bigger (32768) OOM'd at MLP
+  forward because Qwen3-32B's intermediate dim 27648 needs ~1.5GB
+  activation per chunk; 16384 halves that to a safe ~750MB.
 - LLMEngine.step() streaming instead of llm.generate() — the
   benchmark `progress` binary is called as each request *finishes* (not
   during prompt prep, which was instant) so the backend sees real-time
   progress and a SLURM log shows a heartbeat.
+- gpu_memory_utilization kept at 0.90 (raising to 0.95 left no room for
+  activations and OOM'd — see v13a failure note above).
 
 Container-specific settings (vllm 0.9.2 in the image): enforce_eager=True
 skips the V1-engine torch.compile path that crashes silently inside
@@ -47,8 +50,14 @@ PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
 
 MAX_NEW_TOKENS         = 512
 MAX_MODEL_LEN          = int(os.environ.get("MAX_MODEL_LEN", "32768"))
-MAX_NUM_BATCHED_TOKENS = int(os.environ.get("MAX_NUM_BATCHED_TOKENS", "32768"))
-GPU_MEM_UTIL           = float(os.environ.get("GPU_MEM_UTIL", "0.95"))
+# 16384 = sweet spot: 1 prefill chunk for the median ~14K-tok prompt, 2
+# chunks for the max ~28K-tok prompt. 32768 OOM'd at MLP activation
+# (~1.5 GB per chunk for Qwen3-32B's 27648 intermediate dim) — see v13a
+# failure on lanta-g-006 (job 5798218).
+MAX_NUM_BATCHED_TOKENS = int(os.environ.get("MAX_NUM_BATCHED_TOKENS", "16384"))
+# 0.90 = same as v12 (proven safe). 0.95 left only ~100 MiB headroom
+# after model (18GB) + KV cache + activations → OOM during MLP forward.
+GPU_MEM_UTIL           = float(os.environ.get("GPU_MEM_UTIL", "0.90"))
 MODEL_NAME             = os.environ.get("LLM_MODEL", "Qwen/Qwen3-32B-AWQ")
 
 SYSTEM_MSG = (
