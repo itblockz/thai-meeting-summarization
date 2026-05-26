@@ -42,6 +42,7 @@ import json
 import csv
 import time
 
+from transformers import AutoTokenizer
 from vllm import LLMEngine, EngineArgs, SamplingParams
 
 TEST_DIR     = os.environ.get("TEST_DIR",     "/model/test")
@@ -220,8 +221,10 @@ def main():
         max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
         enable_prefix_caching=True,
     )
+    # Load tokenizer separately via AutoTokenizer — engine.get_tokenizer() was
+    # added in vllm 0.10+ and is absent in 0.9.2 (container).
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     engine = LLMEngine.from_engine_args(engine_args)
-    tokenizer = engine.get_tokenizer()
     sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS,
                               repetition_penalty=1.05)
 
