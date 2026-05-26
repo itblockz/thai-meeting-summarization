@@ -13,38 +13,43 @@ This matches exp35 — full-doc context (no retrieval) + E5 self-citation
 Train-set composite 0.6929 leak-free (1218 queries, doc_050 excluded) —
 the repo best, +0.0282 over the previous exp22 production pipeline.
 
-Why drop retrieval: the cross-encoder rerank was the main failure mode
-in exp03's IoU=0 cases (83.5% had gold in the pool but ranked low).
-Giving the LLM the entire document — preserving narrative/meeting flow
-in document order — beats every retrieval variant we tried. exp36
-(same setup, rerank order) lost −0.011 to exp35: order matters,
-selection doesn't.
-
-Token math (Qwen3 tokenizer, full system + 2-shot + full-doc + query +
-chat template): min=8916, median=14139, p95=23069, max=28646 on the
-train set. max_model_len=32768 leaves headroom.
+v13 throughput optimisations (no model-output change vs v12):
+- Sort queries by doc_id before submitting to vLLM — queries from the
+  same doc share the ~14K-token full-doc prefix, so vLLM's
+  enable_prefix_caching reuses the prefilled KV blocks across them.
+- gpu_memory_utilization 0.90 → 0.95 — more KV cache, higher concurrency.
+- max_num_batched_tokens 8192 → 32768 — single-chunk prefill for the
+  full-doc prompts (was 4 chunks per ~28K-tok prompt).
+- LLMEngine.step() streaming instead of llm.generate() — the
+  benchmark `progress` binary is called as each request *finishes* (not
+  during prompt prep, which was instant) so the backend sees real-time
+  progress and a SLURM log shows a heartbeat.
 
 Container-specific settings (vllm 0.9.2 in the image): enforce_eager=True
 skips the V1-engine torch.compile path that crashes silently inside
 Apptainer/Docker.
 
-Output: submission.csv with columns ID, abstractive, refs.
+Output: submission.csv with columns ID, abstractive, refs — written in
+the *original* queries order (sort is internal only).
 """
 from pathlib import Path
 import os
 import re
 import json
 import csv
+import time
 
-from vllm import LLM, SamplingParams
+from vllm import LLMEngine, EngineArgs, SamplingParams
 
 TEST_DIR     = os.environ.get("TEST_DIR",     "/model/test")
 RESULT_DIR   = os.environ.get("RESULT_DIR",   "/result/")
 PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
 
-MAX_NEW_TOKENS = 512
-MAX_MODEL_LEN  = int(os.environ.get("MAX_MODEL_LEN", "32768"))
-MODEL_NAME     = os.environ.get("LLM_MODEL", "Qwen/Qwen3-32B-AWQ")
+MAX_NEW_TOKENS         = 512
+MAX_MODEL_LEN          = int(os.environ.get("MAX_MODEL_LEN", "32768"))
+MAX_NUM_BATCHED_TOKENS = int(os.environ.get("MAX_NUM_BATCHED_TOKENS", "32768"))
+GPU_MEM_UTIL           = float(os.environ.get("GPU_MEM_UTIL", "0.95"))
+MODEL_NAME             = os.environ.get("LLM_MODEL", "Qwen/Qwen3-32B-AWQ")
 
 SYSTEM_MSG = (
     "คุณเป็นผู้ช่วยสรุปเอกสารภาษาไทย "
@@ -163,17 +168,26 @@ def main():
     queries = data["queries"]
     n = len(queries)
     print(f"{n} queries, {len(doc_index)} docs "
-          f"(NO RETRIEVAL — full doc, max_model_len={MAX_MODEL_LEN})", flush=True)
+          f"(NO RETRIEVAL — full doc, max_model_len={MAX_MODEL_LEN}, "
+          f"gpu_mem_util={GPU_MEM_UTIL}, max_num_batched_tokens={MAX_NUM_BATCHED_TOKENS})",
+          flush=True)
+    benchmark_lib(0)
 
     # Pre-build full-doc paragraph lists (in document order) once per doc.
     doc_paras = {}
     for doc_id, paragraphs in doc_index.items():
         doc_paras[doc_id] = filter_valid_paragraphs(paragraphs)
 
-    items = []   # (ID, gen_pids, gen_texts, messages_or_None, query_text)
+    # Sort indices by doc_id so queries from the same doc are submitted
+    # contiguously — vLLM's prefix cache then reuses the full-doc prefilled
+    # KV blocks across them. CSV is written in original queries order at
+    # the end (sort is internal only).
+    order = sorted(range(n), key=lambda i: queries[i]["doc_id"])
+
+    items = []  # one tuple per query, in sorted submission order
     pool_sizes = []
-    for i, query in enumerate(queries):
-        benchmark_lib(i)
+    for idx in order:
+        query = queries[idx]
         valid = doc_paras.get(query["doc_id"], [])
         q_text = query["query"]
         if valid:
@@ -183,32 +197,60 @@ def main():
             messages = build_messages(q_text, gen_texts)
         else:
             gen_pids, gen_texts, messages = [], [], None
-        items.append((query["ID"], gen_pids, gen_texts, messages, q_text))
+        items.append((idx, query["ID"], gen_pids, gen_texts, messages, q_text))
 
     if pool_sizes:
         print(f"pool sizes — mean={sum(pool_sizes)/len(pool_sizes):.2f}, "
               f"min={min(pool_sizes)}, max={max(pool_sizes)}", flush=True)
 
-    llm = LLM(model=MODEL_NAME, quantization="awq_marlin", max_model_len=MAX_MODEL_LEN,
-              gpu_memory_utilization=0.90, dtype="half", enforce_eager=True)
-    tokenizer = llm.get_tokenizer()
-    sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS, repetition_penalty=1.05)
+    engine_args = EngineArgs(
+        model=MODEL_NAME, quantization="awq_marlin",
+        max_model_len=MAX_MODEL_LEN,
+        gpu_memory_utilization=GPU_MEM_UTIL,
+        dtype="half", enforce_eager=True,
+        max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+        enable_prefix_caching=True,
+    )
+    engine = LLMEngine.from_engine_args(engine_args)
+    tokenizer = engine.get_tokenizer()
+    sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS,
+                              repetition_penalty=1.05)
 
-    prompts = []
-    for it in items:
-        msgs = it[3] if it[3] is not None else [{"role": "user", "content": it[4]}]
-        prompts.append(tokenizer.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False))
+    # Add all requests up-front; request_id encodes the submission position
+    # so we can map outputs back to items[].
+    for k, it in enumerate(items):
+        msgs = it[4] if it[4] is not None else [{"role": "user", "content": it[5]}]
+        prompt = tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        engine.add_request(request_id=str(k), prompt=prompt, params=sampling)
 
-    outputs = llm.generate(prompts, sampling)
+    # Stream completions: call benchmark_lib on each finished request so the
+    # benchmark backend sees a real heartbeat (was: one batch ping at the
+    # very end after llm.generate() returned, ~30-60min of silence).
+    raw_by_k = {}
+    n_done = 0
+    t0 = time.time()
+    while engine.has_unfinished_requests():
+        for o in engine.step():
+            if o.finished:
+                raw_by_k[int(o.request_id)] = o.outputs[0].text.strip()
+                n_done += 1
+                benchmark_lib(n_done)
+                if n_done == 1 or n_done % 50 == 0 or n_done == n:
+                    elapsed = time.time() - t0
+                    rate = n_done / max(elapsed, 1e-6)
+                    eta = (n - n_done) / max(rate, 1e-6)
+                    print(f"  [{n_done}/{n}] done — {rate:.2f} q/s, eta {eta:.0f}s",
+                          flush=True)
 
+    # Parse outputs (still in sorted item order)
     cite_re = re.compile(r'\[อ้างอิง[:\s]+[0-9,\s]+\]')
-    results = []
     n_explicit = 0
     ref_counts = []
-    for it, out in zip(items, outputs):
-        qid, gen_pids, gen_texts, _, q_text = it
-        raw = out.outputs[0].text.strip()
+    results_by_qid = {}
+    for k, it in enumerate(items):
+        _idx, qid, gen_pids, gen_texts, _, q_text = it
+        raw = raw_by_k[k]
         answer, _ = split_answer_citation(raw)
         cited_idx = parse_citation(raw, len(gen_pids))
         if gen_pids:
@@ -222,13 +264,16 @@ def main():
         if not answer:
             answer = gen_texts[0] if gen_texts else q_text
         ref_counts.append(len(ref_ids))
-        results.append({"ID": qid, "abstractive": answer, "refs": ",".join(ref_ids)})
+        results_by_qid[qid] = {"ID": qid, "abstractive": answer,
+                               "refs": ",".join(ref_ids)}
 
-    print(f"citations: {n_explicit}/{len(results)} emitted an [อ้างอิง: …] tag, "
-          f"{len(results) - n_explicit} fell back to top-1", flush=True)
+    print(f"citations: {n_explicit}/{len(items)} emitted an [อ้างอิง: …] tag, "
+          f"{len(items) - n_explicit} fell back to top-1", flush=True)
     if ref_counts:
         print(f"avg refs/query: {sum(ref_counts) / len(ref_counts):.2f}", flush=True)
 
+    # Write CSV in ORIGINAL queries order (not sorted submission order)
+    results = [results_by_qid[q["ID"]] for q in queries]
     out_path = Path(RESULT_DIR) / "submission.csv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", newline="", encoding="utf-8") as f:
@@ -242,4 +287,4 @@ def main():
 
 if __name__ == "__main__":
     n = main()
-    benchmark_lib(n)  # must be last operation
+    benchmark_lib(n)   # final "fully done, CSV ready" ping
