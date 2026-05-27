@@ -22,14 +22,16 @@ mkdir -p "$RESULT" "$PROJECT/logs"
 
 # v15 container runs full train 1239 queries — confirm whether bumping vllm
 # to 0.19.1 (matching the venv) actually eliminates the container-vs-venv
-# drift that crashed v14 to 0.6601 (vs exp37 venv 0.6944).
+# drift that crashed v14 to 0.6601 (vs exp37 venv 0.6944). Now that v15-I
+# upgrades the container's Python from 3.11.0rc1 → 3.11.15 (fixes the
+# Triton IRBuilder SIGSEGV), the stack matches the venv exactly.
 echo "=== v15 container — train eval (1239 queries via Apptainer) ==="
 apptainer exec --nv --containall --pwd /model \
+    --bind "$PROJECT/textsum/model/run.py:/model/run.py:ro" \
     --bind "$SHARED/dataset/train_set.json:/model/test/test.json:ro" \
     --bind "$PROJECT/textsum/benchmark_lib:/benchmark_lib:ro" \
     --bind "$RESULT:/result" \
     --env VLLM_WORKER_MULTIPROC_METHOD=spawn \
-    --env VLLM_USE_V1=0 \
     --env MAX_MODEL_LEN=32768 \
     "$PROJECT/textsum_v15_local.sif" python3 /model/run.py
 
