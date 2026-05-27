@@ -19,17 +19,16 @@ module load Apptainer/1.1.6
 RESULT="$PROJECT/textsum_v15_test_result"
 mkdir -p "$RESULT" "$PROJECT/logs"
 
-# v15-D = gdb diagnostic run. The EngineCore segfaults post-model-load
-# with no useful Python frame (background-thread crash). Run python3 under
-# gdb in batch mode + VLLM_ENABLE_V1_MULTIPROCESSING=0 so the crash stays
-# in the main process and gdb's `thread apply all bt` dumps every thread's
-# C-level backtrace. Goal: identify the actual crashing library so the
-# fix can be targeted.
-#
-# Core dumps also enabled in case gdb-on-Apptainer has its own issues.
+# v15-E = isolation hypothesis test. v15-D's gdb trace showed segfault at
+# 0x5266a0 inside the stripped python3 binary (Thread 1), with 60+ threads
+# alive incl. NCCL Watchdog/HeartbeatMonitor and Gloo TCP loops. Pattern =
+# heap corruption (likely ABI/lib mismatch). Swap `--containall` → `--contain`
+# so /tmp, /dev/shm, /etc come from host instead of the container's minimal
+# defaults. If the segfault disappears, host-vs-container lib clash is the
+# root cause. Final submission still needs --containall — this is diagnostic.
 ulimit -c unlimited
-echo "=== v15-D gdb diagnostic — vllm 0.19.1 in-process, exp37 prompt ==="
-apptainer exec --nv --containall --pwd /model \
+echo "=== v15-E isolation test — --contain instead of --containall ==="
+apptainer exec --nv --contain --pwd /model \
     --bind "$PROJECT/textsum/model/test:/model/test:ro" \
     --bind "$PROJECT/textsum/benchmark_lib:/benchmark_lib:ro" \
     --bind "$RESULT:/result" \
