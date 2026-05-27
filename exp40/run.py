@@ -1,35 +1,39 @@
 """
-exp40 — model swap: Qwen3-32B-AWQ → Qwen3.6-35B-A3B-FP8 (single A100).
+exp40 — model swap: Qwen3-32B-AWQ → Qwen3.6-27B-FP8 (single A100-40GB).
 
 Multi-variable change from exp39 (prev best 0.6991): swap the LLM from
-Qwen3-32B-AWQ (dense, AWQ-Marlin 4-bit) to
-**Qwen/Qwen3.6-35B-A3B-FP8** (sparse MoE 256-experts top-8, ~3B active,
-FP8-e4m3 weights, 37.5 GB → fits a single A100-80GB).
-Prompt + shots + decoding params unchanged from exp38/39.
+Qwen3-32B-AWQ (dense, AWQ-Marlin 4-bit) to **Qwen/Qwen3.6-27B-FP8**
+(dense 64-layer × hidden 5120, FP8-e4m3 weights, 30.87 GB → fits a
+single A100-40GB with limit_mm_per_prompt to skip the encoder cache).
+Prompt + shots + decoding params unchanged from exp38/39 (no_think
+already on via enable_thinking=False in apply_chat_template).
 
 Motivation: exp37→exp38→exp39 closed easy citation/IoU gaps but the
 remaining ~100 fallback queries are model-behavior (model produces a
 clean answer then forgets the [อ้างอิง: …] tag). A stronger
 instruction-follower may emit citations more reliably. Qwen3.6 is the
-newest Qwen family; A3B = 3B active params (fast forward despite 35B
-total), 256K context (we use 32K), and a hybrid attention stack
-(self_attn + linear_attn / Mamba layers) that vLLM 0.19.1 supports via
-the `Qwen3_5MoeForConditionalGeneration` arch.
+newest Qwen family.
+
+Why 27B-FP8 over 35B-A3B-FP8 (first try):
+- 35B-A3B-FP8 (37.5 GB) needed an A100-80GB but LANTA's A100s are 40GB.
+  Free GPU memory on cuda:0 was reported as 39.5 GiB; 37.5 GB weights
+  left no room for KV cache → OOM.
+- 27B-FP8 (30.87 GB) leaves ~8 GB headroom on 39.5 GB usable. KV
+  cache for 32K context with 4 KV heads is small (~5 GB max) → fits.
+- 27B is dense (no MoE), so all 27B params actively process every
+  token (vs A3B's 3B active subset). Better quality per param on
+  text-only tasks at this size.
 
 Caveats:
-- Model is multimodal (has vision blocks) but we pass text-only chat
-  messages — vLLM keeps the vision tower idle. Wastes ~1-2 GB.
+- Model is multimodal (vision blocks loaded, idle for text-only chat).
+  limit_mm_per_prompt={"image":0,"video":0} stops vLLM from reserving
+  the encoder cache budget (was eating ~5 GB on the 35B run).
 - A100 has no native FP8 tensor cores → vLLM dequantises FP8→FP16
   on-the-fly via fp8_marlin / fp8_w8a16 kernels. Expected ~1.5-2x
-  slower than native FP8 on H100/Blackwell, but still tractable
-  (estimated ~0.5 q/s vs exp38's 1.28 q/s).
-- BF16 build (Qwen3.6-35B-A3B, 71.9 GB) was the other option but
-  needs TP=2 across 2 GPUs and adds NCCL all-reduce overhead. FP8
-  on a single GPU is the simpler bet.
+  slower than AWQ on the same GPU.
 
 Decision rule: accept exp40 if leak-free composite >= exp39 (0.6991).
-Target: +0.005–0.030 from better instruction following (citation
-discipline) and stronger Thai understanding.
+Target: +0.005–0.030 from better instruction following.
 """
 from pathlib import Path
 import os
@@ -46,7 +50,7 @@ PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
 MAX_NEW_TOKENS = 1024
 MAX_MODEL_LEN  = int(os.environ.get("MAX_MODEL_LEN", "32768"))
 TP_SIZE        = int(os.environ.get("TP_SIZE", "1"))
-MODEL_NAME     = os.environ.get("LLM_MODEL", "Qwen/Qwen3.6-35B-A3B-FP8")
+MODEL_NAME     = os.environ.get("LLM_MODEL", "Qwen/Qwen3.6-27B-FP8")
 
 SYSTEM_MSG = (
     "คุณเป็นผู้ช่วยสรุปเอกสารภาษาไทย "
@@ -170,16 +174,17 @@ def main():
     print(f"pool sizes — mean={sum(pool_sizes)/len(pool_sizes):.2f}, "
           f"min={min(pool_sizes)}, max={max(pool_sizes)}", flush=True)
 
-    # Qwen3.6-35B-A3B-FP8: FP8-e4m3 MoE on a single A100-80GB. vLLM reads
+    # Qwen3.6-27B-FP8: dense 27B FP8-e4m3 on a single A100-40GB. vLLM reads
     # quantization_config from the model's config.json (quant_method=fp8)
-    # and picks the fp8_marlin / fp8_w8a16 kernel automatically on A100.
+    # and picks the fp8_marlin / fp8_w8a16 kernel automatically on A100
+    # (no native FP8 cores → dequantises FP8→FP16 on-the-fly).
     # Vision blocks load but stay idle for text-only chat.
     #
-    # limit_mm_per_prompt={"image": 0} prevents vLLM from reserving the
-    # multimodal encoder cache (was 16384 tokens × image features ≈ several
-    # GB → KV cache went negative in the first attempt). gpu_memory_
-    # utilization bumped 0.90 → 0.95 to give KV cache more room after the
-    # 34.7 GB weights + multimodal scaffolding.
+    # limit_mm_per_prompt={"image":0,"video":0} prevents vLLM from
+    # reserving the multimodal encoder cache (was ~5 GB on the prior
+    # 35B-A3B-FP8 attempt → KV cache went negative). gpu_memory_
+    # utilization=0.95 because the 40 GB GPU is tight after the 30 GB
+    # weights + idle vision tower.
     llm = LLM(model=MODEL_NAME, max_model_len=MAX_MODEL_LEN,
               tensor_parallel_size=TP_SIZE,
               gpu_memory_utilization=0.95,
