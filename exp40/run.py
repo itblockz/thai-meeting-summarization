@@ -1,10 +1,10 @@
 """
-exp40 — model swap: Qwen3-32B-AWQ → Qwen3.6-35B-A3B (BF16, MoE, TP=2).
+exp40 — model swap: Qwen3-32B-AWQ → Qwen3.6-35B-A3B-FP8 (single A100).
 
 Multi-variable change from exp39 (prev best 0.6991): swap the LLM from
-Qwen3-32B-AWQ (dense, AWQ-Marlin 4-bit, single-GPU) to
-**Qwen/Qwen3.6-35B-A3B** (sparse MoE 256-experts top-8, ~3B active,
-BF16 native, requires tensor_parallel_size=2 to fit ~70GB across 2 A100s).
+Qwen3-32B-AWQ (dense, AWQ-Marlin 4-bit) to
+**Qwen/Qwen3.6-35B-A3B-FP8** (sparse MoE 256-experts top-8, ~3B active,
+FP8-e4m3 weights, 37.5 GB → fits a single A100-80GB).
 Prompt + shots + decoding params unchanged from exp38/39.
 
 Motivation: exp37→exp38→exp39 closed easy citation/IoU gaps but the
@@ -18,11 +18,14 @@ the `Qwen3_5MoeForConditionalGeneration` arch.
 
 Caveats:
 - Model is multimodal (has vision blocks) but we pass text-only chat
-  messages — vLLM keeps the vision tower idle. Wastes ~2 GB of weights.
-- BF16 weights ≈ 70 GB → does NOT fit a single A100-80GB. TP=2 splits
-  ~35 GB per GPU. SLURM script requests --gpus-per-node=2.
-- No AWQ/GPTQ build exists from Qwen (only BF16 + FP8, FP8 emulates on
-  A100 and is slower). BF16 + TP is the cleanest path.
+  messages — vLLM keeps the vision tower idle. Wastes ~1-2 GB.
+- A100 has no native FP8 tensor cores → vLLM dequantises FP8→FP16
+  on-the-fly via fp8_marlin / fp8_w8a16 kernels. Expected ~1.5-2x
+  slower than native FP8 on H100/Blackwell, but still tractable
+  (estimated ~0.5 q/s vs exp38's 1.28 q/s).
+- BF16 build (Qwen3.6-35B-A3B, 71.9 GB) was the other option but
+  needs TP=2 across 2 GPUs and adds NCCL all-reduce overhead. FP8
+  on a single GPU is the simpler bet.
 
 Decision rule: accept exp40 if leak-free composite >= exp39 (0.6991).
 Target: +0.005–0.030 from better instruction following (citation
@@ -42,8 +45,8 @@ PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
 
 MAX_NEW_TOKENS = 1024
 MAX_MODEL_LEN  = int(os.environ.get("MAX_MODEL_LEN", "32768"))
-TP_SIZE        = int(os.environ.get("TP_SIZE", "2"))
-MODEL_NAME     = os.environ.get("LLM_MODEL", "Qwen/Qwen3.6-35B-A3B")
+TP_SIZE        = int(os.environ.get("TP_SIZE", "1"))
+MODEL_NAME     = os.environ.get("LLM_MODEL", "Qwen/Qwen3.6-35B-A3B-FP8")
 
 SYSTEM_MSG = (
     "คุณเป็นผู้ช่วยสรุปเอกสารภาษาไทย "
@@ -167,11 +170,14 @@ def main():
     print(f"pool sizes — mean={sum(pool_sizes)/len(pool_sizes):.2f}, "
           f"min={min(pool_sizes)}, max={max(pool_sizes)}", flush=True)
 
-    # Qwen3.6-35B-A3B is BF16-native MoE with vision blocks idle for text-only.
-    # No quantization arg. TP=2 splits ~70 GB weights across 2 A100-80GB.
+    # Qwen3.6-35B-A3B-FP8: FP8-e4m3 MoE on a single A100-80GB (~37.5 GB
+    # weights leaves ~40 GB for KV cache + activations). vLLM reads
+    # quantization_config from the model's config.json (quant_method=fp8)
+    # and picks the fp8_marlin / fp8_w8a16 kernel automatically on A100.
+    # Vision blocks load but stay idle for text-only chat.
     llm = LLM(model=MODEL_NAME, max_model_len=MAX_MODEL_LEN,
               tensor_parallel_size=TP_SIZE,
-              gpu_memory_utilization=0.85,
+              gpu_memory_utilization=0.90,
               dtype="bfloat16", enforce_eager=True,
               trust_remote_code=True)
     tokenizer = llm.get_tokenizer()
