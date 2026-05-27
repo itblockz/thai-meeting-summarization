@@ -19,24 +19,36 @@ module load Apptainer/1.1.6
 RESULT="$PROJECT/textsum_v15_test_result"
 mkdir -p "$RESULT" "$PROJECT/logs"
 
-# v15 = match LANTA venv exactly (vllm 0.19.1, torch 2.10.0, cu128) +
-# VLLM_USE_V1=0 to avoid the EngineCore subprocess segfault in Apptainer.
-# Goal: kill the container-vs-venv greedy-decode drift so the context-first
-# prompt's 0.6944 venv score transfers to the production container.
-echo "=== testing v15_local SIF — vllm 0.19.1 + V0 engine + exp37 prompt ==="
+# v15-D = gdb diagnostic run. The EngineCore segfaults post-model-load
+# with no useful Python frame (background-thread crash). Run python3 under
+# gdb in batch mode + VLLM_ENABLE_V1_MULTIPROCESSING=0 so the crash stays
+# in the main process and gdb's `thread apply all bt` dumps every thread's
+# C-level backtrace. Goal: identify the actual crashing library so the
+# fix can be targeted.
+#
+# Core dumps also enabled in case gdb-on-Apptainer has its own issues.
+ulimit -c unlimited
+echo "=== v15-D gdb diagnostic — vllm 0.19.1 in-process, exp37 prompt ==="
 apptainer exec --nv --containall --pwd /model \
     --bind "$PROJECT/textsum/model/test:/model/test:ro" \
     --bind "$PROJECT/textsum/benchmark_lib:/benchmark_lib:ro" \
     --bind "$RESULT:/result" \
-    --env VLLM_WORKER_MULTIPROC_METHOD=fork \
-    --env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False \
-    --env VLLM_DISABLE_CUSTOM_ALL_REDUCE=1 \
-    --env CUDA_LAUNCH_BLOCKING=1 \
-    --env TORCH_USE_CUDA_DSA=1 \
+    --env VLLM_ENABLE_V1_MULTIPROCESSING=0 \
     --env MAX_MODEL_LEN=32768 \
-    "$PROJECT/textsum_v15_local.sif" python3 /model/run.py
+    --env PYTHONFAULTHANDLER=1 \
+    "$PROJECT/textsum_v15_local.sif" \
+    gdb -batch \
+        -ex 'set pagination off' \
+        -ex 'set print thread-events off' \
+        -ex 'handle SIGSEGV stop print nopass' \
+        -ex 'run' \
+        -ex 'echo \n=== BACKTRACE (crashing thread) ===\n' \
+        -ex 'bt' \
+        -ex 'echo \n=== BACKTRACE (all threads) ===\n' \
+        -ex 'thread apply all bt' \
+        -ex 'echo \n=== INFO SHARED ===\n' \
+        -ex 'info sharedlibrary' \
+        --args python3 /model/run.py
 
 echo "=== exit code: $? ==="
 ls -la "$RESULT"
-# Expect: exit 0, submission.csv (50 rows). If segfault: try
-# --env VLLM_USE_V1=1 fallback and check VLLM_ENGINE_VERSION compat.
