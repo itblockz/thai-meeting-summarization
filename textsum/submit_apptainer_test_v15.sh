@@ -19,43 +19,26 @@ module load Apptainer/1.1.6
 RESULT="$PROJECT/textsum_v15_test_result"
 mkdir -p "$RESULT" "$PROJECT/logs"
 
-# v15-F = python3-dbg diagnostic. v15-D/E confirmed the SIGSEGV is at the
-# same deterministic address 0x5266a0 inside the stripped /usr/bin/python3
-# binary (isolation ruled out). Rebuild adds python3.11-dbg so gdb can
-# (a) resolve 0x5266a0 to a real CPython symbol, and (b) use py-bt to print
-# the actual Python frame at the crash — this is the definitive trace.
-ulimit -c unlimited
-echo "=== v15-F py-bt diagnostic — --containall + python3.11-dbg ==="
+# v15-G = fix. v15-F's py-bt identified the bug: vllm 0.19.1's V1 sampler
+# top-k/top-p Triton kernel JIT-compiles during _dummy_sampler_run and
+# crashes inside Triton's C++ IRBuilder (pybind11/CPython ABI mismatch in
+# this container — `self.builder.options = options` hits
+# _PyDictKeys_StringLookup with NULL dk). run.py now sets
+# sys.modules["triton"]=None before importing vllm so HAS_TRITON=False
+# and the sampler falls back to pure-PyTorch (Qwen3 dense AWQ doesn't
+# touch any other Triton path).
+#
+# Bind-mounts run.py over the container's /model/run.py so we can iterate
+# without rebuilding the SIF.
+echo "=== v15-G fix test — Triton disabled, full --containall ==="
 apptainer exec --nv --containall --pwd /model \
+    --bind "$PROJECT/textsum/model/run.py:/model/run.py:ro" \
     --bind "$PROJECT/textsum/model/test:/model/test:ro" \
     --bind "$PROJECT/textsum/benchmark_lib:/benchmark_lib:ro" \
     --bind "$RESULT:/result" \
-    --env VLLM_ENABLE_V1_MULTIPROCESSING=0 \
+    --env VLLM_WORKER_MULTIPROC_METHOD=spawn \
     --env MAX_MODEL_LEN=32768 \
-    --env PYTHONFAULTHANDLER=1 \
-    "$PROJECT/textsum_v15_local.sif" \
-    gdb -batch \
-        -ex 'set pagination off' \
-        -ex 'set print thread-events off' \
-        -ex 'handle SIGSEGV stop print nopass' \
-        -ex 'run' \
-        -ex 'echo \n=== INFO SYMBOL @ crash address ===\n' \
-        -ex 'info symbol 0x5266a0' \
-        -ex 'echo \n=== DISASSEMBLY around crash ===\n' \
-        -ex 'x/16i $pc' \
-        -ex 'echo \n=== REGISTERS ===\n' \
-        -ex 'info registers' \
-        -ex 'echo \n=== BACKTRACE (C, crashing thread) ===\n' \
-        -ex 'bt full' \
-        -ex 'echo \n=== PY-BT (Python frame at crash) ===\n' \
-        -ex 'py-bt' \
-        -ex 'echo \n=== PY-LIST (source around current Python frame) ===\n' \
-        -ex 'py-list' \
-        -ex 'echo \n=== PY-LOCALS ===\n' \
-        -ex 'py-locals' \
-        -ex 'echo \n=== BACKTRACE (C, all threads) ===\n' \
-        -ex 'thread apply all bt' \
-        --args python3 /model/run.py
+    "$PROJECT/textsum_v15_local.sif" python3 /model/run.py
 
 echo "=== exit code: $? ==="
 ls -la "$RESULT"

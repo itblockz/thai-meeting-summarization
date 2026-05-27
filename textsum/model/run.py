@@ -51,7 +51,23 @@ import os
 import re
 import json
 import csv
+import sys
 import time
+
+# v15-G: disable Triton before any vllm import. vllm 0.19.1 + this
+# container's CPython triggers a SIGSEGV inside the Triton C++ IRBuilder
+# during JIT compile of vllm V1's sampler top-k/top-p kernel (pybind11
+# ABI mismatch — verified via gdb py-bt: _PyDictKeys_StringLookup(dk=0x0,
+# key='options') at triton/compiler/code_generator.py:311
+# `self.builder.options = options`, called from
+# _topk_topp_kernel → apply_top_k_top_p_triton → _dummy_sampler_run →
+# profile_run → determine_available_memory). vllm checks
+# find_spec("triton") to set HAS_TRITON; setting sys.modules["triton"]=None
+# makes find_spec return None, vllm flips HAS_TRITON=False, the sampler
+# dispatcher falls back to apply_top_k_top_p_pytorch (pure torch). For
+# Qwen3-32B-AWQ dense (no MoE/LoRA/Mamba) and enforce_eager=True (no
+# torch.compile/Inductor), Triton has no other entry point in this pipeline.
+sys.modules["triton"] = None
 
 from transformers import AutoTokenizer
 from vllm import LLMEngine, EngineArgs, SamplingParams
