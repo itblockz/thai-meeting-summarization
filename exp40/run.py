@@ -170,16 +170,22 @@ def main():
     print(f"pool sizes — mean={sum(pool_sizes)/len(pool_sizes):.2f}, "
           f"min={min(pool_sizes)}, max={max(pool_sizes)}", flush=True)
 
-    # Qwen3.6-35B-A3B-FP8: FP8-e4m3 MoE on a single A100-80GB (~37.5 GB
-    # weights leaves ~40 GB for KV cache + activations). vLLM reads
+    # Qwen3.6-35B-A3B-FP8: FP8-e4m3 MoE on a single A100-80GB. vLLM reads
     # quantization_config from the model's config.json (quant_method=fp8)
     # and picks the fp8_marlin / fp8_w8a16 kernel automatically on A100.
     # Vision blocks load but stay idle for text-only chat.
+    #
+    # limit_mm_per_prompt={"image": 0} prevents vLLM from reserving the
+    # multimodal encoder cache (was 16384 tokens × image features ≈ several
+    # GB → KV cache went negative in the first attempt). gpu_memory_
+    # utilization bumped 0.90 → 0.95 to give KV cache more room after the
+    # 34.7 GB weights + multimodal scaffolding.
     llm = LLM(model=MODEL_NAME, max_model_len=MAX_MODEL_LEN,
               tensor_parallel_size=TP_SIZE,
-              gpu_memory_utilization=0.90,
+              gpu_memory_utilization=0.95,
               dtype="bfloat16", enforce_eager=True,
-              trust_remote_code=True)
+              trust_remote_code=True,
+              limit_mm_per_prompt={"image": 0, "video": 0})
     tokenizer = llm.get_tokenizer()
     sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS,
                               repetition_penalty=1.05)
