@@ -23,7 +23,7 @@ export RESULT_DIR="$PROJECT/exp40/eval_result"
 export PROGRESS_LIB="$PROJECT/textsum/benchmark_lib/progress"
 export MAX_MODEL_LEN="32768"
 export TP_SIZE="1"
-export LLM_MODEL="Qwen/Qwen3.6-35B-A3B-FP8"
+export LLM_MODEL="Qwen/Qwen3.6-27B-FP8"
 
 export HF_HOME="$SHARED/.hf_cache"
 export TRANSFORMERS_CACHE="$SHARED/.hf_cache"
@@ -33,7 +33,7 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 mkdir -p "$RESULT_DIR" "$PROJECT/logs"
 
-echo "=== exp40: Qwen3.6-35B-A3B-FP8 (single A100) + exp38 prompt/shots ==="
+echo "=== exp40: Qwen3.6-27B-FP8 (single A100-40GB) + exp38 prompt/shots ==="
 cd "$PROJECT/exp40"
 python3 run.py
 
