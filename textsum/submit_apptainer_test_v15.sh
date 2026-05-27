@@ -19,16 +19,14 @@ module load Apptainer/1.1.6
 RESULT="$PROJECT/textsum_v15_test_result"
 mkdir -p "$RESULT" "$PROJECT/logs"
 
-# v15-E = isolation hypothesis test. v15-D's gdb trace showed segfault at
-# 0x5266a0 inside the stripped python3 binary (Thread 1), with 60+ threads
-# alive incl. NCCL Watchdog/HeartbeatMonitor and Gloo TCP loops. Pattern =
-# heap corruption (likely ABI/lib mismatch). Swap `--containall` → `--contain`
-# so /tmp, /dev/shm, /etc come from host instead of the container's minimal
-# defaults. If the segfault disappears, host-vs-container lib clash is the
-# root cause. Final submission still needs --containall — this is diagnostic.
+# v15-F = python3-dbg diagnostic. v15-D/E confirmed the SIGSEGV is at the
+# same deterministic address 0x5266a0 inside the stripped /usr/bin/python3
+# binary (isolation ruled out). Rebuild adds python3.11-dbg so gdb can
+# (a) resolve 0x5266a0 to a real CPython symbol, and (b) use py-bt to print
+# the actual Python frame at the crash — this is the definitive trace.
 ulimit -c unlimited
-echo "=== v15-E isolation test — --contain instead of --containall ==="
-apptainer exec --nv --contain --pwd /model \
+echo "=== v15-F py-bt diagnostic — --containall + python3.11-dbg ==="
+apptainer exec --nv --containall --pwd /model \
     --bind "$PROJECT/textsum/model/test:/model/test:ro" \
     --bind "$PROJECT/textsum/benchmark_lib:/benchmark_lib:ro" \
     --bind "$RESULT:/result" \
@@ -41,12 +39,22 @@ apptainer exec --nv --contain --pwd /model \
         -ex 'set print thread-events off' \
         -ex 'handle SIGSEGV stop print nopass' \
         -ex 'run' \
-        -ex 'echo \n=== BACKTRACE (crashing thread) ===\n' \
-        -ex 'bt' \
-        -ex 'echo \n=== BACKTRACE (all threads) ===\n' \
+        -ex 'echo \n=== INFO SYMBOL @ crash address ===\n' \
+        -ex 'info symbol 0x5266a0' \
+        -ex 'echo \n=== DISASSEMBLY around crash ===\n' \
+        -ex 'x/16i $pc' \
+        -ex 'echo \n=== REGISTERS ===\n' \
+        -ex 'info registers' \
+        -ex 'echo \n=== BACKTRACE (C, crashing thread) ===\n' \
+        -ex 'bt full' \
+        -ex 'echo \n=== PY-BT (Python frame at crash) ===\n' \
+        -ex 'py-bt' \
+        -ex 'echo \n=== PY-LIST (source around current Python frame) ===\n' \
+        -ex 'py-list' \
+        -ex 'echo \n=== PY-LOCALS ===\n' \
+        -ex 'py-locals' \
+        -ex 'echo \n=== BACKTRACE (C, all threads) ===\n' \
         -ex 'thread apply all bt' \
-        -ex 'echo \n=== INFO SHARED ===\n' \
-        -ex 'info sharedlibrary' \
         --args python3 /model/run.py
 
 echo "=== exit code: $? ==="

@@ -12,7 +12,7 @@ From: nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
     # pip temp inside the sandbox rootfs (on Lustre during build) instead.
     export TMPDIR=/buildtmp
     mkdir -p /buildtmp
-    apt-get update && apt-get install -y python3.11 python3.11-dev python3-pip gdb && rm -rf /var/lib/apt/lists/*
+    apt-get update && apt-get install -y python3.11 python3.11-dev python3.11-dbg python3-pip gdb && rm -rf /var/lib/apt/lists/*
     ln -sf /usr/bin/python3.11 /usr/bin/python3
     # torch 2.10.0 wheels live on the cu128 index (matches CUDA 12.8.1 base).
     pip3 install --no-cache-dir --timeout 300 --retries 5 torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
