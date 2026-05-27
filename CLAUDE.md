@@ -107,8 +107,11 @@ LANTA experiment history (train-set composite, ↑ better):
 | `exp27/` — GEN_K sweep | exp22 + GEN_K=20 | 0.6777 † |
 | `exp28/` — fusion ablation | exp27 minus cross-encoder, RRF order only | 0.6743 † |
 | `exp29/` — full pool RRF | exp28 + no GEN_K cap (full pool, RRF order) | 0.6762 † |
-| `exp30/` — full pool rerank (**BEST**) | exp27 + no GEN_K cap (full pool, rerank order) | **0.6783** † ⭐ |
+| `exp30/` — full pool rerank | exp27 + no GEN_K cap (full pool, rerank order) | 0.6783 † |
 | `exp32/` — E3 HyDE | exp30 + HyDE-blended dense (α=0.5) | 0.6779 † *(−0.0004)* |
+| `exp35/` — ceiling test | NO RETRIEVAL — feed full doc to LLM | 0.6929 † |
+| `exp37/` — context-first prompt | exp35 + context BEFORE query (prefix-cache hit) | 0.6944 † |
+| `exp38/` — multi-ref shot2 (**NEW BEST**) | exp37 + replace shot2 with 4-ref example (Q0746) | **0.6987** † ⭐ |
 
 † Held-out evaluation: exp06 scored on 1218 queries excluding doc_050, exp07 on 1211 excluding doc_047, exp08 on the same 1218 as exp06. Apples-to-apples exp03 baselines on those subsets are 0.6270 (doc_050) and 0.6237 (doc_047), so the few-shot deltas are **+0.0059 (exp06)**, **+0.0041 (exp07)** and **+0.0091 (exp08)**. All show statistically significant per-query RougeL improvement (paired t-test p<0.0002), confirming the few-shot signal is real and not a doc-choice artifact. IoU is identical to exp03 because the retrieval pipeline is unchanged.
 
@@ -133,20 +136,24 @@ The avg dense∪BM25 union is ~28.6 — GEN_K=20 already captures the bulk; furt
 
 **HyDE (exp31 retrieval-only, exp32 LLM, leak-free)**: Qwen3-32B-AWQ writes a hypothetical paragraph per query (preserving numeric/named entities), embed with bge-m3, blend with original query embedding at α=0.5 before dense retrieval. Retrieval-only: hit@1 +0.035, hit@20 +0.006 (`eval_retrieval/hyde_eval.py`). But exp32 = exp30 + HyDE blend gives **0.6779 — basically flat (−0.0004)**. Rerank uses the original query, so HyDE's dense-ranking lift is mostly washed out; pool composition barely changes (BM25 catches what HyDE adds). E3 closed.
 
-**Current best**: `exp30/` — exp22 retrieval pool + bge-reranker order on the full union + E5 self-cite + exp08 few-shot — at **0.6783** leak-free, **+0.0136** over the v11 container (exp22 = 0.6647 leak-free). `exp03/` remains the canonical no-few-shot reference (0.6256 full-1239). The Docker submission pipeline (`textsum/model/run.py`) still matches **exp22** as of image tag **v11**; porting exp30 to the container needs `GEN_K` removed and the per-query LLM context to grow from ~1.5K to ~5K tokens (already inside `max_model_len=16384`). Intentional container settings: `enforce_eager=True` (see "Docker container issues") and `max_model_len=16384` (the few-shot E5 prompt needs it). The worked examples are the `_SHOT1_*`/`_SHOT2_*` constants — exp08's hand-picked pair rendered in E5 form.
+**No-retrieval ceiling (exp35/exp37, leak-free)**: skip retrieval entirely — feed the full doc (mean 180 paragraphs, ~14K tokens) to Qwen3-32B-AWQ via E5 self-cite. exp35 (query-first prompt) lands at **0.6929** (+0.0146 over exp30 0.6783). exp37 swaps to **context-first prompt** so vLLM's `enable_prefix_caching` reuses the ~14K-token doc prefix across all queries from the same doc (~5% → ~90% cache hit ceiling). Score equivalent: **0.6944** (+0.0015 from prompt order — negligible) but throughput ~50% faster on doc-grouped batches. The win is that retrieval is no longer the IoU bottleneck — IoU 0.6669 here is bounded by *citation* quality, not pool recall.
+
+**Multi-ref few-shot (exp38, leak-free, NEW BEST)**: exp37's v15 container deploy revealed 153/1239 queries (12.4%) failed to emit `[อ้างอิง: …]` → fell back to `gen_pids[0]` (= doc header para), all IoU=0. Analysis: model produces correct comprehensive answers spanning multiple paragraphs but omits the citation tag entirely. Root cause: both shot1 and shot2 (exp08 pair, carried over) cite a single paragraph, so the model learned "answer + [อ้างอิง: ONE_NUMBER]" and stalls when the answer genuinely needs 3+ paragraphs. exp38 replaces shot2 with **Q0746 from doc_050** — 5-paragraph context where 4 are gold (header + 3 absentees) and 1 is a same-section distractor, answer cites `[อ้างอิง: 2, 3, 4, 5]`. Shot 1 (single-ref) preserved so the 71.8% single-ref dataset prior is still represented. Result: **0.6987** (+0.0043 vs exp37), driven entirely by IoU (0.6669 → 0.6906, +0.0237); RougeL/SS dip slightly (−0.0005/−0.0008) from mild over-citation (avg refs/query 1.20 → 1.54). 47 more queries now emit tags (1086 → 1133); 105 of the 109 fallback queries are *stubborn* (still fail after exp38) and skew toward >5 gold refs.
+
+**Current best**: `exp38/` — full doc + context-first + E5 self-cite + (single-ref shot1 + multi-ref shot2) — at **0.6987** leak-free. The Docker submission pipeline (`textsum/model/run.py`) ports exp38's prompt and shots into image tag **v15-K** (vllm 0.19.1 + python3.11.15-stable via deadsnakes PPA; previous container Python 3.11.0~rc1 SIGFAULTed Triton's pybind11 IRBuilder — see "Docker container issues v15"). Container vs venv drift is sub-noise (~0.0008). exp03 remains the canonical no-few-shot reference (0.6256 full-1239); exp30 (0.6783) was the previous best in the retrieval line before exp35 closed the retrieval phase. The worked examples are the `_SHOT1_*`/`_SHOT2_*` constants — `_SHOT1` is exp08's single-ref pair carry-over, `_SHOT2` is exp38's new multi-ref Q0746.
 
 See `IDEAS.md` for the full experiment roadmap and `eval_retrieval/` for the fast retrieval harness.
 
 **Score breakdown:**
 
-|          | baseline | exp01  | exp03  | exp22 (prod) | exp27  | **exp30 (best)** |
-|----------|----------|--------|--------|--------------|--------|------------------|
-| RougeL   | 0.3387   | 0.3723 | 0.3928 | 0.4454       | 0.4585 | **0.4584**       |
-| SS-score | 0.7667   | 0.8016 | 0.8096 | 0.8384       | 0.8460 | **0.8467**       |
-| IoU      | 0.4744   | 0.6190 | 0.6190 | 0.6575       | 0.6824 | **0.6844**       |
-| **Composite** | **0.5584** | **0.6148** | **0.6256** | **0.6647** | **0.6777** | **0.6783** |
+|          | baseline | exp03  | exp22 (v11)  | exp30  | exp37  | **exp38 (best)** |
+|----------|----------|--------|--------------|--------|--------|------------------|
+| RougeL   | 0.3387   | 0.3928 | 0.4454       | 0.4584 | 0.4939 | **0.4935**       |
+| SS-score | 0.7667   | 0.8096 | 0.8384       | 0.8467 | 0.8626 | **0.8619**       |
+| IoU      | 0.4744   | 0.6190 | 0.6575       | 0.6844 | 0.6669 | **0.6906**       |
+| **Composite** | **0.5584** | **0.6256** | **0.6647** | **0.6783** | **0.6944** | **0.6987** |
 
-baseline/exp01/exp03 are full-1239; exp22/exp27/exp30 are leak-free (1218, doc_050 held out — the few-shot examples come from it). exp03 on that same 1218 subset = 0.6270, so exp30 is **+0.0513** over exp03 and **+0.0136** over the v11 container (exp22).
+baseline/exp03 are full-1239; exp22/exp30/exp37/exp38 are leak-free (1218, doc_050 held out — the few-shot examples come from it). exp03 on the same 1218 subset = 0.6270, so exp38 is **+0.0717** over exp03 and **+0.0204** over the previous retrieval-line best (exp30).
 
 **Key design decisions:**
 - Two-stage retrieval: dense (bge-m3) + BM25 build a candidate pool (top-20 each), a cross-encoder (bge-reranker-v2-m3) reranks it.
