@@ -30,7 +30,7 @@ mkdir -p "$RESULT" "$PROJECT/logs"
 #
 # Bind-mounts run.py over the container's /model/run.py so we can iterate
 # without rebuilding the SIF.
-echo "=== v15-H surgical sampler-only Triton bypass test ==="
+echo "=== v15-I upgraded python3.11 (deadsnakes PPA) test ==="
 apptainer exec --nv --containall --pwd /model \
     --bind "$PROJECT/textsum/model/run.py:/model/run.py:ro" \
     --bind "$PROJECT/textsum/model/test:/model/test:ro" \

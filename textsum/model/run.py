@@ -56,18 +56,6 @@ import time
 from transformers import AutoTokenizer
 from vllm import LLMEngine, EngineArgs, SamplingParams
 
-# v15-H: surgical Triton bypass — only the V1 sampler's top-k/top-p Triton
-# kernel JIT crashes inside the Triton C++ IRBuilder ('self.builder.options
-# = options' → _PyDictKeys_StringLookup(dk=0x0)), verified via gdb py-bt
-# (v15-F log). Other Triton kernels in vllm V1 (e.g. block_table's
-# _compute_slot_mapping_kernel) compile fine. v15-G wholesale-disabled
-# Triton via sys.modules["triton"]=None which broke those other kernels
-# (TypeError: 'function' object is not subscriptable). The surgical
-# alternative: flip HAS_TRITON only in the sampler module so its dispatcher
-# uses apply_top_k_top_p_pytorch — other Triton kernels keep working.
-import vllm.v1.sample.ops.topk_topp_sampler as _topk_topp_sampler
-_topk_topp_sampler.HAS_TRITON = False
-
 TEST_DIR     = os.environ.get("TEST_DIR",     "/model/test")
 RESULT_DIR   = os.environ.get("RESULT_DIR",   "/result/")
 PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
