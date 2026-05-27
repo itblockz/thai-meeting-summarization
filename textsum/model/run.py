@@ -77,11 +77,19 @@ SYSTEM_MSG = (
     "ตอบคำถามโดยอ้างอิงจากย่อหน้าที่ให้มาเท่านั้น ห้ามแต่งเติม"
 )
 
-# Two worked few-shot examples (exp08's pair, both from held-out doc_050),
-# rendered in E5 form: a 5-paragraph numbered context and an answer that
-# ends with the [อ้างอิง: N] tag. Both gold answers cite a single
-# paragraph — matching the dataset prior that 71.8% of queries have one
-# gold ref — which keeps the model from over-citing.
+# Two worked few-shot examples (both from held-out doc_050), rendered in
+# E5 form: a 5-paragraph numbered context and an answer ending with the
+# [อ้างอิง: N] tag.
+#
+# Shot 1 (exp08 carry-over): single-ref — matches the 71.8% single-ref
+# dataset prior, teaches "cite exactly the source paragraph."
+# Shot 2 (v15-K new): multi-ref subset — replaces exp08's single-ref
+# shot2 because the 153 missed-tag queries in the v15 train eval were
+# overwhelmingly multi-ref gold (model emits a comprehensive answer but
+# forgets to cite anything). Q0746 from doc_050: 4 of 5 context paragraphs
+# are gold (P21-P24, absentee list); P20 is a same-section distractor
+# (attendee #12). Teaches "structured answer covers several paragraphs
+# → cite them all" + "don't cite paragraphs the answer didn't use."
 _SHOT1_QUERY = "ในการประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้นที่ใด"
 _SHOT1_PARAS = [
     "ครั้งที่ ๔๙",
@@ -92,15 +100,15 @@ _SHOT1_PARAS = [
 ]
 _SHOT1_ANSWER = "การประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้น ณ ห้องประชุมกรรมาธิการ N 406 ชั้น ๔ อาคารรัฐสภา [อ้างอิง: 3]"
 
-_SHOT2_QUERY = "การจัดทำแบบสำรวจความพึงพอใจและไม่พึงพอใจของคณะกรรมาธิการจัดขึ้นเพื่ออะไร"
+_SHOT2_QUERY = "ในการประชุมคณะกรรมาธิการการเงิน การคลัง สถาบันการเงินและตลาดการเงิน ครั้งที่ 49 มีกรรมการผู้ที่ไม่มาประชุมมีจำนวนกี่คน"
 _SHOT2_PARAS = [
-    "เริ่มประชุมเวลา ๐๙.๔๖ นาฬิกา",
-    "เมื่อกรรมาธิการมาครบองค์ประชุมแล้ว ประธานคณะกรรมาธิการได้กล่าวเปิดประชุม และดำเนินการประชุมตามระเบียบวาระการประชุม สรุปสาระสำคัญได้ ดังนี้",
-    "ระเบียบวาระที่ ๑ เรื่องที่ประธานแจ้งต่อที่ประชุม",
-    "สำนักงานเลขาธิการสภาผู้แทนราษฎรขอความอนุเคราะห์ตอบแบบสำรวจความพึงพอใจและความไม่พึงพอใจของคณะกรรมาธิการต่อการบริหารจัดการด้านการประชุม การศึกษาดูงาน และการจัดสัมมนา เพื่อนำผลการประเมินความพึงพอใจและความไม่พึงพอใจมาเป็นข้อมูลในการทบทวน ปรับปรุง และพัฒนาการปฏิบัติงานให้มีประสิทธิภาพต่อไป",
-    "ที่ประชุมรับทราบ",
+    "๑๒. นางสาวแอนศิริ วลัยกนก กรรมาธิการ",
+    "กรรมาธิการผู้ไม่มาประชุม",
+    "๑. นายพิบูลย์ รัชกิจประการ (ลาการประชุม)",
+    "๒. นายธนยศ ทิมสุวรรณ (ลาการประชุม)",
+    "๓. นายอัคร ทองใจสด (ลาการประชุม)",
 ]
-_SHOT2_ANSWER = "การจัดทำแบบสำรวจความพึงพอใจและไม่พึงพอใจของคณะกรรมการในครั้งนี้ มีการจัดทำขึ้นเพื่อนำข้อมูลที่ได้มาทบทวน ปรับปรุง รวมถึงนำไปพัฒนาการปฏิบัติงานให้มีประสิทธิภาพยิ่งขึ้น [อ้างอิง: 4]"
+_SHOT2_ANSWER = "ในการประชุมคณะกรรมาธิการการเงิน การคลัง สถาบันการเงินและตลาดการเงิน ครั้งที่ 49 มีกรรมการผู้ที่ไม่มาประชุมจำนวน 3 คน [อ้างอิง: 2, 3, 4, 5]"
 
 
 def benchmark_lib(i):
