@@ -1,7 +1,15 @@
 FROM docker.io/nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y python3.11 python3.11-dev python3-pip && \
+# Ubuntu 22.04's default python3.11 is 3.11.0~rc1 (a 2022 release candidate
+# with different CPython internal struct layouts than 3.11 stable). Triton
+# 3.6.0's pybind11 bindings built against 3.11-stable ABI SIGSEGV on rc1
+# inside IRBuilder's first setattr (verified via gdb py-bt on the Apptainer
+# build, see textsum.def comments). The deadsnakes PPA ships current 3.11.x.
+RUN apt-get update && apt-get install -y software-properties-common gnupg ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+RUN add-apt-repository -y ppa:deadsnakes/ppa
+RUN apt-get update && apt-get install -y python3.11 python3.11-dev python3.11-distutils python3-pip && \
     rm -rf /var/lib/apt/lists/*
 RUN ln -sf /usr/bin/python3.11 /usr/bin/python3
 
@@ -17,8 +25,7 @@ snapshot_download('Qwen/Qwen3-32B-AWQ')"
 
 ENV HF_HOME=/root/.cache/huggingface \
     HF_HUB_OFFLINE=1 \
-    TRANSFORMERS_OFFLINE=1 \
-    VLLM_USE_V1=0
+    TRANSFORMERS_OFFLINE=1
 
 COPY model /model
 WORKDIR /model
