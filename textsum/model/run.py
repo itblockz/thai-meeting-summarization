@@ -2,46 +2,46 @@
 Thai document summarization pipeline (production / Docker submission).
 
 NO RETRIEVAL: the full list of *valid* paragraphs from `doc_id` is fed to
-Qwen3-32B-AWQ in original document order. The model is shown the
-paragraphs as a numbered [1..N] context, answers in Thai, then cites
-which paragraphs it used as [อ้างอิง: X]; the cited paragraphs become
-`refs` (E5 self-citation, adaptive count). Two worked few-shot examples
-are prepended as multi-turn chat turns.
+Qwen3-30B-A3B-Instruct-2507-FP8 (MoE, 30 GB FP8 weights) in document
+order. The model is shown the paragraphs as a numbered [1..N] context,
+answers in Thai, then cites which paragraphs it used as [อ้างอิง: X];
+the cited paragraphs become `refs` (E5 self-citation, adaptive count).
+Two worked few-shot examples are prepended as multi-turn chat turns.
 
-This matches exp37 — full-doc context (no retrieval) + E5 self-citation
-+ 2-shot few-shot (exp08's example pair, from held-out doc_050) +
-**context-first prompt order** (doc context placed BEFORE the per-query
-text, so vLLM's prefix cache can reuse the ~14K-token full-doc prefix
-across all queries from the same doc — was ~5% cache hit with the
-query-first order of exp35).
-Train-set composite **0.6944 leak-free** (1218 queries, doc_050
-excluded) — the repo best, +0.0015 over exp35 and +0.0297 over exp22.
+v16 = exp51 port. Single-variable swap from v15-K (Qwen3-32B-AWQ,
+0.6944 leak-free): model → Qwen3-30B-A3B-Instruct-2507-FP8. Prompt,
+shots, retrieval (none) and decoding all unchanged. Leak-free
+composite **0.7110** (venv run, exp51) — +0.012 over v15-K, repo best.
+Citation rate climbs to 1237/1239 (99.8%) vs v15-K's ~91% — the
+stronger instruction-follower forgets the [อ้างอิง: …] tag far less
+often. avg refs/query 2.33 (vs v15-K's 1.54), driving IoU 0.6906 →
+0.7754.
 
-v14 = v13 infra (sort by doc_id, streaming progress, KV opts) PLUS
-context-first prompt order. The infra changes alone were no-op for
-output (verified container-vs-venv drift ≤1/50). The prompt-order swap
-in v14 is the actual score win.
+Why this model on a 40 GB A100:
+- A3B = 30 B params but 3 B activated per token (MoE). FP8-e4m3 weights
+  total 29.54 GiB → fits 40 GB GPU with ~6 GB KV-cache headroom (vLLM
+  reported 73,744-token KV size at gpu_memory_utilization=0.95).
+- A100 has no native FP8 cores → vLLM picks MarlinFP8ScaledMMLinearKernel
+  (linear) + MARLIN Fp8 MoE backend, dequantises FP8 → FP16 on the fly.
+  ~1.5–2× slower than AWQ on the same GPU but quality wins.
+- Multimodal vision blocks load idle for text-only chat;
+  limit_mm_per_prompt={"image":0,"video":0} stops vLLM from reserving
+  the encoder cache budget (was eating ~5 GB on prior 35B-A3B-FP8 try).
+- gpu_memory_utilization 0.90 → 0.95: 0.90 left no room for KV cache
+  after 30 GB weights + idle vision tower; 0.95 confirmed safe in the
+  exp51 venv run (peak ~36 GB on a 40 GB GPU).
 
-v13 throughput optimisations (carry over):
-- Sort queries by doc_id before submitting to vLLM — queries from the
-  same doc share the ~14K-token full-doc prefix, so vLLM's
-  enable_prefix_caching reuses the prefilled KV blocks across them.
-  With v14's context-first prompt, cache hit ceiling rises from ~5%
-  (v13) to ~90% (the doc context is now in the shared prefix).
-- max_num_batched_tokens 8192 → 16384 — single-chunk prefill for the
-  median ~14K-tok prompt (was 2 chunks). Bigger (32768) OOM'd at MLP
-  forward because Qwen3-32B's intermediate dim 27648 needs ~1.5GB
-  activation per chunk; 16384 halves that to a safe ~750MB.
-- LLMEngine.step() streaming instead of llm.generate() — the
-  benchmark `progress` binary is called as each request *finishes* (not
-  during prompt prep, which was instant) so the backend sees real-time
-  progress and a SLURM log shows a heartbeat.
-- gpu_memory_utilization kept at 0.90 (0.95 left no room for
-  activations and OOM'd — v13a failure on lanta-g-006).
-
-Container-specific settings (vllm 0.9.2 in the image): enforce_eager=True
-skips the V1-engine torch.compile path that crashes silently inside
-Apptainer/Docker.
+v14→v16 infra (carry over):
+- Sort queries by doc_id before submission so the ~14K-token full-doc
+  prefix hits vLLM's prefix cache across all queries from the same
+  doc (cache-hit ceiling ~90%).
+- LLMEngine.step() streaming instead of llm.generate() — the benchmark
+  `progress` binary fires per finished request, so the backend sees a
+  real heartbeat.
+- enforce_eager=True keeps the V1-engine torch.compile path off
+  (Apptainer-incompatible) and costs ~0 latency at this batch size.
+- MAX_NEW_TOKENS 512 → 1024 (matches exp51 venv config; the long
+  multi-ref answers from shot 2 sometimes truncate at 512).
 
 Output: submission.csv with columns ID, abstractive, refs — written in
 the *original* queries order (sort is internal only).
@@ -60,17 +60,17 @@ TEST_DIR     = os.environ.get("TEST_DIR",     "/model/test")
 RESULT_DIR   = os.environ.get("RESULT_DIR",   "/result/")
 PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
 
-MAX_NEW_TOKENS         = 512
+MAX_NEW_TOKENS         = 1024
 MAX_MODEL_LEN          = int(os.environ.get("MAX_MODEL_LEN", "32768"))
-# 16384 = sweet spot: 1 prefill chunk for the median ~14K-tok prompt, 2
-# chunks for the max ~28K-tok prompt. 32768 OOM'd at MLP activation
-# (~1.5 GB per chunk for Qwen3-32B's 27648 intermediate dim) — see v13a
-# failure on lanta-g-006 (job 5798218).
+# 16384 = sweet spot for the prior 32B-AWQ build. Kept for A3B-FP8 too:
+# the MoE intermediate dim per expert is smaller (~2048) than 32B-AWQ's
+# 27648, so MLP activations are cheaper; the 14K-tok median prompt is
+# still single-chunk and the 28K-tok max prompt still fits 2 chunks.
 MAX_NUM_BATCHED_TOKENS = int(os.environ.get("MAX_NUM_BATCHED_TOKENS", "16384"))
-# 0.90 = same as v12 (proven safe). 0.95 left only ~100 MiB headroom
-# after model (18GB) + KV cache + activations → OOM during MLP forward.
-GPU_MEM_UTIL           = float(os.environ.get("GPU_MEM_UTIL", "0.90"))
-MODEL_NAME             = os.environ.get("LLM_MODEL", "Qwen/Qwen3-32B-AWQ")
+# 0.95 confirmed safe on the exp51 venv run: 29.54 GiB weights +
+# 6.75 GiB KV cache + activations on a 40 GB A100 → peak ~36 GB.
+GPU_MEM_UTIL           = float(os.environ.get("GPU_MEM_UTIL", "0.95"))
+MODEL_NAME             = os.environ.get("LLM_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8")
 
 SYSTEM_MSG = (
     "คุณเป็นผู้ช่วยสรุปเอกสารภาษาไทย "
@@ -238,17 +238,25 @@ def main():
         print(f"pool sizes — mean={sum(pool_sizes)/len(pool_sizes):.2f}, "
               f"min={min(pool_sizes)}, max={max(pool_sizes)}", flush=True)
 
+    # FP8 quantization auto-detected from the model's config.json
+    # (quant_method=fp8); vLLM picks MarlinFP8ScaledMMLinearKernel on A100.
+    # limit_mm_per_prompt={"image":0,"video":0} stops vLLM from reserving
+    # the multimodal encoder cache (was ~5 GB on the prior 35B-A3B-FP8
+    # attempt → KV cache went negative).
     engine_args = EngineArgs(
-        model=MODEL_NAME, quantization="awq_marlin",
+        model=MODEL_NAME,
         max_model_len=MAX_MODEL_LEN,
         gpu_memory_utilization=GPU_MEM_UTIL,
-        dtype="half", enforce_eager=True,
+        dtype="bfloat16", enforce_eager=True,
         max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
         enable_prefix_caching=True,
+        trust_remote_code=True,
+        limit_mm_per_prompt={"image": 0, "video": 0},
     )
-    # Load tokenizer separately via AutoTokenizer — engine.get_tokenizer() was
-    # added in vllm 0.10+ and is absent in 0.9.2 (container).
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    # Load tokenizer separately via AutoTokenizer — vllm 0.19.1's
+    # engine.get_tokenizer() exists but AutoTokenizer keeps init order
+    # identical between container (0.19.1) and venv (0.19.1).
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
     engine = LLMEngine.from_engine_args(engine_args)
     sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS,
                               repetition_penalty=1.05)
