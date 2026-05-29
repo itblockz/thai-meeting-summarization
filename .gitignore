@@ -11,3 +11,7 @@ eval_retrieval/cache/rerank_train_pool*.json
 eval_retrieval/cache/*.pkl
 .claude/
 .ci_*.log
+eval_retrieval/cache/*.json
+prompt_lab/dev_sample.json
+exp_hybrid_*/submission.csv
+hybrid_*/submission.csv
