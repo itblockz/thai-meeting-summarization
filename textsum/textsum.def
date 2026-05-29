@@ -28,12 +28,17 @@ From: nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
     # torch 2.10.0 wheels live on the cu128 index (matches CUDA 12.8.1 base).
     pip3 install --no-cache-dir --timeout 300 --retries 5 torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
     pip3 install --no-cache-dir --timeout 300 --retries 5 -r /requirements.txt
-    # v16: swap LLM to Qwen3-30B-A3B-Instruct-2507-FP8 (exp42 port,
-    # leak-free 0.7087, +0.010 over v15-K). 30 B MoE with 3 B active per
-    # token, FP8-e4m3 weights ~30 GB → fits 40 GB A100 with KV headroom.
-    # Prompt unchanged from v15-K (exp38 wording) — single-variable swap.
+    # v17: two-stage hybrid (exp56 port, leak-free 0.7215, +0.0128 over
+    # v16's 0.7087). Stage A picks refs with Qwen3.6-27B-FP8 (dense,
+    # ~30 GB FP8); Stage B writes the answer with Qwen3-32B-AWQ
+    # (~18 GB INT4) + hint pointing at Stage A's refs. Both stages share
+    # one 40 GB GPU sequentially (combined weights 48 GB > 40 GB →
+    # cannot coexist; `del + empty_cache` between). Optimised for H100
+    # 40 GB (native FP8 + FA3 + FP8 KV cache, auto-detected at runtime);
+    # falls back gracefully on A100. Bundle BOTH weights (~50 GB SIF).
     python3 -c "from huggingface_hub import snapshot_download; \
-snapshot_download('Qwen/Qwen3-30B-A3B-Instruct-2507-FP8')"
+snapshot_download('Qwen/Qwen3.6-27B-FP8'); \
+snapshot_download('Qwen/Qwen3-32B-AWQ')"
     rm -rf /buildtmp
 
 %environment

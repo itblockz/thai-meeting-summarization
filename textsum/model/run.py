@@ -1,63 +1,61 @@
 """
-Thai document summarization pipeline (production / Docker submission).
+v17 — exp56 port (two-stage hybrid), H100 40GB single-GPU optimised.
 
 NO RETRIEVAL: the full list of *valid* paragraphs from `doc_id` is fed to
-Qwen3-30B-A3B-Instruct-2507-FP8 (MoE, 30 GB FP8 weights) in document
-order. The model is shown the paragraphs as a numbered [1..N] context,
-answers in Thai, then cites which paragraphs it used as [อ้างอิง: X];
-the cited paragraphs become `refs` (E5 self-citation, adaptive count).
-Two worked few-shot examples are prepended as multi-turn chat turns.
+both stages in document order. Two sequential LLMs share one 40 GB GPU
+(weights together = 30 + 18 ≈ 48 GB > 40 GB, so they cannot coexist):
 
-v16 = exp42 port. Single-variable swap from v15-K (Qwen3-32B-AWQ,
-0.6987 leak-free): model → Qwen3-30B-A3B-Instruct-2507-FP8. Prompt
-(v15-K's exp38 wording: "concise and comprehensive"), shots, retrieval
-(none) and decoding all unchanged. Leak-free composite **0.7087**
-(venv run, exp42) — +0.010 over v15-K. avg refs/query rises to 2.79
-(vs v15-K's 1.54) as the stronger model follows the citation directive
-more thoroughly; IoU 0.6906 → 0.7410 captures the bulk of the gain.
+  Stage A — Qwen/Qwen3.6-27B-FP8 (dense, FP8-e4m3 weights ≈ 30 GB) with
+            V10_factual prompt + the exp38 multi-ref shot pair. Picks
+            *refs* via [อ้างอิง: …] tags from the full doc.
+  --- free weights, gc.collect(), torch.cuda.empty_cache() ---
+  Stage B — Qwen/Qwen3-32B-AWQ (INT4 AWQ-Marlin, ≈ 18 GB) with exp38's
+            E5 prompt + a "เน้นย่อหน้าหมายเลข [X, Y, Z]" hint pointing
+            at Stage A's selection. Writes the abstractive answer on
+            the FULL doc context. Its emitted citations are parsed but
+            DISCARDED — final `refs` are FIXED to Stage A's selection.
 
-NB: exp51 was a parallel experiment with the same model swap but a
-revised instruction prompt ("short and to the point, no
-interpretation") that scored 0.7110 — v16 carries the *exp42* wording,
-not exp51's, so the production gain over v15-K stays single-variable
-(only the model changed).
+Leak-free composite **0.7215** on A100 (exp56, +0.0228 over v16's 0.7087).
 
-Why this model on a 40 GB A100:
-- A3B = 30 B params but 3 B activated per token (MoE). FP8-e4m3 weights
-  total 29.54 GiB → fits 40 GB GPU with ~6 GB KV-cache headroom (vLLM
-  reported 73,744-token KV size at gpu_memory_utilization=0.95).
-- A100 has no native FP8 cores → vLLM picks MarlinFP8ScaledMMLinearKernel
-  (linear) + MARLIN Fp8 MoE backend, dequantises FP8 → FP16 on the fly.
-  ~1.5–2× slower than AWQ on the same GPU but quality wins.
-- Multimodal vision blocks load idle for text-only chat;
-  limit_mm_per_prompt={"image":0,"video":0} stops vLLM from reserving
-  the encoder cache budget (was eating ~5 GB on prior 35B-A3B-FP8 try).
-- gpu_memory_utilization 0.90 → 0.95: 0.90 left no room for KV cache
-  after 30 GB weights + idle vision tower; 0.95 confirmed safe in the
-  exp42 venv run (peak ~36 GB on a 40 GB GPU).
+H100 40 GB optimisations (vs the A100-targeted exp56 reference):
+  - Native FP8 GEMM: A100 has no FP8 tensor cores, so 27B-FP8 falls back
+    to MarlinFP8 dequant kernels (~1.5–2× slower). H100 SM 9.0 runs the
+    FP8 GEMM directly; vLLM auto-selects the native path.
+  - FlashAttention 3: H100-only TMA + WGMMA attention path, 1.5–2× faster
+    than FA2 on the long-context (~14K-tok) doc prompts.
+  - FP8 KV cache (`kv_cache_dtype="fp8"`): H100-only, halves KV cache
+    memory → roughly 2× concurrent prompts in flight.
+  - gpu_memory_utilization 0.92 (vs A100's 0.90): H100 firmware is
+    stable enough at higher mem util. Stage A budget: 36.8 GB → 30 GB
+    weights + ~5–6 GB FP8 KV. Stage B: 18 GB weights + ~17 GB FP8 KV.
+  - enforce_eager remains True: vllm 0.19.1's V1 engine still segfaults
+    inside Apptainer (verified at v15 bump attempt, job 5787048 —
+    FLASHINFER / TRITON_ATTN / FLEX_ATTENTION all SIGSEGV after model
+    load). `VLLM_USE_V1=0` (set in textsum.def) pins V0 in-process
+    workers. Eager mode in V0 costs ~0 latency at this batch size.
+  - max_num_batched_tokens 16384: long-context (full doc ≈ 14K tok)
+    throughput is bound by prefill chunking, not decode.
 
-v14→v16 infra (carry over):
-- Sort queries by doc_id before submission so the ~14K-token full-doc
-  prefix hits vLLM's prefix cache across all queries from the same
-  doc (cache-hit ceiling ~90%).
-- LLMEngine.step() streaming instead of llm.generate() — the benchmark
-  `progress` binary fires per finished request, so the backend sees a
-  real heartbeat.
-- enforce_eager=True keeps the V1-engine torch.compile path off
-  (Apptainer-incompatible) and costs ~0 latency at this batch size.
-- MAX_NEW_TOKENS 512 → 1024 (matches exp42 venv config; the long
-  multi-ref answers from shot 2 sometimes truncate at 512).
+A100 fallback (auto-detected): `kv_cache_dtype="auto"` keeps FP16 KV
+and we stay on MarlinFP8 dequant. Runtime ≈ exp56's measured 2h45m on
+A100. The same SIF runs on either GPU — no rebuild required.
 
-Output: submission.csv with columns ID, abstractive, refs — written in
-the *original* queries order (sort is internal only).
+Doc-grouping (carry over from v16): both stages submit queries sorted
+by doc_id so vLLM's prefix cache reuses the full-doc prefilled KV blocks
+across all queries from the same doc (~5% → ~90% cache hit ceiling).
+CSV is written in the ORIGINAL queries order at the end.
+
+Output: submission.csv with columns ID, abstractive, refs.
 """
 from pathlib import Path
 import os
 import re
 import json
 import csv
+import gc
 import time
 
+import torch
 from transformers import AutoTokenizer
 from vllm import LLMEngine, EngineArgs, SamplingParams
 
@@ -65,36 +63,23 @@ TEST_DIR     = os.environ.get("TEST_DIR",     "/model/test")
 RESULT_DIR   = os.environ.get("RESULT_DIR",   "/result/")
 PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
 
-MAX_NEW_TOKENS         = 1024
-MAX_MODEL_LEN          = int(os.environ.get("MAX_MODEL_LEN", "32768"))
-# 16384 = sweet spot for the prior 32B-AWQ build. Kept for A3B-FP8 too:
-# the MoE intermediate dim per expert is smaller (~2048) than 32B-AWQ's
-# 27648, so MLP activations are cheaper; the 14K-tok median prompt is
-# still single-chunk and the 28K-tok max prompt still fits 2 chunks.
+MAX_NEW_TOKENS         = int(os.environ.get("MAX_NEW_TOKENS",         "1024"))
+MAX_MODEL_LEN          = int(os.environ.get("MAX_MODEL_LEN",          "32768"))
 MAX_NUM_BATCHED_TOKENS = int(os.environ.get("MAX_NUM_BATCHED_TOKENS", "16384"))
-# 0.95 confirmed safe on the exp42 venv run: 29.54 GiB weights +
-# 6.75 GiB KV cache + activations on a 40 GB A100 → peak ~36 GB.
-GPU_MEM_UTIL           = float(os.environ.get("GPU_MEM_UTIL", "0.95"))
-MODEL_NAME             = os.environ.get("LLM_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8")
+GPU_MEM_UTIL           = float(os.environ.get("GPU_MEM_UTIL",         "0.92"))
+
+MODEL_27B = os.environ.get("LLM_MODEL_STAGE_A", "Qwen/Qwen3.6-27B-FP8")
+MODEL_AWQ = os.environ.get("LLM_MODEL_STAGE_B", "Qwen/Qwen3-32B-AWQ")
 
 SYSTEM_MSG = (
     "คุณเป็นผู้ช่วยสรุปเอกสารภาษาไทย "
     "ตอบคำถามโดยอ้างอิงจากย่อหน้าที่ให้มาเท่านั้น ห้ามแต่งเติม"
 )
 
-# Two worked few-shot examples (both from held-out doc_050), rendered in
-# E5 form: a 5-paragraph numbered context and an answer ending with the
-# [อ้างอิง: N] tag.
-#
-# Shot 1 (exp08 carry-over): single-ref — matches the 71.8% single-ref
-# dataset prior, teaches "cite exactly the source paragraph."
-# Shot 2 (v15-K new): multi-ref subset — replaces exp08's single-ref
-# shot2 because the 153 missed-tag queries in the v15 train eval were
-# overwhelmingly multi-ref gold (model emits a comprehensive answer but
-# forgets to cite anything). Q0746 from doc_050: 4 of 5 context paragraphs
-# are gold (P21-P24, absentee list); P20 is a same-section distractor
-# (attendee #12). Teaches "structured answer covers several paragraphs
-# → cite them all" + "don't cite paragraphs the answer didn't use."
+# Few-shot pair — both from held-out doc_050, both stages reuse the same
+# shot QUERY/PARA/ANSWER triples; only the wrapping prompt differs.
+# Shot 1 = exp08 single-ref. Shot 2 = exp38 multi-ref (Q0746, 4 of 5
+# context paras are gold).
 _SHOT1_QUERY = "ในการประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้นที่ใด"
 _SHOT1_PARAS = [
     "ครั้งที่ ๔๙",
@@ -136,14 +121,37 @@ def filter_valid_paragraphs(paragraphs):
     return [p for p in paragraphs if is_valid(p)]
 
 
-def build_prompt(query, paras):
-    """E5 prompt — CONTEXT FIRST, then query, then instruction.
+def is_hopper_or_newer():
+    """Return True if the visible GPU is H100 (SM 9.0) or newer.
 
-    Context-first lets vLLM's prefix cache match the full ~14K-token doc
-    block across all queries from the same doc (the query is the
-    divergence point, not the cache-killer at the start). Instruction
-    stays at the end for recency bias on the citation directive.
+    Drives the FP8-KV-cache + V1-friendly decisions below. We probe at
+    runtime rather than at build time because the SIF is shared across
+    A100 (LANTA local test) and H100 (benchmark backend) without rebuild.
     """
+    if not torch.cuda.is_available():
+        return False
+    try:
+        major, _ = torch.cuda.get_device_capability(0)
+    except Exception:
+        return False
+    return major >= 9
+
+
+def build_prompt_v10(query, paras):
+    """Stage A — exp50/V10_factual prompt for ref-picking."""
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: ตอบคำถามเป็นภาษาไทย**สั้นและตรงประเด็น** "
+        f"ระบุข้อเท็จจริงที่ปรากฏในย่อหน้าเท่านั้น ห้ามตีความหรือสรุปเกินขอบเขต "
+        f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y]\n"
+        f"คำตอบ:"
+    )
+
+
+def build_prompt_exp38(query, paras):
+    """Stage B shot template (no hint) — exp38's E5 prompt."""
     context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
     return (
         f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
@@ -155,28 +163,47 @@ def build_prompt(query, paras):
     )
 
 
-def build_messages(query, paras):
-    """System + 2 few-shot turns + the final user turn.
-
-    Every user turn uses the same build_prompt; the few-shot assistant
-    turns carry the worked [อ้างอิง: N] answer.
+def build_prompt_exp38_with_hint(query, paras, hint_idx):
+    """Stage B — exp38's E5 prompt + the 'focus on paragraphs [...]' hint
+    pointing at Stage A's 1-based picks within the full doc.
     """
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    hint_str = ", ".join(str(i) for i in hint_idx) if hint_idx else "—"
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: โปรดสรุปคำตอบเป็นภาษาไทยอย่างกระชับและครอบคลุม "
+        f"โดยอ้างอิงจากข้อมูลที่ให้มาเท่านั้น "
+        f"**โดยเน้นย่อหน้าหมายเลข [{hint_str}] เป็นข้อมูลหลัก** "
+        f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y]\n"
+        f"คำตอบ:"
+    )
+
+
+def build_messages_v10(query, paras):
     return [
-        {"role": "system", "content": SYSTEM_MSG},
-        {"role": "user", "content": build_prompt(_SHOT1_QUERY, _SHOT1_PARAS)},
+        {"role": "system",    "content": SYSTEM_MSG},
+        {"role": "user",      "content": build_prompt_v10(_SHOT1_QUERY, _SHOT1_PARAS)},
         {"role": "assistant", "content": _SHOT1_ANSWER},
-        {"role": "user", "content": build_prompt(_SHOT2_QUERY, _SHOT2_PARAS)},
+        {"role": "user",      "content": build_prompt_v10(_SHOT2_QUERY, _SHOT2_PARAS)},
         {"role": "assistant", "content": _SHOT2_ANSWER},
-        {"role": "user", "content": build_prompt(query, paras)},
+        {"role": "user",      "content": build_prompt_v10(query, paras)},
+    ]
+
+
+def build_messages_exp38_hint(query, paras, hint_idx):
+    return [
+        {"role": "system",    "content": SYSTEM_MSG},
+        {"role": "user",      "content": build_prompt_exp38(_SHOT1_QUERY, _SHOT1_PARAS)},
+        {"role": "assistant", "content": _SHOT1_ANSWER},
+        {"role": "user",      "content": build_prompt_exp38(_SHOT2_QUERY, _SHOT2_PARAS)},
+        {"role": "assistant", "content": _SHOT2_ANSWER},
+        {"role": "user",      "content": build_prompt_exp38_with_hint(query, paras, hint_idx)},
     ]
 
 
 def parse_citation(text, n_paras):
-    """0-indexed paragraph indices from ALL [อ้างอิง...] tags.
-
-    The model emits one tag per item in a multi-part answer; re.search
-    (first tag only) under-counts refs, so collect every tag's numbers.
-    """
+    """Collect 0-indexed paragraph indices from ALL [อ้างอิง...] tags."""
     nums = []
     for grp in re.findall(r'\[อ้างอิง[:\s]+([0-9,\s]+)\]', text):
         nums += [int(x) for x in re.findall(r'\d+', grp)]
@@ -185,21 +212,89 @@ def parse_citation(text, n_paras):
         if 1 <= num <= n_paras and num not in seen:
             seen.add(num)
             valid.append(num - 1)
-    return valid or [0]  # fallback: first paragraph
+    return valid or [0]
 
 
-def split_answer_citation(text):
-    """Return (answer, raw_citation_tag).
+def split_answer(text):
+    """Strip every [อ้างอิง...] tag inline."""
+    return re.sub(r'\s*\[อ้างอิง[^\]]*\]', '', text).strip()
 
-    answer = text with EVERY [อ้างอิง...] tag removed. The model emits a
-    tag inline after each item in multi-part answers, not only at the
-    end, so stripping from the last tag alone (rfind) leaks the earlier
-    tags into abstractive — gold answers carry no such tag.
+
+def make_engine_args(model_name, extra_kwargs):
+    """Build EngineArgs with H100-aware defaults.
+
+    Both stages share gpu_memory_utilization, max_model_len,
+    max_num_batched_tokens, enable_prefix_caching, enforce_eager,
+    and (on H100) kv_cache_dtype="fp8". Stage-specific knobs
+    (quantization, dtype, MM caps) come in via extra_kwargs.
     """
-    idx = text.rfind('[อ้างอิง')
-    raw_tag = text[idx:] if idx != -1 else ""
-    answer = re.sub(r'\s*\[อ้างอิง[^\]]*\]', '', text).strip()
-    return answer, raw_tag
+    hopper = is_hopper_or_newer()
+    kv = "fp8" if hopper else "auto"
+    base = dict(
+        model=model_name,
+        max_model_len=MAX_MODEL_LEN,
+        gpu_memory_utilization=GPU_MEM_UTIL,
+        max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+        enable_prefix_caching=True,
+        enforce_eager=True,        # V0 in Apptainer; no torch.compile path
+        trust_remote_code=True,
+        kv_cache_dtype=kv,
+    )
+    base.update(extra_kwargs)
+    return EngineArgs(**base)
+
+
+def run_stage(stage_label, model_name, extra_kwargs, items, progress_fn):
+    """Load model, stream all `items` through engine.step(), free GPU.
+
+    items: list of (key, messages) tuples — key is the stable index used
+    to map the raw output back to the caller's data structures.
+
+    progress_fn(n_done_in_stage): called once per finished request so
+    the benchmark `progress` binary keeps emitting heartbeats during
+    the stage. The caller decides how to translate stage-local progress
+    into overall 0..N progress (see split between Stages A and B in
+    main()).
+    """
+    print(f"\n=== {stage_label}: {model_name} ===", flush=True)
+    print(f"  H100 detected: {is_hopper_or_newer()} | "
+          f"kv_cache_dtype: {'fp8' if is_hopper_or_newer() else 'auto'} | "
+          f"gpu_mem_util: {GPU_MEM_UTIL} | "
+          f"max_num_batched_tokens: {MAX_NUM_BATCHED_TOKENS}",
+          flush=True)
+
+    engine = LLMEngine.from_engine_args(make_engine_args(model_name, extra_kwargs))
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS,
+                              repetition_penalty=1.05)
+
+    n = len(items)
+    for key, msgs in items:
+        prompt = tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        engine.add_request(request_id=str(key), prompt=prompt, params=sampling)
+
+    raw_by_key = {}
+    n_done = 0
+    t0 = time.time()
+    while engine.has_unfinished_requests():
+        for o in engine.step():
+            if o.finished:
+                raw_by_key[int(o.request_id)] = o.outputs[0].text.strip()
+                n_done += 1
+                progress_fn(n_done)
+                if n_done == 1 or n_done % 50 == 0 or n_done == n:
+                    elapsed = time.time() - t0
+                    rate = n_done / max(elapsed, 1e-6)
+                    eta = (n - n_done) / max(rate, 1e-6)
+                    print(f"  [{stage_label} {n_done}/{n}] {rate:.2f} q/s, eta {eta:.0f}s",
+                          flush=True)
+
+    # Free GPU before the next stage's weights land.
+    del engine, tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
+    return raw_by_key
 
 
 def main():
@@ -207,9 +302,10 @@ def main():
     doc_index = {doc["doc_id"]: doc["paragraphs"] for doc in data["docs"]}
     queries = data["queries"]
     n = len(queries)
-    print(f"{n} queries, {len(doc_index)} docs "
-          f"(NO RETRIEVAL — full doc, max_model_len={MAX_MODEL_LEN}, "
-          f"gpu_mem_util={GPU_MEM_UTIL}, max_num_batched_tokens={MAX_NUM_BATCHED_TOKENS})",
+    half = n // 2
+    print(f"v17 hybrid (exp56 port): {n} queries, {len(doc_index)} docs | "
+          f"Stage A = {MODEL_27B} | Stage B = {MODEL_AWQ} | "
+          f"max_model_len={MAX_MODEL_LEN}",
           flush=True)
     benchmark_lib(0)
 
@@ -219,14 +315,17 @@ def main():
         doc_paras[doc_id] = filter_valid_paragraphs(paragraphs)
 
     # Sort indices by doc_id so queries from the same doc are submitted
-    # contiguously — vLLM's prefix cache then reuses the full-doc prefilled
-    # KV blocks across them. CSV is written in original queries order at
-    # the end (sort is internal only).
+    # contiguously to BOTH stages — vLLM's prefix cache then reuses the
+    # full-doc prefilled KV blocks across them. CSV is written in
+    # ORIGINAL queries order at the end (sort is internal only).
     order = sorted(range(n), key=lambda i: queries[i]["doc_id"])
 
-    items = []  # one tuple per query, in sorted submission order
+    # ----- Stage A items (key = position in sorted order) -----
     pool_sizes = []
-    for idx in order:
+    stage_a_items = []
+    stage_a_gen_pids = {}
+    stage_a_gen_texts = {}
+    for k, idx in enumerate(order):
         query = queries[idx]
         valid = doc_paras.get(query["doc_id"], [])
         q_text = query["query"]
@@ -234,93 +333,85 @@ def main():
             gen_pids  = [p["para_id"] for p in valid]
             gen_texts = [p["text"]    for p in valid]
             pool_sizes.append(len(valid))
-            messages = build_messages(q_text, gen_texts)
+            msgs = build_messages_v10(q_text, gen_texts)
         else:
-            gen_pids, gen_texts, messages = [], [], None
-        items.append((idx, query["ID"], gen_pids, gen_texts, messages, q_text))
-
+            gen_pids, gen_texts = [], []
+            msgs = [{"role": "user", "content": q_text}]
+        stage_a_items.append((k, msgs))
+        stage_a_gen_pids[k] = gen_pids
+        stage_a_gen_texts[k] = gen_texts
     if pool_sizes:
         print(f"pool sizes — mean={sum(pool_sizes)/len(pool_sizes):.2f}, "
               f"min={min(pool_sizes)}, max={max(pool_sizes)}", flush=True)
 
-    # FP8 quantization auto-detected from the model's config.json
-    # (quant_method=fp8); vLLM picks MarlinFP8ScaledMMLinearKernel on A100.
-    # limit_mm_per_prompt={"image":0,"video":0} stops vLLM from reserving
-    # the multimodal encoder cache (was ~5 GB on the prior 35B-A3B-FP8
-    # attempt → KV cache went negative).
-    engine_args = EngineArgs(
-        model=MODEL_NAME,
-        max_model_len=MAX_MODEL_LEN,
-        gpu_memory_utilization=GPU_MEM_UTIL,
-        dtype="bfloat16", enforce_eager=True,
-        max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
-        enable_prefix_caching=True,
-        trust_remote_code=True,
-        limit_mm_per_prompt={"image": 0, "video": 0},
+    # Progress: Stage A occupies the 0..n/2 half of the overall heartbeat
+    # range. Map stage-local n_done → overall via integer halving so the
+    # benchmark sees a smooth monotonic count.
+    raws_A = run_stage(
+        "Stage A (refs)", MODEL_27B,
+        dict(dtype="bfloat16",
+             limit_mm_per_prompt={"image": 0, "video": 0}),
+        stage_a_items,
+        progress_fn=lambda i: benchmark_lib(i // 2),
     )
-    # Load tokenizer separately via AutoTokenizer — vllm 0.19.1's
-    # engine.get_tokenizer() exists but AutoTokenizer keeps init order
-    # identical between container (0.19.1) and venv (0.19.1).
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    engine = LLMEngine.from_engine_args(engine_args)
-    sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS,
-                              repetition_penalty=1.05)
 
-    # Add all requests up-front; request_id encodes the submission position
-    # so we can map outputs back to items[].
-    for k, it in enumerate(items):
-        msgs = it[4] if it[4] is not None else [{"role": "user", "content": it[5]}]
-        prompt = tokenizer.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-        engine.add_request(request_id=str(k), prompt=prompt, params=sampling)
-
-    # Stream completions: call benchmark_lib on each finished request so the
-    # benchmark backend sees a real heartbeat (was: one batch ping at the
-    # very end after llm.generate() returned, ~30-60min of silence).
-    raw_by_k = {}
-    n_done = 0
-    t0 = time.time()
-    while engine.has_unfinished_requests():
-        for o in engine.step():
-            if o.finished:
-                raw_by_k[int(o.request_id)] = o.outputs[0].text.strip()
-                n_done += 1
-                benchmark_lib(n_done)
-                if n_done == 1 or n_done % 50 == 0 or n_done == n:
-                    elapsed = time.time() - t0
-                    rate = n_done / max(elapsed, 1e-6)
-                    eta = (n - n_done) / max(rate, 1e-6)
-                    print(f"  [{n_done}/{n}] done — {rate:.2f} q/s, eta {eta:.0f}s",
-                          flush=True)
-
-    # Parse outputs (still in sorted item order)
-    cite_re = re.compile(r'\[อ้างอิง[:\s]+[0-9,\s]+\]')
-    n_explicit = 0
-    ref_counts = []
-    results_by_qid = {}
-    for k, it in enumerate(items):
-        _idx, qid, gen_pids, gen_texts, _, q_text = it
-        raw = raw_by_k[k]
-        answer, _ = split_answer_citation(raw)
+    # Parse Stage A → refs + hint indices (per submission-order key k).
+    stage_a_refs = {}   # k -> list of para_id strings
+    stage_a_hint = {}   # k -> list of 1-based positions within full doc
+    for k in range(n):
+        raw = raws_A.get(k, "")
+        gen_pids = stage_a_gen_pids[k]
         cited_idx = parse_citation(raw, len(gen_pids))
-        if gen_pids:
-            ref_ids = [gen_pids[j] for j in cited_idx if j < len(gen_pids)]
-            if not ref_ids:
-                ref_ids = [gen_pids[0]]
+        valid_idx = [j for j in cited_idx if j < len(gen_pids)]
+        ref_pids = [gen_pids[j] for j in valid_idx]
+        if not ref_pids and gen_pids:
+            ref_pids = [gen_pids[0]]
+            valid_idx = [0]
+        stage_a_refs[k] = ref_pids
+        stage_a_hint[k] = [j + 1 for j in valid_idx]
+    avg_refs_A = (sum(len(r) for r in stage_a_refs.values()) /
+                  max(len(stage_a_refs), 1))
+    print(f"Stage A: avg refs/query = {avg_refs_A:.2f}", flush=True)
+    del stage_a_items, raws_A
+
+    # ----- Stage B items (same submission order; carries the hint) -----
+    stage_b_items = []
+    for k, idx in enumerate(order):
+        query = queries[idx]
+        valid = doc_paras.get(query["doc_id"], [])
+        q_text = query["query"]
+        gen_texts = stage_a_gen_texts[k]
+        if valid:
+            msgs = build_messages_exp38_hint(q_text, gen_texts, stage_a_hint[k])
         else:
-            ref_ids = []
-        if cite_re.search(raw):
-            n_explicit += 1
+            msgs = [{"role": "user", "content": q_text}]
+        stage_b_items.append((k, msgs))
+
+    # Progress: Stage B occupies n/2..n half of the heartbeat range.
+    raws_B = run_stage(
+        "Stage B (answer)", MODEL_AWQ,
+        dict(quantization="awq_marlin", dtype="half"),
+        stage_b_items,
+        progress_fn=lambda i: benchmark_lib(half + i // 2),
+    )
+
+    # ----- Assemble final results (refs FIXED to Stage A) -----
+    empty_answers = 0
+    results_by_qid = {}
+    for k, idx in enumerate(order):
+        query = queries[idx]
+        qid = query["ID"]
+        q_text = query["query"]
+        gen_texts = stage_a_gen_texts[k]
+        ref_pids = stage_a_refs[k]
+        raw = raws_B.get(k, "")
+        answer = split_answer(raw)
         if not answer:
             answer = gen_texts[0] if gen_texts else q_text
-        ref_counts.append(len(ref_ids))
+            empty_answers += 1
         results_by_qid[qid] = {"ID": qid, "abstractive": answer,
-                               "refs": ",".join(ref_ids)}
-
-    print(f"citations: {n_explicit}/{len(items)} emitted an [อ้างอิง: …] tag, "
-          f"{len(items) - n_explicit} fell back to top-1", flush=True)
-    if ref_counts:
-        print(f"avg refs/query: {sum(ref_counts) / len(ref_counts):.2f}", flush=True)
+                               "refs": ",".join(ref_pids)}
+    print(f"empty_answers={empty_answers}", flush=True)
 
     # Write CSV in ORIGINAL queries order (not sorted submission order)
     results = [results_by_qid[q["ID"]] for q in queries]
@@ -330,7 +421,6 @@ def main():
         writer = csv.DictWriter(f, fieldnames=["ID", "abstractive", "refs"])
         writer.writeheader()
         writer.writerows(results)
-
     print(f"Written {len(results)} rows to {out_path}", flush=True)
     return n
 
