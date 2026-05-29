@@ -82,8 +82,8 @@ Both `APPTAINER_TMPDIR` and `APPTAINER_CACHEDIR` MUST point at Lustre — `/tmp`
 
 ### Pipeline (two phases)
 
-1. **Retrieval**: For each query, build a candidate pool from the `doc_id` document (dense bge-m3 + BM25, top-20 each), rerank it with a cross-encoder (bge-reranker-v2-m3). The current best (`exp30/`) keeps the **full reranked union pool** (mean ~28 paragraphs); earlier configs truncated to `GEN_K` (5 or 20).
-2. **Generation**: Pass the reranked paragraphs as a numbered `[1..K]` context to vLLM running Qwen3-32B-AWQ; it answers in Thai and cites which paragraphs it used as `[อ้างอิง: X]` (E5 self-citation — the cited paragraphs become `refs`). The Docker pipeline (`textsum/model/run.py`) still matches **exp22** (GEN_K=5) — exp03 retrieval + E5 self-citation + 2-shot multi-turn-chat few-shot — at image tag **v11**. exp30 (NEW BEST) is not yet ported to the container. Both pass `enforce_eager=True` to skip the V1-engine torch.compile path, which crashes silently inside Apptainer/Docker containers on vllm 0.9.2 (see "Docker container issues").
+1. **Retrieval (legacy)**: For each query, build a candidate pool from the `doc_id` document (dense bge-m3 + BM25, top-20 each), rerank it with a cross-encoder (bge-reranker-v2-m3). `exp22` (v11 prod) truncated to `GEN_K=5`; `exp30` (previous retrieval-line best, 0.6783) keeps the **full reranked union pool** (mean ~28 paragraphs). **exp35 closed this phase**: skipping retrieval and feeding the whole doc to a strong LLM beats every retrieval config (exp35 0.6929 vs exp30 0.6783). All experiments from exp35 onward (including v16 production and exp56 repo-best) have no retrieval step — both the legacy hybrid retrieval and exp30's full pool are unused outside their own lineage.
+2. **Generation**: Pass the paragraphs as a numbered `[1..K]` context to vLLM; the model answers in Thai and cites which paragraphs it used as `[อ้างอิง: X]` (E5 self-citation — the cited paragraphs become `refs`). The Docker pipeline (`textsum/model/run.py`) is now at image tag **v16** — full-doc / no-retrieval / context-first / E5 + exp38's 2-shot multi-turn-chat few-shot, generation model **Qwen3-30B-A3B-Instruct-2507-FP8** (port of exp42, composite **0.7087** leak-free). exp56 (NEW repo best, two-stage hybrid at 0.7215) is not yet containerized — would need a ~50 GB SIF holding both 27B-FP8 + 32B-AWQ weights. All container runs pass `enforce_eager=True` to skip the V1-engine torch.compile path, which crashes silently inside Apptainer/Docker containers on vllm 0.9.2 (see "Docker container issues").
 
 ### Experiments
 
@@ -111,7 +111,17 @@ LANTA experiment history (train-set composite, ↑ better):
 | `exp32/` — E3 HyDE | exp30 + HyDE-blended dense (α=0.5) | 0.6779 † *(−0.0004)* |
 | `exp35/` — ceiling test | NO RETRIEVAL — feed full doc to LLM | 0.6929 † |
 | `exp37/` — context-first prompt | exp35 + context BEFORE query (prefix-cache hit) | 0.6944 † |
-| `exp38/` — multi-ref shot2 (**NEW BEST**) | exp37 + replace shot2 with 4-ref example (Q0746) | **0.6987** † ⭐ |
+| `exp38/` — multi-ref shot2 | exp37 + replace shot2 with 4-ref example (Q0746) | 0.6987 † |
+| `exp39/` — token budget | exp38 + MAX_NEW_TOKENS 512→1024 | 0.6991 † |
+| `exp40/` — E9 model swap | exp39 + 32B-AWQ → Qwen3.6-27B-FP8 | 0.6969 † |
+| `exp42/` — E9 model swap (**v16 prod**) | exp39 + 32B-AWQ → Qwen3-30B-A3B-Instruct-2507-FP8 | **0.7087** † ⭐ |
+| `exp50–54/` — prompt sweep | port prompt_lab R3 winners (V10/V13/V14/V15) to 27B-FP8 / AWQ / A3B | see prompt_lab |
+| `exp55/` — hybrid pipeline 1 (AWQ) | 27B-FP8 picks refs → 32B-AWQ writes answer on filtered context | (see narrative) |
+| `exp56/` — hybrid pipeline 2 (**NEW BEST**) | 27B-FP8 picks refs → 32B-AWQ writes answer on full ctx + "เน้นย่อหน้า" hint, refs FIXED | **0.7215** † ⭐⭐ |
+| `exp57/` — hybrid pipeline 3 (AWQ, refs free) | same as exp56 but Stage B can override refs | (see narrative) |
+| `exp58/` — hybrid pipeline 1 (A3B) | exp55 with Stage B = A3B-Instruct | 0.7072 † |
+| `exp59/` — hybrid pipeline 2 (A3B) | exp56 with Stage B = A3B-Instruct, refs fixed | 0.7196 † |
+| `exp60/` — hybrid pipeline 3 (A3B) | exp57 with Stage B = A3B-Instruct, refs free | 0.7199 † |
 
 † Held-out evaluation: exp06 scored on 1218 queries excluding doc_050, exp07 on 1211 excluding doc_047, exp08 on the same 1218 as exp06. Apples-to-apples exp03 baselines on those subsets are 0.6270 (doc_050) and 0.6237 (doc_047), so the few-shot deltas are **+0.0059 (exp06)**, **+0.0041 (exp07)** and **+0.0091 (exp08)**. All show statistically significant per-query RougeL improvement (paired t-test p<0.0002), confirming the few-shot signal is real and not a doc-choice artifact. IoU is identical to exp03 because the retrieval pipeline is unchanged.
 
@@ -140,28 +150,55 @@ The avg dense∪BM25 union is ~28.6 — GEN_K=20 already captures the bulk; furt
 
 **Multi-ref few-shot (exp38, leak-free, NEW BEST)**: exp37's v15 container deploy revealed 153/1239 queries (12.4%) failed to emit `[อ้างอิง: …]` → fell back to `gen_pids[0]` (= doc header para), all IoU=0. Analysis: model produces correct comprehensive answers spanning multiple paragraphs but omits the citation tag entirely. Root cause: both shot1 and shot2 (exp08 pair, carried over) cite a single paragraph, so the model learned "answer + [อ้างอิง: ONE_NUMBER]" and stalls when the answer genuinely needs 3+ paragraphs. exp38 replaces shot2 with **Q0746 from doc_050** — 5-paragraph context where 4 are gold (header + 3 absentees) and 1 is a same-section distractor, answer cites `[อ้างอิง: 2, 3, 4, 5]`. Shot 1 (single-ref) preserved so the 71.8% single-ref dataset prior is still represented. Result: **0.6987** (+0.0043 vs exp37), driven entirely by IoU (0.6669 → 0.6906, +0.0237); RougeL/SS dip slightly (−0.0005/−0.0008) from mild over-citation (avg refs/query 1.20 → 1.54). 47 more queries now emit tags (1086 → 1133); 105 of the 109 fallback queries are *stubborn* (still fail after exp38) and skew toward >5 gold refs.
 
-**Current best**: `exp38/` — full doc + context-first + E5 self-cite + (single-ref shot1 + multi-ref shot2) — at **0.6987** leak-free. The Docker submission pipeline (`textsum/model/run.py`) ports exp38's prompt and shots into image tag **v15-K** (vllm 0.19.1 + python3.11.15-stable via deadsnakes PPA; previous container Python 3.11.0~rc1 SIGFAULTed Triton's pybind11 IRBuilder — see "Docker container issues v15"). Container vs venv drift is sub-noise (~0.0008). exp03 remains the canonical no-few-shot reference (0.6256 full-1239); exp30 (0.6783) was the previous best in the retrieval line before exp35 closed the retrieval phase. The worked examples are the `_SHOT1_*`/`_SHOT2_*` constants — `_SHOT1` is exp08's single-ref pair carry-over, `_SHOT2` is exp38's new multi-ref Q0746.
+**Token & model exploration (exp39–exp42, leak-free)**: with retrieval closed at exp37 and citation closed at exp38, focus shifted to inference-side levers. **exp39** lifts `MAX_NEW_TOKENS` 512→1024 — rescues queries whose answer was cut mid-sentence (~50/1218 affected) → **0.6991** (+0.0004, within noise). **exp40** swaps Qwen3-32B-AWQ → Qwen3.6-27B-FP8 (dense 30.87 GB, fits A100-40GB with `limit_mm_per_prompt`) → **0.6969** (−0.0022); A100 has no native FP8 cores so vLLM falls back to `fp8_marlin`/`fp8_w8a16` software dequant — ~1.5–2× slower than AWQ on identical hardware, and slightly behind on quality at this prompt. **exp42** swaps to **Qwen3-30B-A3B-Instruct-2507-FP8** (MoE, ~3B active of 30B, same FP8 weights) → **0.7087** (+0.0096 vs exp38) — best single-model so far. Now production at image tag **v16**. The win comes from A3B's instruction-following — emits `[อ้างอิง: …]` reliably without the exp38 fallback queues that hurt exp22/exp37 generations. (exp41/exp43–exp49 were OOM/quality-loss variants in the same swap exploration; abandoned.)
+
+**Prompt-lab cross-model sweep (exp50–exp54, leak-free)**: built `prompt_lab/` to compare 15 prompt variants × 3 finalist models (32B-AWQ / 27B-FP8 / A3B-Instruct) on 100 held-out dev queries before committing a full LANTA job per variant. R3 winners ported to full eval (1218 leak-free):
+- `exp50/`: 27B-FP8 + **V10_factual** ("สั้น+ตรงประเด็น, ระบุข้อเท็จจริงเท่านั้น, ห้ามตีความ") → **IoU 0.7998** (record across all single-stage variants × models).
+- `exp51/`: A3B-Instruct + V10_factual.
+- `exp52/`: AWQ + **V14_named_entities** — highest RougeL on dev (0.4963), forces entity coverage.
+- `exp53/`: AWQ + **V15_no_redundant** — best AWQ proxy on dev (0.6955), adds "ห้ามอ้างย่อหน้าที่ไม่ได้ใช้" guard.
+- `exp54/`: 27B-FP8 + **V13_extract** — IoU **0.8225** on dev (highest IoU ever), at cost of RougeL (model becomes ultra-extractive). Ceiling test.
+
+R4/R5 (R5 = few-shot composition ablation) confirmed model-specific shot preferences: A3B and AWQ both prefer the exp38 2-shot baseline; 27B-FP8 was more sensitive to shot wording (`F1_zero_shot` and `F2_only_single` competitive). See `prompt_lab/results_*/summary.json` for the full grid.
+
+**Two-stage hybrid pipelines (exp55–exp60, leak-free) — NEW BEST**: insight from the prompt sweep — V10_factual + 27B-FP8 produces sharper *refs* (IoU 0.7998 vs exp38's 0.6906) but worse *answers* (RougeL/SS drop); exp38's E5 + AWQ produces stronger *answers* but weaker *refs*. Decoupling the two — Stage A picks refs, Stage B writes the answer — captures both halves. **Stage A is always Qwen3.6-27B-FP8 + V10_factual + exp38 shots** running on the full doc. All values are FRESH model output — no precomputed CSVs are read (the constraint that drove this design: refs and answer must both be generated, not joined from prior runs).
+
+Three Stage-B variants × two Stage-B models (32B-AWQ vs A3B-Instruct, same A100-40GB):
+
+| Pipeline | Stage-B context | Stage-B refs | 32B-AWQ Stage B | A3B Stage B |
+|---|---|---|--:|--:|
+| 1 (filter) | only Stage A's cited paras (1..K renumbered) | fixed to Stage A | `exp55/` | `exp58/` = 0.7072 |
+| 2 (hint, fixed) | full doc + "เน้นย่อหน้า [X,Y,Z] เป็นข้อมูลหลัก" line | fixed to Stage A | `exp56/` = **0.7215** ⭐ | `exp59/` = 0.7196 |
+| 3 (hint, free) | full doc + hint | Stage B can override | `exp57/` | `exp60/` = 0.7199 |
+
+Key findings:
+- **Pipeline 2 wins both model families** — full context + hint beats filtered context decisively (exp58 0.7072 < exp59 0.7196 = +0.0124). Filtering away non-cited paras throws away signal Stage B can still use to phrase the answer.
+- **32B-AWQ Stage B narrowly beats A3B** (exp56 0.7215 vs exp59 0.7196 = +0.0019). A3B is ~4× faster wall-clock but the AWQ answer quality edge is the headline.
+- **Letting Stage B override refs (pipeline 3) is flat** — exp60 (0.7199) only +0.0003 over exp59. Stage A's V10_factual refs are already near-optimal; A3B mostly agrees and occasionally adds noise.
+- **IoU breaks the citation ceiling**: exp38's IoU 0.6906 → exp59's **0.8006** (+0.0100). The "model answers spanning multi-paras but forgets the citation tag" failure mode that bottlenecked single-stage exp38 (153/1239 → IoU=0 fallbacks) is solved by giving citation its own dedicated model+prompt that *only* picks refs.
+
+**Current best**: `exp56/` — Stage A = Qwen3.6-27B-FP8 + V10_factual prompt + exp38 multi-ref shots (refs only); Stage B = Qwen3-32B-AWQ + exp38 E5 prompt with `**โดยเน้นย่อหน้าหมายเลข [X, Y, Z] เป็นข้อมูลหลัก**` hint pointing at Stage A's selection; **final refs FIXED to Stage A**, abstractive from Stage B. Composite **0.7215** leak-free (+0.0228 over exp38). The Docker pipeline still runs single-model v16 (port of exp42, composite 0.7087); exp56 is not yet containerized — would need a hybrid SIF (~50 GB, both model weights) and `del llm; gc.collect(); torch.cuda.empty_cache()` between stages. exp38 remains the canonical single-AWQ reference (0.6987); exp03 the no-few-shot baseline (0.6256 full-1239); exp30 (0.6783) the previous-best retrieval-line score before exp35 closed the retrieval phase.
 
 See `IDEAS.md` for the full experiment roadmap and `eval_retrieval/` for the fast retrieval harness.
 
 **Score breakdown:**
 
-|          | baseline | exp03  | exp22 (v11)  | exp30  | exp37  | **exp38 (best)** |
-|----------|----------|--------|--------------|--------|--------|------------------|
-| RougeL   | 0.3387   | 0.3928 | 0.4454       | 0.4584 | 0.4939 | **0.4935**       |
-| SS-score | 0.7667   | 0.8096 | 0.8384       | 0.8467 | 0.8626 | **0.8619**       |
-| IoU      | 0.4744   | 0.6190 | 0.6575       | 0.6844 | 0.6669 | **0.6906**       |
-| **Composite** | **0.5584** | **0.6256** | **0.6647** | **0.6783** | **0.6944** | **0.6987** |
+|          | baseline | exp03  | exp22 (v11)  | exp30  | exp37  | exp38  | exp42 (v16) | exp59 (A3B hybrid) | **exp56 (best)** |
+|----------|----------|--------|--------------|--------|--------|--------|-------------|--------------------|------------------|
+| RougeL   | 0.3387   | 0.3928 | 0.4454       | 0.4584 | 0.4939 | 0.4935 | —           | 0.4899             | —                |
+| SS-score | 0.7667   | 0.8096 | 0.8384       | 0.8467 | 0.8626 | 0.8619 | —           | 0.8624             | —                |
+| IoU      | 0.4744   | 0.6190 | 0.6575       | 0.6844 | 0.6669 | 0.6906 | —           | 0.8006             | 0.8006*          |
+| **Composite** | **0.5584** | **0.6256** | **0.6647** | **0.6783** | **0.6944** | **0.6987** | **0.7087** | **0.7196** | **0.7215** |
 
-baseline/exp03 are full-1239; exp22/exp30/exp37/exp38 are leak-free (1218, doc_050 held out — the few-shot examples come from it). exp03 on the same 1218 subset = 0.6270, so exp38 is **+0.0717** over exp03 and **+0.0204** over the previous retrieval-line best (exp30).
+baseline/exp03 are full-1239; exp22/exp30/exp37/exp38/exp42/exp56/exp59 are leak-free (1218, doc_050 held out — the few-shot examples come from it). exp03 on the same 1218 subset = 0.6270, so exp56 is **+0.0945** over exp03 and **+0.0228** over the previous single-stage best (exp38). \*exp56 IoU is identical to exp59 because both fix refs to Stage A (same 27B-FP8 + V10_factual model). The +0.0019 composite over exp59 comes from 32B-AWQ Stage B's marginally better RougeL/SS at writing the answer.
 
 **Key design decisions:**
-- Two-stage retrieval: dense (bge-m3) + BM25 build a candidate pool (top-20 each), a cross-encoder (bge-reranker-v2-m3) reranks it.
-- **exp30 (current best)** feeds the LLM the *full reranked union pool* (mean 28.57 paras) — no GEN_K cap; E5 self-citation reports the subset actually cited as `refs`. The GEN_K sweep (exp22→exp25→exp26→exp27→exp30 = 5→10→15→20→full) showed monotonic gain; the v11 container still uses **GEN_K=5** (exp22).
-- `GEN_K=5` (production v11) was the elbow of the rerank recall curve — hit@5 = 0.912 vs hit@1 = 0.739; the gain past K=5 only materialised once we switched to Qwen3-32B-AWQ (the 7B model in exp02 couldn't exploit the extra context).
-- `exp03/` and the `exp04`–`exp16` line instead use `TOP_K=1` — retrieve, generate from, and report exactly one paragraph.
-- bge-m3 and the cross-encoder both run on GPU; the cross-encoder is freed (`del` + `empty_cache`) before the LLM loads. (`exp03/` and earlier `expNN` embed bge-m3 on CPU — a pre-v9 convention to keep CUDA uninitialised until vLLM spawns its workers.)
-- LANTA SLURM scripts set `VLLM_WORKER_MULTIPROC_METHOD=spawn` — required when CrossEncoder touches CUDA before vLLM init, otherwise the forked worker crashes.
+- **Retrieval is closed**: exp35 / exp37 showed feeding the full doc to a strong LLM beats any retrieval config we tried (exp30 = 0.6783 → exp37 = 0.6944 by removing retrieval). The current best (exp56) inherits this — both Stage A and Stage B see the full doc. The old two-stage *retrieval* (bge-m3 dense + BM25 → bge-reranker-v2-m3) survives only in legacy paths (`exp22`/`exp30` lineage and the v11 container) and is unused by exp35+.
+- **exp56 (current best)** is a two-stage *LLM* pipeline: Stage A (Qwen3.6-27B-FP8 + V10_factual prompt) picks refs; Stage B (Qwen3-32B-AWQ + exp38 E5 prompt + hint "เน้นย่อหน้า [X,Y,Z]") writes the answer on the full doc. Refs are FIXED to Stage A. Free Stage A's LLM (`del llm; gc.collect(); torch.cuda.empty_cache()`) before loading Stage B — both 27B-FP8 (30 GB) and 32B-AWQ (~18 GB) cannot coexist on a single A100-40GB.
+- **Production v16** (`textsum/model/run.py`) still runs the single-model port of exp42: Qwen3-30B-A3B-Instruct-2507-FP8 + exp38 E5 prompt + (single-ref shot1 + multi-ref shot2 = Q0746) + `enforce_eager=True`. Composite 0.7087 leak-free — the hybrid exp56 (0.7215) is not yet containerized (would need ~50 GB SIF holding both 27B-FP8 + 32B-AWQ weights).
+- **`enforce_eager=True`** is required inside Apptainer/Docker on vllm 0.9.2's V1-engine torch.compile path — without it the worker SIGKILLs mid-compile. Eager mode costs ~0 latency on this workload. The LANTA venv (vllm 0.19.1) tolerates `enforce_eager=False` but the container does not.
+- **`VLLM_WORKER_MULTIPROC_METHOD=spawn`** is set in every LANTA SLURM script. Required when any code (CrossEncoder, sentence-transformers, even just `import torch`) touches CUDA before vLLM init — otherwise the forked worker crashes during model load.
+- **Legacy retrieval path** (kept for the `exp22`/`exp30` lineage and v11 container): bge-m3 dense + BM25 build top-20 each, cross-encoder reranks. bge-m3 and the cross-encoder run on GPU; the cross-encoder is freed before the LLM loads. `exp03/` and the `exp04`–`exp16` line use `TOP_K=1` (retrieve one para and report it as the only ref); `exp30` keeps the full reranked union pool with no GEN_K cap (mean 28.6 paras).
 
 ### What does NOT help (verified, don't retry without new evidence)
 
@@ -188,19 +225,24 @@ baseline/exp03 are full-1239; exp22/exp30/exp37/exp38 are leak-free (1218, doc_0
 
 ### Docker container issues
 
-History of `Exit StatusCode 1` in the benchmark backend (resolved at v8; v9 = perf; v10 = few-shot; v11 = E5):
+History of `Exit StatusCode 1` in the benchmark backend (resolved at v8; v9 = perf; v10 = few-shot; v11 = E5; v12 = no retrieval; v14 = context-first; v15-K = exp38 multi-ref shot2; **v16 = exp42 A3B-Instruct, current production**):
 
-| Tag | Changes vs previous | Benchmark / local Apptainer |
-|-----|---------------------|----------------------------|
-| v3 (parent repo) | dense-only, `transformers.pipeline` LLM | ✅ ran |
-| v4 | + rerank pipeline, switched LLM to vLLM | ❌ exit 1 |
-| v5 | v4 + `VLLM_WORKER_MULTIPROC_METHOD=spawn` env | ❌ exit 1 |
-| v6 | reverted LLM to `transformers.pipeline`; rerank kept | ❌ exit 1 |
-| v7 | v6 + `tzdata` in requirements (pythainlp needed it) | ✅ local Apptainer |
-| v8 | back to vLLM + Qwen3-32B-AWQ; five gotchas pinned | ✅ local Apptainer (4:48) |
-| v9 | bge-m3 encoding moved from CPU to GPU | ✅ local Apptainer (2:57, −39%) |
-| v10 | v9 + 2-shot few-shot prompting (exp08); `max_model_len` 4096→8192 | ✅ local Apptainer (test exit 0) |
-| v11 | v10 + E5 self-citation (exp22): top-5 numbered context, `[อ้างอิง:]`-driven `refs`; `max_model_len` 8192→16384 | ✅ local Apptainer (test exit 0) |
+| Tag | Changes vs previous | Score (leak-free) | Benchmark / local Apptainer |
+|-----|---------------------|--:|----------------------------|
+| v3 (parent repo) | dense-only, `transformers.pipeline` LLM | 0.5584 (baseline) | ✅ ran |
+| v4 | + rerank pipeline, switched LLM to vLLM | — | ❌ exit 1 |
+| v5 | v4 + `VLLM_WORKER_MULTIPROC_METHOD=spawn` env | — | ❌ exit 1 |
+| v6 | reverted LLM to `transformers.pipeline`; rerank kept | — | ❌ exit 1 |
+| v7 | v6 + `tzdata` in requirements (pythainlp needed it) | — | ✅ local Apptainer |
+| v8 | back to vLLM + Qwen3-32B-AWQ; five gotchas pinned | (exp03 0.6256) | ✅ local Apptainer (4:48) |
+| v9 | bge-m3 encoding moved from CPU to GPU | — | ✅ local Apptainer (2:57, −39%) |
+| v10 | v9 + 2-shot few-shot prompting (exp08); `max_model_len` 4096→8192 | (exp08 0.6361) | ✅ local Apptainer (test exit 0) |
+| v11 | v10 + E5 self-citation (exp22): top-5 numbered context, `[อ้างอิง:]`-driven `refs`; `max_model_len` 8192→16384 | 0.6647 (exp22) | ✅ local Apptainer (test exit 0) |
+| v12 | port exp35: drop retrieval entirely — feed full doc; `max_model_len` 16384→32768 | 0.6929 (exp35) | ✅ |
+| v14 | port exp37: context-first prompt (context BEFORE query) — enables prefix-cache reuse | 0.6944 (exp37) | ✅ |
+| v15* | bump vllm 0.9.2 → 0.19.1 to match LANTA venv. Run of v15-A through v15-J chased an Apptainer SIGSEGV in Triton's pybind11 IRBuilder traced to Ubuntu's `python3.11.0~rc1`. v15-I fixed the root cause by installing **python3.11.x stable** via `deadsnakes` PPA. v15-G/H were Triton-bypass workarounds preserved as escape hatches. | — | ✅ (after v15-I) |
+| v15-K | port exp38: replace shot2 with multi-ref Q0746 example | 0.6987 (exp38) | ✅ |
+| v16 (**prod**) | port exp42: generation model 32B-AWQ → Qwen3-30B-A3B-Instruct-2507-FP8 (FP8 weights, ~3B active MoE) | **0.7087** (exp42) | ✅ |
 
 **v11 → vllm 0.19.1: attempted, reverted.** To remove the venv (vllm 0.19.1) vs container (0.9.2) greedy-decode drift, v11's stack was bumped to match the venv — `cuda:12.8.1-cudnn` base, `torch 2.10.0+cu128`, `vllm 0.19.1`, `transformers 5.8.1`. It builds, but the vLLM EngineCore worker **segfaults** inside Apptainer right after model load (engine warmup) — the same `Engine core initialization failed. Failed core proc(s): {}` class as v4–v8. Forcing `FLASHINFER` / `TRITON_ATTN` / `FLEX_ATTENTION` backends all segfault too (job 5787048), so it is not the attention kernel; the root cause is deeper. Reverted — v11 stays on vllm 0.9.2. The venv↔container drift (~17/50 sample-test answers diverge under greedy decoding) is accepted, as for v8–v10.
 
@@ -239,7 +281,8 @@ Train set additionally has `"abstractive"` and `"refs"` fields on each query (gr
 | `TEST_DIR` | `/model/test` | `$PROJECT/textsum/model/test` |
 | `RESULT_DIR` | `/result` | `$PROJECT/textsum/result` |
 | `PROGRESS_LIB` | `/benchmark_lib/progress` | `$PROJECT/textsum/benchmark_lib/progress` |
-| `LLM_MODEL` | `Qwen/Qwen3-32B-AWQ` | set to override |
+| `LLM_MODEL` | `Qwen/Qwen3-30B-A3B-Instruct-2507-FP8` (v16; was `Qwen/Qwen3-32B-AWQ` ≤v15) | set to override |
+| `MAX_MODEL_LEN` | `32768` (v12+) | set to override |
 | `VLLM_WORKER_MULTIPROC_METHOD` | (unset) | `spawn` — required when CrossEncoder touches CUDA before vLLM |
 
 ### Progress reporting
