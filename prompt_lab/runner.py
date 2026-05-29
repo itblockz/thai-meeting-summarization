@@ -39,6 +39,35 @@ _SHOT2_PARAS = [
 ]
 _SHOT2_ANSWER = "ในการประชุมคณะกรรมาธิการการเงิน การคลัง สถาบันการเงินและตลาดการเงิน ครั้งที่ 49 มีกรรมการผู้ที่ไม่มาประชุมจำนวน 3 คน [อ้างอิง: 2, 3, 4, 5]"
 
+# ============ R5 shot variants ============
+# Synthetic 2-ref shot — covers mid-cardinality between _SHOT1 (1 ref) and _SHOT2 (4 refs)
+_SHOT3_QUERY = "ในการประชุมครั้งที่ 49 มีการพิจารณาเรื่องใดเป็นวาระสำคัญ"
+_SHOT3_PARAS = [
+    "วาระที่ ๑ เรื่องที่ประธานแจ้งต่อที่ประชุม",
+    "วาระที่ ๒ รับรองรายงานการประชุม ครั้งที่ ๔๘",
+    "วาระที่ ๓ พิจารณาแผนยุทธศาสตร์การเงินการคลังปี ๒๕๖๘",
+    "วาระที่ ๔ พิจารณาความก้าวหน้าโครงการสินเชื่อ SME",
+    "วาระที่ ๕ เรื่องอื่นๆ",
+]
+_SHOT3_ANSWER = "ในการประชุมครั้งที่ 49 มีการพิจารณาวาระสำคัญสองเรื่องคือ แผนยุทธศาสตร์การเงินการคลังปี ๒๕๖๘ และความก้าวหน้าโครงการสินเชื่อ SME [อ้างอิง: 3, 4]"
+
+_DEFAULT_SHOTS = [
+    (_SHOT1_QUERY, _SHOT1_PARAS, _SHOT1_ANSWER),
+    (_SHOT2_QUERY, _SHOT2_PARAS, _SHOT2_ANSWER),
+]
+_SHOTS_NONE = []
+_SHOTS_ONLY_SINGLE = [(_SHOT1_QUERY, _SHOT1_PARAS, _SHOT1_ANSWER)]
+_SHOTS_ONLY_MULTI = [(_SHOT2_QUERY, _SHOT2_PARAS, _SHOT2_ANSWER)]
+_SHOTS_SWAPPED = [
+    (_SHOT2_QUERY, _SHOT2_PARAS, _SHOT2_ANSWER),
+    (_SHOT1_QUERY, _SHOT1_PARAS, _SHOT1_ANSWER),
+]
+_SHOTS_THREE = [
+    (_SHOT1_QUERY, _SHOT1_PARAS, _SHOT1_ANSWER),
+    (_SHOT2_QUERY, _SHOT2_PARAS, _SHOT2_ANSWER),
+    (_SHOT3_QUERY, _SHOT3_PARAS, _SHOT3_ANSWER),
+]
+
 
 def filter_valid_paragraphs(paragraphs):
     def is_valid(p):
@@ -398,6 +427,13 @@ PROMPT_VARIANTS = [
     ('V20_role_factual', SYSTEM_ROLE_EXPERT, _build_prompt_v20_role_factual),
     ('V21_extract_soft', SYSTEM_BASELINE, _build_prompt_v21_extract_soft),
     ('V22_triple_stack', SYSTEM_BASELINE, _build_prompt_v22_triple_stack),
+    # Round 5 — few-shot ablation on V10_factual base prompt
+    ('F1_zero_shot', SYSTEM_BASELINE, _build_prompt_brevity_factual, _SHOTS_NONE),
+    ('F2_only_single', SYSTEM_BASELINE, _build_prompt_brevity_factual, _SHOTS_ONLY_SINGLE),
+    ('F3_only_multi', SYSTEM_BASELINE, _build_prompt_brevity_factual, _SHOTS_ONLY_MULTI),
+    ('F4_swap_order', SYSTEM_BASELINE, _build_prompt_brevity_factual, _SHOTS_SWAPPED),
+    ('F5_three_shot', SYSTEM_BASELINE, _build_prompt_brevity_factual, _SHOTS_THREE),
+    ('F6_baseline', SYSTEM_BASELINE, _build_prompt_brevity_factual, _DEFAULT_SHOTS),
 ]
 
 # Filter via env var (e.g. VARIANTS=V10_factual,V6_brevity_minimal)
@@ -408,17 +444,16 @@ if _only:
     print(f'Filtered to variants: {[v[0] for v in PROMPT_VARIANTS]}', flush=True)
 
 
-def build_messages(system, build_fn, query, paras):
+def build_messages(system, build_fn, query, paras, shots=None):
+    if shots is None:
+        shots = _DEFAULT_SHOTS
     msgs = []
     if system:
         msgs.append({'role': 'system', 'content': system})
-    msgs += [
-        {'role': 'user', 'content': build_fn(_SHOT1_QUERY, _SHOT1_PARAS)},
-        {'role': 'assistant', 'content': _SHOT1_ANSWER},
-        {'role': 'user', 'content': build_fn(_SHOT2_QUERY, _SHOT2_PARAS)},
-        {'role': 'assistant', 'content': _SHOT2_ANSWER},
-        {'role': 'user', 'content': build_fn(query, paras)},
-    ]
+    for shot_q, shot_p, shot_a in shots:
+        msgs.append({'role': 'user', 'content': build_fn(shot_q, shot_p)})
+        msgs.append({'role': 'assistant', 'content': shot_a})
+    msgs.append({'role': 'user', 'content': build_fn(query, paras)})
     return msgs
 
 
@@ -455,11 +490,16 @@ def main():
     sampling = SamplingParams(temperature=0.0, max_tokens=1024, repetition_penalty=1.05)
 
     results = []
-    for name, system, build_fn in PROMPT_VARIANTS:
+    for entry in PROMPT_VARIANTS:
+        if len(entry) == 4:
+            name, system, build_fn, shots = entry
+        else:
+            name, system, build_fn = entry
+            shots = None
         print(f"\n=== {name} ===", flush=True)
         prompts = []
         for it in items:
-            msgs = build_messages(system, build_fn, it['query'], it['gen_texts'])
+            msgs = build_messages(system, build_fn, it['query'], it['gen_texts'], shots)
             prompts.append(tokenizer.apply_chat_template(
                 msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False))
         outputs = llm.generate(prompts, sampling)
