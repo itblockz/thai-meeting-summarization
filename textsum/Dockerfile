@@ -19,9 +19,10 @@ RUN pip3 install --no-cache-dir --timeout 300 --retries 5 \
     torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 RUN pip3 install --no-cache-dir --timeout 300 --retries 5 -r requirements.txt
 
-# v16: swap LLM to Qwen3-30B-A3B-Instruct-2507-FP8 (exp51 port, leak-free
-# 0.7110, +0.012 over v15-K). 30 B MoE with 3 B active per token, FP8-e4m3
-# weights ~30 GB → fits 40 GB A100 with KV headroom.
+# v16: swap LLM to Qwen3-30B-A3B-Instruct-2507-FP8 (exp42 port, leak-free
+# 0.7087, +0.010 over v15-K). 30 B MoE with 3 B active per token, FP8-e4m3
+# weights ~30 GB → fits 40 GB A100 with KV headroom. Prompt unchanged from
+# v15-K (exp38 wording) — single-variable model swap.
 RUN python3 -c "\
 from huggingface_hub import snapshot_download; \
 snapshot_download('Qwen/Qwen3-30B-A3B-Instruct-2507-FP8')"

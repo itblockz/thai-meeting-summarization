@@ -8,14 +8,19 @@ answers in Thai, then cites which paragraphs it used as [อ้างอิง: 
 the cited paragraphs become `refs` (E5 self-citation, adaptive count).
 Two worked few-shot examples are prepended as multi-turn chat turns.
 
-v16 = exp51 port. Single-variable swap from v15-K (Qwen3-32B-AWQ,
-0.6944 leak-free): model → Qwen3-30B-A3B-Instruct-2507-FP8. Prompt,
-shots, retrieval (none) and decoding all unchanged. Leak-free
-composite **0.7110** (venv run, exp51) — +0.012 over v15-K, repo best.
-Citation rate climbs to 1237/1239 (99.8%) vs v15-K's ~91% — the
-stronger instruction-follower forgets the [อ้างอิง: …] tag far less
-often. avg refs/query 2.33 (vs v15-K's 1.54), driving IoU 0.6906 →
-0.7754.
+v16 = exp42 port. Single-variable swap from v15-K (Qwen3-32B-AWQ,
+0.6987 leak-free): model → Qwen3-30B-A3B-Instruct-2507-FP8. Prompt
+(v15-K's exp38 wording: "concise and comprehensive"), shots, retrieval
+(none) and decoding all unchanged. Leak-free composite **0.7087**
+(venv run, exp42) — +0.010 over v15-K. avg refs/query rises to 2.79
+(vs v15-K's 1.54) as the stronger model follows the citation directive
+more thoroughly; IoU 0.6906 → 0.7410 captures the bulk of the gain.
+
+NB: exp51 was a parallel experiment with the same model swap but a
+revised instruction prompt ("short and to the point, no
+interpretation") that scored 0.7110 — v16 carries the *exp42* wording,
+not exp51's, so the production gain over v15-K stays single-variable
+(only the model changed).
 
 Why this model on a 40 GB A100:
 - A3B = 30 B params but 3 B activated per token (MoE). FP8-e4m3 weights
@@ -29,7 +34,7 @@ Why this model on a 40 GB A100:
   the encoder cache budget (was eating ~5 GB on prior 35B-A3B-FP8 try).
 - gpu_memory_utilization 0.90 → 0.95: 0.90 left no room for KV cache
   after 30 GB weights + idle vision tower; 0.95 confirmed safe in the
-  exp51 venv run (peak ~36 GB on a 40 GB GPU).
+  exp42 venv run (peak ~36 GB on a 40 GB GPU).
 
 v14→v16 infra (carry over):
 - Sort queries by doc_id before submission so the ~14K-token full-doc
@@ -40,7 +45,7 @@ v14→v16 infra (carry over):
   real heartbeat.
 - enforce_eager=True keeps the V1-engine torch.compile path off
   (Apptainer-incompatible) and costs ~0 latency at this batch size.
-- MAX_NEW_TOKENS 512 → 1024 (matches exp51 venv config; the long
+- MAX_NEW_TOKENS 512 → 1024 (matches exp42 venv config; the long
   multi-ref answers from shot 2 sometimes truncate at 512).
 
 Output: submission.csv with columns ID, abstractive, refs — written in
@@ -67,7 +72,7 @@ MAX_MODEL_LEN          = int(os.environ.get("MAX_MODEL_LEN", "32768"))
 # 27648, so MLP activations are cheaper; the 14K-tok median prompt is
 # still single-chunk and the 28K-tok max prompt still fits 2 chunks.
 MAX_NUM_BATCHED_TOKENS = int(os.environ.get("MAX_NUM_BATCHED_TOKENS", "16384"))
-# 0.95 confirmed safe on the exp51 venv run: 29.54 GiB weights +
+# 0.95 confirmed safe on the exp42 venv run: 29.54 GiB weights +
 # 6.75 GiB KV cache + activations on a 40 GB A100 → peak ~36 GB.
 GPU_MEM_UTIL           = float(os.environ.get("GPU_MEM_UTIL", "0.95"))
 MODEL_NAME             = os.environ.get("LLM_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8")
