@@ -27,10 +27,16 @@ RUN pip3 install --no-cache-dir --timeout 300 --retries 5 -r requirements.txt
 # between). Optimised for H100 40 GB (native FP8 + FA3 + FP8 KV cache,
 # auto-detected at runtime); falls back gracefully on A100 (~exp56's
 # 2h45m). Bundle BOTH model weights in the SIF (~50 GB image).
-RUN python3 -c "\
-from huggingface_hub import snapshot_download; \
-snapshot_download('Qwen/Qwen3.6-27B-FP8'); \
-snapshot_download('Qwen/Qwen3-32B-AWQ')"
+# Download each model in its OWN cached layer so a network drop (or a future
+# rebuild) never re-pulls a model that already completed. With BuildKit, editing
+# model/run.py below invalidates only the COPY layer — these ~45 GB weight layers
+# stay cached and are NOT re-downloaded. hf_transfer = faster, resumable
+# multi-part pulls for the large FP8/AWQ shards.
+RUN pip3 install --no-cache-dir hf_transfer
+RUN HF_HUB_ENABLE_HF_TRANSFER=1 python3 -c \
+    "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3.6-27B-FP8')"
+RUN HF_HUB_ENABLE_HF_TRANSFER=1 python3 -c \
+    "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-32B-AWQ')"
 
 ENV HF_HOME=/root/.cache/huggingface \
     HF_HUB_OFFLINE=1 \
