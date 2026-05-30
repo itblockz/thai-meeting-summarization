@@ -1,0 +1,47 @@
+# Controls what `gcloud builds submit` uploads to GCS as the build source.
+# Only textsum/ (Dockerfile + model/ + requirements.txt) is needed to build.
+# Without this file gcloud falls back to .gitignore; we list things explicitly
+# so heavy off-repo artefacts never get uploaded.
+
+# version control + CI metadata (not needed inside the build)
+.git/
+.github/
+.gitignore
+
+# everything except the build context
+expNN/
+exp*/
+eval_retrieval/
+eval_train/
+prompt_lab/
+logs/
+apptainer_tmp/
+
+# large / generated artefacts (mirror of .gitignore)
+*.sif
+*.log
+*.out
+*.err
+*.npy
+*.npz
+*.faiss
+*.pt
+*.bin
+*.csv
+.hf_cache/
+.cache/
+result/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# baked-in test data is bind-mounted over /model/test at benchmark runtime, so
+# it never needs to ship in the source upload (esp. the 100+ test.json.zipN splits)
+*.json.zip*
+textsum/model/test/
+
+# docs — not consumed by docker build
+*.md
+IDEAS.md
+CLAUDE.md
