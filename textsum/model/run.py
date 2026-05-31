@@ -55,6 +55,27 @@ import csv
 import gc
 import time
 
+# --- Writable scratch for Triton's JIT kernel cache (MUST run before torch/
+# vllm/triton import) ---------------------------------------------------------
+# Qwen3.6-27B is a qwen3_next (linear-attention / Mamba-GDN) model: it
+# runtime-compiles many Triton FLA kernels at startup and writes them to a
+# cache dir. The benchmark backend launches the container with `--containall`,
+# whose session /tmp (and read-only /root/.triton) is a tiny tmpfs — the cache
+# write hits `OSError: [Errno 28] No space left on device` and the vLLM
+# EngineCore dies during profile_run (verified: job 5815781). The only path the
+# backend guarantees is writable is RESULT_DIR (where submission.csv goes), so
+# anchor every JIT/temp cache there. Verified fix at job 5815800 (exit 0).
+_scratch = os.environ.get("RESULT_DIR", "/result").rstrip("/") or "/result"
+for _sub, _var in (("triton", "TRITON_CACHE_DIR"),
+                   ("xdg",    "XDG_CACHE_HOME"),
+                   ("tmp",    "TMPDIR")):
+    _d = f"{_scratch}/.cache/{_sub}"
+    try:
+        os.makedirs(_d, exist_ok=True)
+        os.environ.setdefault(_var, _d)
+    except OSError:
+        pass  # if /result isn't writable yet, fall back to defaults
+
 import torch
 from transformers import AutoTokenizer
 from vllm import LLMEngine, EngineArgs, SamplingParams
