@@ -19,7 +19,7 @@ RUN pip3 install --no-cache-dir --timeout 300 --retries 5 \
     torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 RUN pip3 install --no-cache-dir --timeout 300 --retries 5 -r requirements.txt
 
-# v17: two-stage hybrid (exp56 port, leak-free 0.7215, +0.0128 over v16's
+# v19: two-stage hybrid (exp56 port, leak-free 0.7215, +0.0128 over v16's
 # 0.7087). Stage A picks refs with Qwen3.6-27B-FP8 (dense, ~30 GB FP8);
 # Stage B writes the answer with Qwen3-32B-AWQ (~18 GB INT4) + hint
 # pointing at Stage A's refs. Both stages share one 40 GB GPU sequentially
@@ -38,9 +38,12 @@ RUN HF_HUB_ENABLE_HF_TRANSFER=1 python3 -c \
 RUN HF_HUB_ENABLE_HF_TRANSFER=1 python3 -c \
     "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-32B-AWQ')"
 
+RUN mkdir -p /scratch && chmod 1777 /scratch
+
 ENV HF_HOME=/root/.cache/huggingface \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
+    TEXTSUM_SCRATCH_DIR=/scratch \
     VLLM_USE_V1=0
 
 COPY model /model

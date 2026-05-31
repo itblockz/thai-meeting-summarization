@@ -1,5 +1,5 @@
 """
-v17 — exp56 port (two-stage hybrid), H100 40GB single-GPU optimised.
+v19 — exp56 port (two-stage hybrid), H100 40GB single-GPU optimised.
 
 NO RETRIEVAL: the full list of *valid* paragraphs from `doc_id` is fed to
 both stages in document order. Two sequential LLMs share one 40 GB GPU
@@ -54,6 +54,7 @@ import json
 import csv
 import gc
 import time
+import shutil
 
 # --- Writable scratch for Triton's JIT kernel cache (MUST run before torch/
 # vllm/triton import) ---------------------------------------------------------
@@ -62,19 +63,106 @@ import time
 # cache dir. The benchmark backend launches the container with `--containall`,
 # whose session /tmp (and read-only /root/.triton) is a tiny tmpfs — the cache
 # write hits `OSError: [Errno 28] No space left on device` and the vLLM
-# EngineCore dies during profile_run (verified: job 5815781). The only path the
-# backend guarantees is writable is RESULT_DIR (where submission.csv goes), so
-# anchor every JIT/temp cache there. Verified fix at job 5815800 (exit 0).
-_scratch = os.environ.get("RESULT_DIR", "/result").rstrip("/") or "/result"
+# EngineCore dies during profile_run (verified: job 5815781).
+#
+# v18 briefly anchored TMPDIR under RESULT_DIR. That fixed ENOSPC but polluted
+# the result upload tree with runtime temp/IPC files (e.g. sockets under
+# .cache/tmp), and the benchmark uploader later failed with "no such device or
+# address" before any progress was reported. v19 therefore keeps all runtime
+# scratch outside RESULT_DIR. Local Apptainer tests use a sibling of RESULT_DIR;
+# the Docker image provides /scratch for the benchmark backend.
+_result_dir_for_cache = Path(os.environ.get("RESULT_DIR", "/result/")).resolve()
+
+
+def _is_relative_to(path, parent):
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+    except OSError:
+        return False
+
+
+def _is_writable_dir(path):
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        marker = path / ".write_test"
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write("ok")
+        marker.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+def _runtime_cache_candidates(result_dir):
+    for var in ("TEXTSUM_SCRATCH_DIR", "AIBENCHMARK_SCRATCH_DIR", "SCRATCH_DIR"):
+        root = os.environ.get(var)
+        if root:
+            yield Path(root) / "textsum-runtime-cache"
+
+    # If RESULT_DIR is a real path such as /lustre/.../result, its parent is the
+    # safest large writable filesystem while staying outside the upload root.
+    if result_dir.parent != result_dir and str(result_dir.parent) != os.sep:
+        yield result_dir.parent / "textsum-runtime-cache"
+
+    # Docker benchmark path. The Dockerfile creates /scratch with mode 1777.
+    yield Path("/scratch/textsum-runtime-cache")
+    yield Path("/var/tmp/textsum-runtime-cache")
+    yield Path("/tmp/textsum-runtime-cache")
+    yield Path("/textsum-runtime-cache")
+
+
+def _configure_runtime_cache():
+    seen = set()
+    for candidate in _runtime_cache_candidates(_result_dir_for_cache):
+        candidate = candidate.resolve()
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _is_relative_to(candidate, _result_dir_for_cache):
+            continue
+        if _is_writable_dir(candidate):
+            break
+    else:
+        # Last resort: allow the job to attempt inference, but keep this path
+        # clean before exit so successful runs upload only submission.csv.
+        candidate = _result_dir_for_cache / ".cache" / "runtime"
+        candidate.mkdir(parents=True, exist_ok=True)
+
+    for _sub, _var in (("triton", "TRITON_CACHE_DIR"),
+                       ("xdg",    "XDG_CACHE_HOME"),
+                       ("tmp",    "TMPDIR")):
+        _d = candidate / _sub
+        _d.mkdir(parents=True, exist_ok=True)
+        os.environ[_var] = str(_d)
+    print(f"Runtime cache dir: {candidate}", flush=True)
+    return candidate
+
+
+def _cleanup_result_cache():
+    cache_dir = _result_dir_for_cache / ".cache"
+    if cache_dir.exists() and _is_relative_to(cache_dir, _result_dir_for_cache):
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+def _cleanup_runtime_cache():
+    if _runtime_cache_dir.exists():
+        shutil.rmtree(_runtime_cache_dir, ignore_errors=True)
+
+
+_cleanup_result_cache()
+_runtime_cache_dir = _configure_runtime_cache()
 for _sub, _var in (("triton", "TRITON_CACHE_DIR"),
                    ("xdg",    "XDG_CACHE_HOME"),
                    ("tmp",    "TMPDIR")):
-    _d = f"{_scratch}/.cache/{_sub}"
+    _d = Path(os.environ[_var])
     try:
-        os.makedirs(_d, exist_ok=True)
-        os.environ.setdefault(_var, _d)
+        _d.mkdir(parents=True, exist_ok=True)
     except OSError:
-        pass  # if /result isn't writable yet, fall back to defaults
+        pass
 
 import torch
 from transformers import AutoTokenizer
@@ -324,7 +412,7 @@ def main():
     queries = data["queries"]
     n = len(queries)
     half = n // 2
-    print(f"v17 hybrid (exp56 port): {n} queries, {len(doc_index)} docs | "
+    print(f"v19 hybrid (exp56 port): {n} queries, {len(doc_index)} docs | "
           f"Stage A = {MODEL_27B} | Stage B = {MODEL_AWQ} | "
           f"max_model_len={MAX_MODEL_LEN}",
           flush=True)
@@ -447,5 +535,10 @@ def main():
 
 
 if __name__ == "__main__":
-    n = main()
-    benchmark_lib(n)   # final "fully done, CSV ready" ping
+    try:
+        n = main()
+        _cleanup_result_cache()
+        benchmark_lib(n)   # final "fully done, CSV ready" ping
+    finally:
+        _cleanup_result_cache()
+        _cleanup_runtime_cache()
