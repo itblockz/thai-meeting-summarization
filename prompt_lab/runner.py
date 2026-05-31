@@ -14,7 +14,8 @@ PROJECT = Path('/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047')
 DEV_FILE = PROJECT / 'prompt_lab/dev_sample.json'
 MODEL_NAME = os.environ.get('LLM_MODEL', 'Qwen/Qwen3-30B-A3B-Instruct-2507-FP8')
 MODEL_TAG = MODEL_NAME.split('/')[-1].replace('.', '_')
-RESULT_DIR = PROJECT / f'prompt_lab/results_{MODEL_TAG}'
+RESULT_SUFFIX = os.environ.get('RESULT_SUFFIX', '').strip()
+RESULT_DIR = PROJECT / f'prompt_lab/results_{MODEL_TAG}{("_" + RESULT_SUFFIX) if RESULT_SUFFIX else ""}'
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
 print(f'Model: {MODEL_NAME}  tag={MODEL_TAG}', flush=True)
 
@@ -66,6 +67,16 @@ _SHOTS_THREE = [
     (_SHOT1_QUERY, _SHOT1_PARAS, _SHOT1_ANSWER),
     (_SHOT2_QUERY, _SHOT2_PARAS, _SHOT2_ANSWER),
     (_SHOT3_QUERY, _SHOT3_PARAS, _SHOT3_ANSWER),
+]
+
+_CITE_SHOTS = [
+    (_SHOT1_QUERY, _SHOT1_PARAS, "[อ้างอิง: 3]"),
+    (_SHOT2_QUERY, _SHOT2_PARAS, "[อ้างอิง: 2, 3, 4, 5]"),
+]
+_CITE_SHOTS_THREE = [
+    (_SHOT1_QUERY, _SHOT1_PARAS, "[อ้างอิง: 3]"),
+    (_SHOT2_QUERY, _SHOT2_PARAS, "[อ้างอิง: 2, 3, 4, 5]"),
+    (_SHOT3_QUERY, _SHOT3_PARAS, "[อ้างอิง: 3, 4]"),
 ]
 
 
@@ -405,6 +416,110 @@ def _build_prompt_v22_triple_stack(query, paras):
         f"คำตอบ:"
     )
 
+# ---- Round 6: citation-only prompts optimized for reference IoU ----
+SYSTEM_CITATION_ONLY = (
+    "คุณเป็นผู้คัดเลือกย่อหน้าอ้างอิงภาษาไทย "
+    "ตอบด้วยรูปแบบ [อ้างอิง: X, Y] เท่านั้น ห้ามเขียนสรุปหรือคำอธิบาย"
+)
+
+SYSTEM_CITATION_RECALL = (
+    "คุณเป็นผู้ตรวจหลักฐานจากเอกสารภาษาไทย "
+    "เลือกเฉพาะย่อหน้าที่สนับสนุนคำตอบโดยตรง "
+    "ตอบด้วยรูปแบบ [อ้างอิง: X, Y] เท่านั้น"
+)
+
+def _build_prompt_cite_minimal(query, paras):
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: เลือกเลขย่อหน้าที่จำเป็นที่สุดสำหรับตอบคำถาม "
+        f"อ้างเฉพาะย่อหน้าที่มีข้อมูลคำตอบโดยตรง ไม่อ้างย่อหน้าซ้ำซ้อน "
+        f"ตอบเฉพาะรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y] เท่านั้น ห้ามเขียนสรุป\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_cite_direct_all(query, paras):
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: เลือกทุกย่อหน้าที่เป็นหลักฐานโดยตรงของคำตอบ "
+        f"ถ้าคำตอบประกอบด้วยชื่อ ตัวเลข วันที่ สถานที่ ตำแหน่ง หรือรายการหลายบรรทัด "
+        f"ให้รวมย่อหน้าที่มีข้อมูลเหล่านั้นทุกย่อหน้า "
+        f"ตอบเฉพาะรูปแบบ [อ้างอิง: X, Y] เท่านั้น ห้ามเขียนสรุป\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_cite_with_heading(query, paras):
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: เลือกย่อหน้าที่เป็นหลักฐานคำตอบโดยตรง "
+        f"ถ้ารายการย่อยต้องอาศัยหัวข้อหรือป้ายกำกับก่อนหน้าเพื่อเข้าใจความหมาย "
+        f"ให้อ้างทั้งหัวข้อและรายการย่อยที่เกี่ยวข้อง "
+        f"ตอบเฉพาะรูปแบบ [อ้างอิง: X, Y] เท่านั้น ห้ามเขียนสรุป\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_cite_no_heading(query, paras):
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: เลือกเฉพาะย่อหน้าที่มีเนื้อหาคำตอบจริง "
+        f"หลีกเลี่ยงการอ้างหัวข้อ ป้ายกำกับ บรรทัดคั่น หรือบริบททั่วไป "
+        f"ยกเว้นเมื่อหัวข้อนั้นเป็นคำตอบโดยตรง "
+        f"ตอบเฉพาะรูปแบบ [อ้างอิง: X, Y] เท่านั้น ห้ามเขียนสรุป\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_cite_key_phrases(query, paras):
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: เทียบคำสำคัญในคำถามกับย่อหน้า เช่น ชื่อบุคคล หน่วยงาน ครั้งที่ วันที่ จำนวนเงิน จำนวนคน "
+        f"และเลือกย่อหน้าที่มีคำสำคัญหรือค่าคำตอบตรงกับคำถาม "
+        f"ตอบเฉพาะรูปแบบ [อ้างอิง: X, Y] เท่านั้น ห้ามเขียนสรุป\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_cite_silent_answer(query, paras):
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: คิดเงียบ ๆ ว่าคำตอบคืออะไรและมาจากย่อหน้าใด "
+        f"จากนั้นส่งออกเฉพาะเลขย่อหน้าที่ใช้ตอบคำถามจริง "
+        f"ในรูปแบบ [อ้างอิง: X, Y] เท่านั้น ห้ามเขียนคำตอบหรือเหตุผล\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_cite_balanced(query, paras):
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: เลือกชุดย่อหน้าที่ทำให้ผู้อ่านตรวจสอบคำตอบได้ครบถ้วนแต่ไม่กว้างเกินไป "
+        f"รวมทุกย่อหน้าที่ให้ข้อเท็จจริงเฉพาะของคำตอบ และตัดย่อหน้าที่เป็นเพียงบริบททั่วไป "
+        f"ตอบเฉพาะรูปแบบ [อ้างอิง: X, Y] เท่านั้น ห้ามเขียนสรุป\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_cite_conservative(query, paras):
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: เลือกเฉพาะย่อหน้าที่มั่นใจว่าเป็นหลักฐานของคำตอบ "
+        f"ถ้ามีหลายย่อหน้าต่อเนื่องที่ร่วมกันตอบคำถาม ให้ใส่เลขทุกย่อหน้านั้น "
+        f"ถ้าย่อหน้าใดไม่จำเป็นต่อการตรวจคำตอบ ให้ตัดออก "
+        f"ตอบเฉพาะรูปแบบ [อ้างอิง: X, Y] เท่านั้น ห้ามเขียนสรุป\n"
+        f"คำตอบ:"
+    )
+
 # variants registry
 PROMPT_VARIANTS = [
     ('V1_brevity', SYSTEM_BASELINE, _build_prompt_brevity),               # winner baseline
@@ -434,6 +549,15 @@ PROMPT_VARIANTS = [
     ('F4_swap_order', SYSTEM_BASELINE, _build_prompt_brevity_factual, _SHOTS_SWAPPED),
     ('F5_three_shot', SYSTEM_BASELINE, _build_prompt_brevity_factual, _SHOTS_THREE),
     ('F6_baseline', SYSTEM_BASELINE, _build_prompt_brevity_factual, _DEFAULT_SHOTS),
+    # Round 6 — citation-only, rank by IoU
+    ('C1_cite_minimal', SYSTEM_CITATION_ONLY, _build_prompt_cite_minimal, _CITE_SHOTS),
+    ('C2_cite_direct_all', SYSTEM_CITATION_ONLY, _build_prompt_cite_direct_all, _CITE_SHOTS),
+    ('C3_cite_with_heading', SYSTEM_CITATION_RECALL, _build_prompt_cite_with_heading, _CITE_SHOTS),
+    ('C4_cite_no_heading', SYSTEM_CITATION_ONLY, _build_prompt_cite_no_heading, _CITE_SHOTS),
+    ('C5_cite_key_phrases', SYSTEM_CITATION_ONLY, _build_prompt_cite_key_phrases, _CITE_SHOTS),
+    ('C6_cite_silent_answer', SYSTEM_CITATION_ONLY, _build_prompt_cite_silent_answer, _CITE_SHOTS),
+    ('C7_cite_balanced_3shot', SYSTEM_CITATION_RECALL, _build_prompt_cite_balanced, _CITE_SHOTS_THREE),
+    ('C8_cite_conservative_3shot', SYSTEM_CITATION_ONLY, _build_prompt_cite_conservative, _CITE_SHOTS_THREE),
 ]
 
 # Filter via env var (e.g. VARIANTS=V10_factual,V6_brevity_minimal)
@@ -487,7 +611,9 @@ def main():
         limit_mm_per_prompt={'image': 0, 'video': 0},
     )
     tokenizer = llm.get_tokenizer()
-    sampling = SamplingParams(temperature=0.0, max_tokens=1024, repetition_penalty=1.05)
+    max_tokens = int(os.environ.get('MAX_TOKENS', '1024'))
+    sampling = SamplingParams(temperature=0.0, max_tokens=max_tokens, repetition_penalty=1.05)
+    print(f"Sampling: temperature=0.0 max_tokens={max_tokens}", flush=True)
 
     results = []
     for entry in PROMPT_VARIANTS:
@@ -529,10 +655,16 @@ def main():
         results.append({'name': name, 'rougeL': r_avg, 'IoU': i_avg, 'cites': n_explicit, 'avg_refs': sum(ref_counts)/len(ref_counts), 'proxy': proxy})
 
     # final summary table
+    rank_by = os.environ.get('RANK_BY', 'proxy').strip()
+    rank_key = {'iou': 'IoU', 'rougel': 'rougeL', 'proxy': 'proxy'}.get(rank_by.lower(), 'proxy')
     print("\n\n=== SUMMARY ===", flush=True)
-    print(f"{'variant':<20} {'RougeL':>8} {'IoU':>8} {'cites':>8} {'refs':>6} {'proxy':>8}", flush=True)
-    for r in sorted(results, key=lambda x: -x['proxy']):
-        print(f"{r['name']:<20} {r['rougeL']:>8.4f} {r['IoU']:>8.4f} {r['cites']:>6}/{len(items)} {r['avg_refs']:>6.2f} {r['proxy']:>8.4f}", flush=True)
+    print(f"Ranked by: {rank_key}", flush=True)
+    print(f"{'variant':<28} {'RougeL':>8} {'IoU':>8} {'cites':>8} {'refs':>6} {'proxy':>8}", flush=True)
+    for r in sorted(results, key=lambda x: -x[rank_key]):
+        print(f"{r['name']:<28} {r['rougeL']:>8.4f} {r['IoU']:>8.4f} {r['cites']:>6}/{len(items)} {r['avg_refs']:>6.2f} {r['proxy']:>8.4f}", flush=True)
+    if results:
+        best_iou = max(results, key=lambda x: x['IoU'])
+        print(f"\nBest IoU: {best_iou['name']} = {best_iou['IoU']:.4f} (avg_refs={best_iou['avg_refs']:.2f})", flush=True)
 
     with open(RESULT_DIR / 'summary.json', 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
