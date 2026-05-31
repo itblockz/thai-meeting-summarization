@@ -520,6 +520,79 @@ def _build_prompt_cite_conservative(query, paras):
         f"คำตอบ:"
     )
 
+# ---- Round 7: R3-style prompt variants, citation-only output ----
+def _build_prompt_r3cite_factual_one_sentence(query, paras):
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: เหมือนการตอบคำถามแบบสั้นในประโยคเดียวที่ตรงประเด็น "
+        f"ให้เลือกเลขย่อหน้าที่มีข้อเท็จจริงซึ่งจำเป็นต่อคำตอบนั้นเท่านั้น "
+        f"ห้ามตีความหรือสรุปเกินขอบเขต "
+        f"ตอบเฉพาะรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y] เท่านั้น ห้ามเขียนสรุป\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_r3cite_factual_minimal(query, paras):
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: เลือกเฉพาะเลขย่อหน้าที่จำเป็นต่อคำตอบแบบสั้นและตรงประเด็น "
+        f"ใช้ข้อเท็จจริงที่ปรากฏในย่อหน้าเท่านั้น "
+        f"ไม่อ้างย่อหน้าที่เป็นเพียงบริบทหรือซ้ำซ้อน "
+        f"ตอบเฉพาะรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y] เท่านั้น ห้ามเขียนสรุป\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_r3cite_factual_extract(query, paras):
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: ถ้าต้องตอบด้วยการใช้ถ้อยคำเดิมจากเอกสารให้มากที่สุด "
+        f"ให้เลือกเลขย่อหน้าที่ควรคัดข้อความมาใช้เป็นคำตอบโดยตรง "
+        f"ตัดย่อหน้าที่ไม่มีถ้อยคำคำตอบจริงออก "
+        f"ตอบเฉพาะรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y] เท่านั้น ห้ามเขียนสรุป\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_r3cite_named_entities(query, paras):
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: เลือกเลขย่อหน้าที่มีชื่อ ตัวเลข วันที่ ตำแหน่ง สถานที่ "
+        f"หรือหน่วยงานที่เกี่ยวข้องและจำเป็นต่อคำตอบให้ครบ "
+        f"ไม่อ้างย่อหน้าที่ไม่มี entity หรือข้อเท็จจริงของคำตอบ "
+        f"ตอบเฉพาะรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y] เท่านั้น ห้ามเขียนสรุป\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_r3cite_no_redundant(query, paras):
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: เลือกเลขย่อหน้าที่มีข้อเท็จจริงของคำตอบโดยตรง "
+        f"ห้ามอ้างย่อหน้าที่ไม่ได้นำเนื้อหามาใช้ ห้ามอ้างซ้ำซ้อน "
+        f"ถ้าหลายย่อหน้าร่วมกันตอบคำถาม ให้เลือกเฉพาะชุดที่จำเป็นที่สุด "
+        f"ตอบเฉพาะรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y] เท่านั้น ห้ามเขียนสรุป\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_r3cite_complete(query, paras):
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: เลือกเลขย่อหน้าที่ครอบคลุมข้อมูลที่เกี่ยวข้องทุกประเด็นของคำตอบ "
+        f"ใช้เฉพาะข้อเท็จจริงที่ปรากฏในย่อหน้า ห้ามตีความเกินเอกสาร "
+        f"รวมย่อหน้าที่จำเป็นต่อการตรวจคำตอบให้ครบ แต่ไม่รวมบริบททั่วไปที่ไม่จำเป็น "
+        f"ตอบเฉพาะรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y] เท่านั้น ห้ามเขียนสรุป\n"
+        f"คำตอบ:"
+    )
+
 # variants registry
 PROMPT_VARIANTS = [
     ('V1_brevity', SYSTEM_BASELINE, _build_prompt_brevity),               # winner baseline
@@ -558,6 +631,13 @@ PROMPT_VARIANTS = [
     ('C6_cite_silent_answer', SYSTEM_CITATION_ONLY, _build_prompt_cite_silent_answer, _CITE_SHOTS),
     ('C7_cite_balanced_3shot', SYSTEM_CITATION_RECALL, _build_prompt_cite_balanced, _CITE_SHOTS_THREE),
     ('C8_cite_conservative_3shot', SYSTEM_CITATION_ONLY, _build_prompt_cite_conservative, _CITE_SHOTS_THREE),
+    # Round 7 — R3 prompt shapes, citation-only output
+    ('R3C11_factual_one_sentence', SYSTEM_CITATION_ONLY, _build_prompt_r3cite_factual_one_sentence, _CITE_SHOTS),
+    ('R3C12_factual_minimal', SYSTEM_CITATION_ONLY, _build_prompt_r3cite_factual_minimal, _CITE_SHOTS),
+    ('R3C13_factual_extract', SYSTEM_CITATION_ONLY, _build_prompt_r3cite_factual_extract, _CITE_SHOTS),
+    ('R3C14_named_entities', SYSTEM_CITATION_ONLY, _build_prompt_r3cite_named_entities, _CITE_SHOTS),
+    ('R3C15_no_redundant', SYSTEM_CITATION_ONLY, _build_prompt_r3cite_no_redundant, _CITE_SHOTS),
+    ('R3C16_complete', SYSTEM_CITATION_RECALL, _build_prompt_r3cite_complete, _CITE_SHOTS),
 ]
 
 # Filter via env var (e.g. VARIANTS=V10_factual,V6_brevity_minimal)
