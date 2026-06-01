@@ -173,14 +173,14 @@ def main():
     # MAX_MODEL_LEN (measure the worst prompt) and/or raise util — do NOT
     # fall back to TP=2 (see memory: prefer-single-gpu).
     # Single-A100-40GB fit: 32 GB gemma-4 weights leave too little for bf16
-    # KV at 32K (needs 9.54 GiB, only ~5.7 free) → kv_cache_dtype="fp8"
-    # halves KV (~4.77 GiB) + util 0.97. max_model_len stays 32768 so the
-    # largest docs (~28K tok) are not truncated. See exp71 for rationale
-    # (memory:prefer-single-gpu — adjust, don't TP=2).
+    # KV at 32K → FP8 KV cache + util 0.97. MUST be fp8_e5m2 (A100/sm80 has
+    # no e4m3 reshape_and_cache Triton kernel). max_model_len stays 32768;
+    # measured worst prompt ~18.1K tok so no truncation. See exp71 for the
+    # full rationale (memory:prefer-single-gpu — adjust, don't TP=2).
     llm = LLM(model=MODEL_NAME, max_model_len=MAX_MODEL_LEN,
               tensor_parallel_size=TP_SIZE,
               gpu_memory_utilization=0.97,
-              kv_cache_dtype="fp8",
+              kv_cache_dtype="fp8_e5m2",
               dtype="bfloat16", enforce_eager=True,
               trust_remote_code=True,
               limit_mm_per_prompt={"image": 0, "video": 0})
