@@ -24,6 +24,7 @@ export TRANSFORMERS_OFFLINE=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export LLM_MODEL="Qwen/Qwen3-30B-A3B-Thinking-2507-FP8"
 export RESULT_SUFFIX="r3"
+export ENABLE_THINKING=1
 export VARIANTS="V11_factual_one_sentence,V12_factual_minimal_cite,V13_factual_extract,V14_factual_named_entities,V15_factual_no_redundant,V16_factual_complete"
 
 cd "$PROJECT/prompt_lab"

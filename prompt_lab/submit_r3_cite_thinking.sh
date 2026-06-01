@@ -24,7 +24,8 @@ export TRANSFORMERS_OFFLINE=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export LLM_MODEL="Qwen/Qwen3-30B-A3B-Thinking-2507-FP8"
 export RESULT_SUFFIX="r3_cite_only"
-export MAX_TOKENS=64
+export ENABLE_THINKING=1
+export MAX_TOKENS=1024
 export RANK_BY=IoU
 export VARIANTS="R3C11_factual_one_sentence,R3C12_factual_minimal,R3C13_factual_extract,R3C14_named_entities,R3C15_no_redundant,R3C16_complete"
 
