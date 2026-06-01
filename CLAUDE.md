@@ -126,6 +126,7 @@ LANTA experiment history (train-set composite, ↑ better):
 | `exp64/` — hybrid pipeline 1 (Stage A=A3B) | exp55 with Stage A = A3B-Instruct (Stage B 32B-AWQ) | 0.7032 † |
 | `exp65/` — hybrid pipeline 2 (Stage A=A3B) | exp56 with Stage A = A3B-Instruct, refs fixed | 0.7118 † |
 | `exp66/` — hybrid pipeline 3 (Stage A=A3B) | exp57 with Stage A = A3B-Instruct, refs free | 0.7148 † |
+| `exp67/` — prompt swap (AWQ) | exp38 + **V10_factual** prompt (32B-AWQ, prompt-only) | 0.6948 † *(−0.0039)* |
 
 † Held-out evaluation: exp06 scored on 1218 queries excluding doc_050, exp07 on 1211 excluding doc_047, exp08 on the same 1218 as exp06. Apples-to-apples exp03 baselines on those subsets are 0.6270 (doc_050) and 0.6237 (doc_047), so the few-shot deltas are **+0.0059 (exp06)**, **+0.0041 (exp07)** and **+0.0091 (exp08)**. All show statistically significant per-query RougeL improvement (paired t-test p<0.0002), confirming the few-shot signal is real and not a doc-choice artifact. IoU is identical to exp03 because the retrieval pipeline is unchanged.
 
@@ -164,6 +165,8 @@ The avg dense∪BM25 union is ~28.6 — GEN_K=20 already captures the bulk; furt
 - `exp54/`: 27B-FP8 + **V13_extract** — IoU **0.8225** on dev (highest IoU ever), at cost of RougeL (model becomes ultra-extractive). Ceiling test.
 
 R4/R5 (R5 = few-shot composition ablation) confirmed model-specific shot preferences: A3B and AWQ both prefer the exp38 2-shot baseline; 27B-FP8 was more sensitive to shot wording (`F1_zero_shot` and `F2_only_single` competitive). See `prompt_lab/results_*/summary.json` for the full grid.
+
+**V10_factual on 32B-AWQ (exp67, leak-free) — REGRESSES, don't pursue**: the prompt-lab grid put V10_factual on 27B-FP8 (exp50) and A3B (exp51), never on AWQ. exp67 closes that cell — exp38's E5 prompt swapped to V10_factual, model held at 32B-AWQ, single-variable. Result **0.6948 (−0.0039 vs exp38 0.6987)**: V10 lifts IoU as expected (0.6906→0.6980, +0.0074, its "ระบุข้อเท็จจริงเท่านั้น" sharpens citation) but the terser/extractive answer costs RougeL (0.4935→0.4892) and SS (0.8619→0.8534) more than the 0.20-weight IoU gain recovers. Same IoU↔answer trade V10 shows on every model, but on AWQ the answer-quality loss wins net-negative — consistent with R4/R5 where AWQ preferred V14/V15, not V10. **Verdict: V10 does not transfer to single-stage AWQ; it pays off only where its sharp refs are isolated from answer-writing (the exp56 hybrid uses V10 on 27B-FP8 for Stage-A refs ONLY).**
 
 **Two-stage hybrid pipelines (exp55–exp66, leak-free) — NEW BEST**: insight from the prompt sweep — V10_factual + 27B-FP8 produces sharper *refs* (IoU 0.7998 vs exp38's 0.6906) but worse *answers* (RougeL/SS drop); exp38's E5 + AWQ produces stronger *answers* but weaker *refs*. Decoupling the two — Stage A picks refs, Stage B writes the answer — captures both halves. **Stage A is always Qwen3.6-27B-FP8 + V10_factual + exp38 shots** running on the full doc. All values are FRESH model output — no precomputed CSVs are read (the constraint that drove this design: refs and answer must both be generated, not joined from prior runs).
 
