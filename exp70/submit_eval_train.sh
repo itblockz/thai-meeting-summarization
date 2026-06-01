@@ -4,7 +4,7 @@
 #SBATCH --account=zz991021
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=1
+#SBATCH --gpus-per-node=2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=08:00:00
@@ -22,10 +22,11 @@ export TEST_DIR="$PROJECT/textsum/eval_train"
 export RESULT_DIR="$PROJECT/exp70/eval_result"
 export PROGRESS_LIB="$PROJECT/textsum/benchmark_lib/progress"
 # 2-shot full-doc (doc_050 x2 ~45.7K) + largest real doc ~27.6K => ~75K.
-# Single A100-40GB (user-chosen). If it OOMs on the largest docs, switch
-# to TP=2: set TP_SIZE=2 and gpus-per-node=2 below.
+# 1 GPU OOM'd: KV needs 7.5 GiB for max_seq_len 81920, only 6.75 avail
+# (vLLM est. max len 73744). Switched to TP=2 (2 GPUs) — doubles KV to
+# ~13.5 GiB, comfortably fits the 82K context.
 export MAX_MODEL_LEN="81920"
-export TP_SIZE="1"
+export TP_SIZE="2"
 export LLM_MODEL="Qwen/Qwen3-30B-A3B-Instruct-2507-FP8"
 
 export HF_HOME="$SHARED/.hf_cache"
