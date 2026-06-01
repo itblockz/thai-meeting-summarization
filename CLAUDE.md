@@ -92,6 +92,7 @@ Qwen3-30B-A3B-Instruct-2507-FP8 (MoE, ~3B active) + exp38 E5 prompt + 2-shot few
 - **`VLLM_WORKER_MULTIPROC_METHOD=spawn`** in every LANTA SLURM script — required when any code touches CUDA before vLLM init (CrossEncoder, sentence-transformers, even `import torch`), else the forked worker crashes on model load.
 - **27B-FP8 is slow because of prefix caching, not just FP8**: it resolves to a multimodal arch (`Qwen3_5ForConditionalGeneration`) so vLLM auto-disables `enable_prefix_caching` → re-prefills the whole doc every query (~25× prefill work). Forcing the flag on (exp63) gave ~2.9× speedup, output-neutral. Still loses to AWQ/A3B on speed+quality → dead-end as a single model.
 - A100 has no native FP8 cores → vLLM uses `fp8_marlin`/`fp8_w8a16` software dequant (~1.5–2× slower than AWQ).
+- **A 31B FP8 model can't do full-doc on one A100-40GB** (exp71/72): ~30 GB of bf16-loaded weights leave only ~6.49 GiB for KV, and **FP8 KV cache is impossible on A100 with an FP8 checkpoint** — `kv_cache_dtype="fp8"` (=e4m3) has no sm80 reshape_and_cache Triton kernel (`fp8e4nv not supported`), and `fp8_e5m2` is rejected outright (`not supported with fp8 checkpoints`). With bf16 KV forced, vLLM caps context at ~7.7K tokens (gemma-4's attention layout makes KV expensive) → 89% of queries truncated. Fix is a smaller quant: **NVFP4** (exp73) loads at ~18.5 GB via vLLM's `NvFp4LinearBackend.MARLIN` (weight-only FP4 dequant — warns it degrades compute-heavy/prefill, but runs fine), leaving ~16 GiB KV → full 32768 context with no truncation. For FP8 specifically, use TP=2.
 
 ### Experiment history (train-set composite, ↑ better; † = leak-free 1218 q, doc_050 held out)
 
@@ -112,6 +113,7 @@ Qwen3-30B-A3B-Instruct-2507-FP8 (MoE, ~3B active) + exp38 E5 prompt + 2-shot few
 | exp50/51 † | V10_factual on 27B-FP8 / A3B (record single-stage IoU 0.7998 on exp50) | — |
 | **exp56** ⭐⭐ | hybrid: 27B-FP8 picks refs → 32B-AWQ writes answer, refs fixed | **0.7215** |
 | exp59 † | hybrid pipeline 2 with A3B Stage B | 0.7196 |
+| exp73 † | exp51 + model → gemma-4-31B-it-**NVFP4** (single-stage; IoU 0.8091, beats hybrid's citation) | 0.7140 |
 
 **Score breakdown (leak-free except baseline/exp03):**
 
@@ -130,6 +132,7 @@ exp03 on the leak-free 1218 subset = 0.6270, so exp56 is **+0.0945** over exp03 
 - **Order vs selection (exp28–30):** at K≥20, the cross-encoder's value is *ordering* (gold at rank 1 → RougeL/SS lift), not selection; RRF loses to rerank.
 - **exp38 fixed the citation-fallback bug:** 153/1239 queries omitted `[อ้างอิง:]` (→ IoU=0). A multi-ref shot2 (cites 4 paras) taught the model to cite ≥3 paras; IoU 0.6669→0.6906.
 - **Hybrid pipelines (exp55–66):** decoupling refs (sharp via V10_factual+27B-FP8) from answers (strong via AWQ/A3B) is the win. **Pipeline 2 (full doc + hint, refs fixed) beats filtered-context (pipeline 1) by +0.012.** 32B-AWQ Stage B narrowly beats A3B (+0.0019). IoU breaks the single-stage citation ceiling: 0.6906 → 0.8006.
+- **gemma-4-31B on this task (exp71–73):** the model swap (exp51 pipeline, V10_factual + exp38 shots, single A100-40GB) lands at **0.7140 leak-free with the NVFP4 quant (exp73, +0.0030 over exp51, +0.0053 over v16/exp42)** — RougeL 0.4790 / SS 0.8546 / **IoU 0.8091**. The standout is IoU: a *single* model matching the exp56/exp59 *hybrid* citation quality (0.8006), because gemma-4 follows V10_factual's citation instruction near-perfectly (99.7% tag rate, 4/1239 fallbacks vs exp38's 153). Answer quality (RougeL/SS) is a touch below the A3B line, but the 0.20-weighted IoU more than compensates. **The two FP8 checkpoints (exp71 FP8-Dynamic, exp72 FP8-block) are infeasible on a single A100-40GB** for this full-doc task — see gotchas. exp71/72 code is committed but unrun; a real Dynamic-vs-block comparison needs TP=2.
 
 ### What does NOT help (verified — don't retry without new evidence)
 - **Reranker swaps** Qwen3-Reranker-0.6B/4B, jina-reranker-v3: bge-reranker-v2-m3 already ≥ them on MIRACL Thai. Qwen3-Reranker-8B lifts every retrieval metric but only +0.0016 composite (exp23) — gold already in top-5 ≥91%.
