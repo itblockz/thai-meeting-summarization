@@ -1,7 +1,9 @@
-# Build the v21 two-stage hybrid image (~50 GB, both Qwen3.6-27B-FP8 +
-# Qwen3-32B-AWQ weights embedded) on Google Cloud Build, then push to the
-# competition registry. GitHub Actions can't do this (runner disk ~14 GB);
-# LANTA podman is blocked (no /etc/subuid). GCB gives a configurable disk.
+# Build the v16.1 single-model image (~30 GB, one Qwen3-30B-A3B-Instruct-2507
+# -FP8 weight embedded) on Google Cloud Build, then push to the competition
+# registry. This is the lean single-model fallback (exp51, 0.7110) — the v21
+# two-stage hybrid (~50 GB) lives on master. GitHub Actions can't do even
+# this (runner disk ~14 GB); LANTA podman is blocked (no /etc/subuid). GCB
+# gives a configurable disk.
 #
 # Run:  gcloud builds submit --config cloudbuild.yaml .
 # (run from repo root D:\textsum — the build context below is textsum/)
@@ -18,8 +20,8 @@ steps:
         echo "$$REGISTRY_PASSWORD" | docker login registry.ai.in.th \
           -u nontapat.jf0n --password-stdin
         docker build \
-          -t registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v21 .
-        docker push registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v21
+          -t registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v16.1 .
+        docker push registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v16.1
 
 availableSecrets:
   secretManager:
@@ -27,14 +29,14 @@ availableSecrets:
       env: 'REGISTRY_PASSWORD'
 
 options:
-  # ~50 GB image + uncompressed layers (base ~10 GB, torch/vllm, 27B-FP8 ~30 GB,
-  # 32B-AWQ ~18 GB) need well over the default 100 GB. 250 GB leaves headroom.
-  diskSizeGb: 250
-  # HIGHCPU_8 = faster pip install + better network throughput for the 45 GB
+  # ~30 GB image + uncompressed layers (base ~10 GB, torch/vllm, A3B-FP8
+  # ~30 GB) exceed the default 100 GB once layers stack. 150 GB leaves headroom.
+  diskSizeGb: 150
+  # HIGHCPU_8 = faster pip install + better network throughput for the ~30 GB
   # HF pull. Bumping machineType/disk above defaults exits the free 120 min/day
   # tier (billed from minute 1) — covered by the $300 trial credit.
   machineType: 'E2_HIGHCPU_8'
 
-# Default GCB timeout is 10 min; this build is ~1-2 h (dominated by the HF
+# Default GCB timeout is 10 min; this build is ~1 h (dominated by the HF
 # weight download). 4 h ceiling so a slow pull doesn't get killed.
 timeout: 14400s
