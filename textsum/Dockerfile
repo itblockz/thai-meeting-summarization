@@ -13,17 +13,10 @@ RUN apt-get update && apt-get install -y python3.11 python3.11-dev python3.11-di
     rm -rf /var/lib/apt/lists/*
 RUN ln -sf /usr/bin/python3.11 /usr/bin/python3
 
-# v21: the base image is CUDA *runtime* (no nvcc). On the H100 benchmark backend
-# vLLM's Hopper FP8 fast paths (DeepGEMM + FlashInfer fp8 KV) JIT-compile CUDA
-# kernels with nvcc+ninja at first use — v19 died here with `nvcc: not found`.
-# Install the matching CUDA 12.8 compiler toolkit (nvcc + headers) + ninja so
-# that JIT succeeds. cuda-minimal-build pulls nvcc/cudart-dev without the full
-# ~6GB toolkit. run.py routes all JIT caches (TORCH_EXTENSIONS_DIR,
-# CUDA_CACHE_PATH, FLASHINFER_WORKSPACE_BASE, HOME) to writable /scratch.
-RUN apt-get update && apt-get install -y cuda-minimal-build-12-8 ninja-build && \
-    rm -rf /var/lib/apt/lists/*
-ENV CUDA_HOME=/usr/local/cuda \
-    PATH=/usr/local/cuda/bin:$PATH
+# v16.1 needs NO nvcc: run.py sets VLLM_USE_DEEP_GEMM=0 and keeps
+# kv_cache_dtype="auto", forcing the precompiled Marlin/Triton FP8 path on both
+# A100 and H100 (no runtime JIT). The v21 hybrid's cuda-minimal-build/nvcc bake
+# + CUDA_HOME env are dropped here — keeps this single-model image lean.
 
 COPY requirements.txt ./
 # torch 2.10.0 wheels on cu128 index (matches CUDA 12.8.1 base)
@@ -31,24 +24,17 @@ RUN pip3 install --no-cache-dir --timeout 300 --retries 5 \
     torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 RUN pip3 install --no-cache-dir --timeout 300 --retries 5 -r requirements.txt
 
-# v19: two-stage hybrid (exp56 port, leak-free 0.7215, +0.0128 over v16's
-# 0.7087). Stage A picks refs with Qwen3.6-27B-FP8 (dense, ~30 GB FP8);
-# Stage B writes the answer with Qwen3-32B-AWQ (~18 GB INT4) + hint
-# pointing at Stage A's refs. Both stages share one 40 GB GPU sequentially
-# (combined weights 48 GB > 40 GB → cannot coexist; `del + empty_cache`
-# between). Optimised for H100 40 GB (native FP8 + FA3 + FP8 KV cache,
-# auto-detected at runtime); falls back gracefully on A100 (~exp56's
-# 2h45m). Bundle BOTH model weights in the SIF (~50 GB image).
-# Download each model in its OWN cached layer so a network drop (or a future
-# rebuild) never re-pulls a model that already completed. With BuildKit, editing
-# model/run.py below invalidates only the COPY layer — these ~45 GB weight layers
-# stay cached and are NOT re-downloaded. hf_transfer = faster, resumable
-# multi-part pulls for the large FP8/AWQ shards.
+# v16.1: single-model exp51 port (leak-free 0.7110, +0.0023 over v16's
+# 0.7087). One model — Qwen3-30B-A3B-Instruct-2507-FP8 (MoE, ~30 GB FP8) —
+# with the V10_factual prompt. Proven-buildable, H100-safe single-model
+# fallback to the v21 two-stage hybrid (~50 GB) on master (~30 GB image).
+# Its own cached layer so a network drop / future rebuild never re-pulls a
+# completed model. With BuildKit, editing model/run.py below invalidates only
+# the COPY layer — the ~30 GB weight layer stays cached. hf_transfer = faster,
+# resumable multi-part pulls for the large FP8 shards.
 RUN pip3 install --no-cache-dir hf_transfer
 RUN HF_HUB_ENABLE_HF_TRANSFER=1 python3 -c \
-    "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3.6-27B-FP8')"
-RUN HF_HUB_ENABLE_HF_TRANSFER=1 python3 -c \
-    "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-32B-AWQ')"
+    "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-30B-A3B-Instruct-2507-FP8')"
 
 RUN mkdir -p /scratch && chmod 1777 /scratch
 
