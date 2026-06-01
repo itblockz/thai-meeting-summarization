@@ -107,11 +107,13 @@ def split_answer_citation(text):
     return re.sub(r'\s*\[อ้างอิง[^\]]*\]', '', text).strip()
 
 
-def final_response_text(text):
+def final_response_text(text, require_think_marker=False):
     """For thinking models, score only the final answer after </think>."""
     marker = '</think>'
     idx = text.rfind(marker)
     if idx == -1:
+        if require_think_marker:
+            return ''
         return text.strip()
     return text[idx + len(marker):].strip()
 
@@ -723,14 +725,18 @@ def main():
         rouges, ious = [], []
         n_explicit = 0
         n_think_stripped = 0
+        n_think_missing = 0
         ref_counts = []
         for it, out in zip(items, outputs):
             raw_full = out.outputs[0].text.strip()
-            raw = final_response_text(raw_full)
-            if raw != raw_full:
+            has_think_marker = raw_full.rfind('</think>') != -1
+            raw = final_response_text(raw_full, require_think_marker=enable_thinking)
+            if has_think_marker:
                 n_think_stripped += 1
+            elif enable_thinking:
+                n_think_missing += 1
             ans = split_answer_citation(raw)
-            cited_idx = parse_citation(raw, len(it['gen_pids']))
+            cited_idx = parse_citation(raw, len(it['gen_pids'])) if raw else []
             pred_refs = [it['gen_pids'][j] for j in cited_idx if j < len(it['gen_pids'])]
             if re.search(r'\[อ้างอิง[:\s]+[0-9,\s]+\]', raw):
                 n_explicit += 1
@@ -744,9 +750,9 @@ def main():
         # For ranking, also report what composite WOULD be assuming SS≈0.85 (typical)
         proxy = 0.55 * r_avg + 0.45 * i_avg
         full_proxy = 0.45 * 0.85 + 0.35 * r_avg + 0.20 * i_avg  # assume SS=0.85
-        print(f"RougeL={r_avg:.4f}  IoU={i_avg:.4f}  citations={n_explicit}/{len(items)}  avg_refs={sum(ref_counts)/len(ref_counts):.2f}  think_stripped={n_think_stripped}/{len(items)}", flush=True)
+        print(f"RougeL={r_avg:.4f}  IoU={i_avg:.4f}  citations={n_explicit}/{len(items)}  avg_refs={sum(ref_counts)/len(ref_counts):.2f}  think_stripped={n_think_stripped}/{len(items)}  think_missing={n_think_missing}/{len(items)}", flush=True)
         print(f"proxy (no SS) = {proxy:.4f}  proxy(SS=0.85) = {full_proxy:.4f}", flush=True)
-        results.append({'name': name, 'rougeL': r_avg, 'IoU': i_avg, 'cites': n_explicit, 'avg_refs': sum(ref_counts)/len(ref_counts), 'proxy': proxy})
+        results.append({'name': name, 'rougeL': r_avg, 'IoU': i_avg, 'cites': n_explicit, 'avg_refs': sum(ref_counts)/len(ref_counts), 'proxy': proxy, 'think_stripped': n_think_stripped, 'think_missing': n_think_missing})
 
     # final summary table
     rank_by = os.environ.get('RANK_BY', 'proxy').strip()

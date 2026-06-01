@@ -7,7 +7,7 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=01:30:00
+#SBATCH --time=04:00:00
 #SBATCH --output=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047/logs/prompt_lab_r3think_%j.out
 #SBATCH --error=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047/logs/prompt_lab_r3think_%j.err
 
@@ -25,6 +25,7 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export LLM_MODEL="Qwen/Qwen3-30B-A3B-Thinking-2507-FP8"
 export RESULT_SUFFIX="r3"
 export ENABLE_THINKING=1
+export MAX_TOKENS=2048
 export VARIANTS="V11_factual_one_sentence,V12_factual_minimal_cite,V13_factual_extract,V14_factual_named_entities,V15_factual_no_redundant,V16_factual_complete"
 
 cd "$PROJECT/prompt_lab"
