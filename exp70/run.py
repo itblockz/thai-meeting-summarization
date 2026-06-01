@@ -197,9 +197,14 @@ def main():
     print(f"pool sizes — mean={sum(pool_sizes)/len(pool_sizes):.2f}, "
           f"min={min(pool_sizes)}, max={max(pool_sizes)}", flush=True)
 
+    # 1-GPU fit: at util 0.95 vLLM gave only 6.75 GiB KV (est. max len
+    # 73744) → OOM at max_model_len 81920. The worst ACTUAL prompt is
+    # 2*doc_050 + doc_006 ≈ 73.3K ctx + template ≈ 75K (no real doc
+    # exceeds doc_006's 27.6K, so nothing is longer). max_model_len 77824
+    # covers it with margin; util 0.97 gives ~7.55 GiB KV vs ~7.12 needed.
     llm = LLM(model=MODEL_NAME, max_model_len=MAX_MODEL_LEN,
               tensor_parallel_size=TP_SIZE,
-              gpu_memory_utilization=0.95,
+              gpu_memory_utilization=0.97,
               dtype="bfloat16", enforce_eager=True,
               trust_remote_code=True,
               limit_mm_per_prompt={"image": 0, "video": 0})
