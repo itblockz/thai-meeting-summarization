@@ -1,5 +1,5 @@
 """
-v19 — exp56 port (two-stage hybrid), H100 40GB single-GPU optimised.
+v20 — exp56 port (two-stage hybrid), H100 40GB single-GPU optimised.
 
 NO RETRIEVAL: the full list of *valid* paragraphs from `doc_id` is fed to
 both stages in document order. Two sequential LLMs share one 40 GB GPU
@@ -430,7 +430,7 @@ def main():
     queries = data["queries"]
     n = len(queries)
     half = n // 2
-    print(f"v19 hybrid (exp56 port): {n} queries, {len(doc_index)} docs | "
+    print(f"v20 hybrid (exp56 port): {n} queries, {len(doc_index)} docs | "
           f"Stage A = {MODEL_27B} | Stage B = {MODEL_AWQ} | "
           f"max_model_len={MAX_MODEL_LEN}",
           flush=True)
