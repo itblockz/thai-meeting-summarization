@@ -1,5 +1,5 @@
 """
-v20 — exp56 port (two-stage hybrid), H100 40GB single-GPU optimised.
+v21 — exp56 port (two-stage hybrid), H100 40GB single-GPU optimised.
 
 NO RETRIEVAL: the full list of *valid* paragraphs from `doc_id` is fed to
 both stages in document order. Two sequential LLMs share one 40 GB GPU
@@ -132,9 +132,21 @@ def _configure_runtime_cache():
         candidate = _result_dir_for_cache / ".cache" / "runtime"
         candidate.mkdir(parents=True, exist_ok=True)
 
-    for _sub, _var in (("triton", "TRITON_CACHE_DIR"),
-                       ("xdg",    "XDG_CACHE_HOME"),
-                       ("tmp",    "TMPDIR")):
+    # The first three are the original Triton/XDG/tmp anchors. The rest (v21)
+    # are for the Hopper FP8 JIT path — DeepGEMM, FlashInfer and torch's
+    # cpp_extension all compile CUDA at first use and write caches under
+    # HOME/.cache, TORCH_EXTENSIONS_DIR, or CUDA_CACHE_PATH; under --containall
+    # those default to read-only or tiny tmpfs → ENOSPC/permission failure.
+    # Setting HOME here also redirects any ~/.cache/<tool> path we didn't name
+    # explicitly. HF_HOME is set separately in the image, so the baked weights
+    # are unaffected by the HOME change.
+    for _sub, _var in (("triton",     "TRITON_CACHE_DIR"),
+                       ("xdg",        "XDG_CACHE_HOME"),
+                       ("tmp",        "TMPDIR"),
+                       ("torch_ext",  "TORCH_EXTENSIONS_DIR"),
+                       ("cuda",       "CUDA_CACHE_PATH"),
+                       ("flashinfer", "FLASHINFER_WORKSPACE_BASE"),
+                       ("home",       "HOME")):
         _d = candidate / _sub
         _d.mkdir(parents=True, exist_ok=True)
         os.environ[_var] = str(_d)
@@ -164,18 +176,18 @@ for _sub, _var in (("triton", "TRITON_CACHE_DIR"),
     except OSError:
         pass
 
-# --- Hopper/H100: force the precompiled FP8 path (no runtime nvcc) ------------
-# The base image is a CUDA *runtime* (no nvcc / no CUDA toolkit). On the
-# benchmark's H100, vLLM's Hopper-only FP8 fast paths — DeepGEMM (block-FP8
-# GEMM) and FlashInfer (fp8 KV cache) — JIT-compile CUDA kernels with
-# nvcc+ninja at first use, which dies with `nvcc: not found` /
-# `ninja: build stopped`. The A100 backend-sim never hit this: SM 8.0 has no
-# native FP8, so vLLM used the precompiled Marlin/Triton FP8 path. Disabling
-# DeepGEMM here (env read at engine init) + keeping kv_cache_dtype="auto" in
-# make_engine_args() forces that same precompiled path on H100, so the shared
-# SIF runs identically on A100 and H100. Cost: the H100 FP8 speed bonus; the
-# answers/refs are unchanged (this is the proven exp56/A100 config).
-os.environ.setdefault("VLLM_USE_DEEP_GEMM", "0")
+# --- Hopper/H100: KEEP the native FP8 fast path (DeepGEMM + FlashInfer) -------
+# v19 crashed on the H100 benchmark backend because those Hopper-only kernels
+# JIT-compile with nvcc+ninja at first use and the runtime base image had no
+# nvcc (`nvcc: not found` / `ninja: build stopped`). v20 sidestepped it by
+# forcing the precompiled path; v21 instead KEEPS the FP8 path and makes it
+# work: the Dockerfile bakes cuda-toolkit (nvcc) into the image, and
+# _configure_runtime_cache() below routes EVERY JIT/compile cache
+# (TORCH_EXTENSIONS_DIR, CUDA_CACHE_PATH, FlashInfer workspace, HOME/.cache)
+# to writable scratch so the compile succeeds under --containall. The A100
+# backend-sim still exercises the precompiled path (SM 8.0 has no native FP8),
+# so the Hopper JIT branch is validated only by the real H100 submission.
+# (No VLLM_USE_DEEP_GEMM override — vLLM's Hopper default enables it.)
 
 import torch
 from transformers import AutoTokenizer
@@ -350,13 +362,12 @@ def make_engine_args(model_name, extra_kwargs):
     and (on H100) kv_cache_dtype="fp8". Stage-specific knobs
     (quantization, dtype, MM caps) come in via extra_kwargs.
     """
-    # kv_cache_dtype stays "auto" on every GPU: fp8 KV on Hopper pulls in the
-    # FlashInfer backend, which JIT-compiles with nvcc (absent from the runtime
-    # base image). "auto" keeps the precompiled attention path — the proven
-    # A100 config that completed the backend-sim. Both stages fit FP16 KV at
-    # max_model_len=32768 on a 40 GB GPU (verified on A100-40GB; H100-40GB is
-    # identical memory).
-    kv = "auto"
+    # v21: re-enable the Hopper FP8 KV path (fp8 on H100, auto on A100). On
+    # Hopper this pulls in FlashInfer, which JIT-compiles with nvcc — now
+    # present in the image (cuda-toolkit baked in the Dockerfile) and with all
+    # JIT caches routed to writable scratch (see _configure_runtime_cache). On
+    # A100 "auto" keeps the precompiled path (the config that passed the sim).
+    kv = "fp8" if is_hopper_or_newer() else "auto"
     base = dict(
         model=model_name,
         max_model_len=MAX_MODEL_LEN,
@@ -385,7 +396,7 @@ def run_stage(stage_label, model_name, extra_kwargs, items, progress_fn):
     """
     print(f"\n=== {stage_label}: {model_name} ===", flush=True)
     print(f"  H100 detected: {is_hopper_or_newer()} | "
-          f"kv_cache_dtype: auto (precompiled FP8 path, no nvcc) | "
+          f"kv_cache_dtype: {'fp8' if is_hopper_or_newer() else 'auto'} | "
           f"gpu_mem_util: {GPU_MEM_UTIL} | "
           f"max_num_batched_tokens: {MAX_NUM_BATCHED_TOKENS}",
           flush=True)
@@ -430,7 +441,7 @@ def main():
     queries = data["queries"]
     n = len(queries)
     half = n // 2
-    print(f"v20 hybrid (exp56 port): {n} queries, {len(doc_index)} docs | "
+    print(f"v21 hybrid (exp56 port): {n} queries, {len(doc_index)} docs | "
           f"Stage A = {MODEL_27B} | Stage B = {MODEL_AWQ} | "
           f"max_model_len={MAX_MODEL_LEN}",
           flush=True)

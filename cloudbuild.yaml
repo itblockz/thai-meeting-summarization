@@ -1,4 +1,4 @@
-# Build the v20 two-stage hybrid image (~50 GB, both Qwen3.6-27B-FP8 +
+# Build the v21 two-stage hybrid image (~50 GB, both Qwen3.6-27B-FP8 +
 # Qwen3-32B-AWQ weights embedded) on Google Cloud Build, then push to the
 # competition registry. GitHub Actions can't do this (runner disk ~14 GB);
 # LANTA podman is blocked (no /etc/subuid). GCB gives a configurable disk.
@@ -18,8 +18,8 @@ steps:
         echo "$$REGISTRY_PASSWORD" | docker login registry.ai.in.th \
           -u nontapat.jf0n --password-stdin
         docker build \
-          -t registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v20 .
-        docker push registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v20
+          -t registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v21 .
+        docker push registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v21
 
 availableSecrets:
   secretManager:

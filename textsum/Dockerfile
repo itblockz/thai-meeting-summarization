@@ -13,6 +13,18 @@ RUN apt-get update && apt-get install -y python3.11 python3.11-dev python3.11-di
     rm -rf /var/lib/apt/lists/*
 RUN ln -sf /usr/bin/python3.11 /usr/bin/python3
 
+# v21: the base image is CUDA *runtime* (no nvcc). On the H100 benchmark backend
+# vLLM's Hopper FP8 fast paths (DeepGEMM + FlashInfer fp8 KV) JIT-compile CUDA
+# kernels with nvcc+ninja at first use — v19 died here with `nvcc: not found`.
+# Install the matching CUDA 12.8 compiler toolkit (nvcc + headers) + ninja so
+# that JIT succeeds. cuda-minimal-build pulls nvcc/cudart-dev without the full
+# ~6GB toolkit. run.py routes all JIT caches (TORCH_EXTENSIONS_DIR,
+# CUDA_CACHE_PATH, FLASHINFER_WORKSPACE_BASE, HOME) to writable /scratch.
+RUN apt-get update && apt-get install -y cuda-minimal-build-12-8 ninja-build && \
+    rm -rf /var/lib/apt/lists/*
+ENV CUDA_HOME=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:$PATH
+
 COPY requirements.txt ./
 # torch 2.10.0 wheels on cu128 index (matches CUDA 12.8.1 base)
 RUN pip3 install --no-cache-dir --timeout 300 --retries 5 \
