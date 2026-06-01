@@ -52,6 +52,9 @@ snapshot_download('Qwen/Qwen3-32B-AWQ')"
     export HF_HUB_OFFLINE=1
     export TRANSFORMERS_OFFLINE=1
     export TEXTSUM_SCRATCH_DIR=/scratch
+    # v21: make nvcc visible for the Hopper FP8 JIT paths.
+    export CUDA_HOME=/usr/local/cuda
+    export PATH=/usr/local/cuda/bin:$PATH
     # vllm 0.19.1's V1 engine spawns an EngineCore subprocess that segfaults
     # inside Apptainer right after model load (verified on v11 bump attempt,
     # job 5787048 — FLASHINFER/TRITON_ATTN/FLEX_ATTENTION all segfault, so
