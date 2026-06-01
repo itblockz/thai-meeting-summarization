@@ -7,7 +7,7 @@
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH --time=06:00:00
+#SBATCH --time=10:00:00
 #SBATCH --output=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047/logs/exp71_eval_%j.out
 #SBATCH --error=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047/logs/exp71_eval_%j.err
 
@@ -21,7 +21,7 @@ source "$SHARED/venv/bin/activate"
 export TEST_DIR="$PROJECT/textsum/eval_train"
 export RESULT_DIR="$PROJECT/exp71/eval_result"
 export PROGRESS_LIB="$PROJECT/textsum/benchmark_lib/progress"
-export MAX_MODEL_LEN="20480"   # bf16 KV only fits ~21.8K tok on 40GB after 32GB weights; worst prompt ~18.1K
+export MAX_MODEL_LEN="15360"   # bf16 KV ceiling ~15.4K on 40GB after 32GB FP8 weights; only doc_006 (17.5K) truncates
 export TP_SIZE="1"
 export LLM_MODEL="RedHatAI/gemma-4-31B-it-FP8-Dynamic"
 

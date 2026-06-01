@@ -174,12 +174,14 @@ def main():
     # fall back to TP=2 (see memory: prefer-single-gpu).
     # Single-A100-40GB fit: bf16 KV only (FP8 KV impossible here — e4m3 has
     # no sm80 kernel, e5m2 rejected with fp8 checkpoints). 32 GB weights →
-    # ~6.49 GiB KV at util 0.97 → fits ~21.8K tok; MAX_MODEL_LEN=20480 (set
-    # in submit script) covers the ~18.1K worst prompt + 1K gen, no
-    # truncation. See exp71 (memory:prefer-single-gpu — adjust, don't TP=2).
+    # Real bf16 KV ceiling ~15.4K tok (8.61 GiB needed for 20480, only 6.49
+    # avail). MAX_MODEL_LEN=15360 (submit script) fits all docs but doc_006
+    # (truncated tail). enable_prefix_caching=True to survive KV-starved
+    # batching — doc-context prefix reused across a doc's queries. See exp71.
     llm = LLM(model=MODEL_NAME, max_model_len=MAX_MODEL_LEN,
               tensor_parallel_size=TP_SIZE,
               gpu_memory_utilization=0.97,
+              enable_prefix_caching=True,
               dtype="bfloat16", enforce_eager=True,
               trust_remote_code=True,
               limit_mm_per_prompt={"image": 0, "video": 0})

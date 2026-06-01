@@ -177,13 +177,19 @@ def main():
     # "fp8_e5m2" is rejected outright ("fp8_e5m2 kv-cache is not supported
     # with fp8 checkpoints"). So KV stays bf16, and the only lever is
     # max_model_len (memory:prefer-single-gpu — adjust, don't TP=2).
-    # Measured worst prompt is ~18.1K tok (largest doc_006 ctx 17,569);
-    # bf16 KV ≈0.30 MB/tok → 6.49 GiB fits ~21.8K tok, so MAX_MODEL_LEN=
-    # 20480 (set in submit script) covers the worst prompt + 1K generation
-    # with no doc truncation.
+    # Real bf16 KV cost (from vLLM): 8.61 GiB for 20480 tok → ~0.42 MB/tok;
+    # only 6.49 GiB is available, so the hard ceiling is ~15.4K tok of
+    # context. MAX_MODEL_LEN=15360 (submit script) needs 6.46 GiB ≤ 6.49 →
+    # fits all docs except doc_006 (ctx 17,569 → tail truncated; 1 of 50).
+    # KV is too starved for batching, so enable_prefix_caching=True is
+    # essential: queries are doc-grouped and the few-shot + doc-context
+    # prefix is identical within a doc, so each doc is prefilled ~once
+    # instead of per query (exp63: vLLM honors the flag for this multimodal
+    # arch; output-neutral under greedy decode).
     llm = LLM(model=MODEL_NAME, max_model_len=MAX_MODEL_LEN,
               tensor_parallel_size=TP_SIZE,
               gpu_memory_utilization=0.97,
+              enable_prefix_caching=True,
               dtype="bfloat16", enforce_eager=True,
               trust_remote_code=True,
               limit_mm_per_prompt={"image": 0, "video": 0})
