@@ -123,6 +123,9 @@ LANTA experiment history (train-set composite, ↑ better):
 | `exp59/` — hybrid pipeline 2 (A3B) | exp56 with Stage B = A3B-Instruct, refs fixed | 0.7196 † |
 | `exp60/` — hybrid pipeline 3 (A3B) | exp57 with Stage B = A3B-Instruct, refs free | 0.7199 † |
 | `exp63/` — prefix-cache probe | exp40 + forced `enable_prefix_caching=True` (speed test, not a score chase) | 0.6973 † |
+| `exp64/` — hybrid pipeline 1 (Stage A=A3B) | exp55 with Stage A = A3B-Instruct (Stage B 32B-AWQ) | 0.7032 † |
+| `exp65/` — hybrid pipeline 2 (Stage A=A3B) | exp56 with Stage A = A3B-Instruct, refs fixed | 0.7118 † |
+| `exp66/` — hybrid pipeline 3 (Stage A=A3B) | exp57 with Stage A = A3B-Instruct, refs free | 0.7148 † |
 
 † Held-out evaluation: exp06 scored on 1218 queries excluding doc_050, exp07 on 1211 excluding doc_047, exp08 on the same 1218 as exp06. Apples-to-apples exp03 baselines on those subsets are 0.6270 (doc_050) and 0.6237 (doc_047), so the few-shot deltas are **+0.0059 (exp06)**, **+0.0041 (exp07)** and **+0.0091 (exp08)**. All show statistically significant per-query RougeL improvement (paired t-test p<0.0002), confirming the few-shot signal is real and not a doc-choice artifact. IoU is identical to exp03 because the retrieval pipeline is unchanged.
 
@@ -162,7 +165,7 @@ The avg dense∪BM25 union is ~28.6 — GEN_K=20 already captures the bulk; furt
 
 R4/R5 (R5 = few-shot composition ablation) confirmed model-specific shot preferences: A3B and AWQ both prefer the exp38 2-shot baseline; 27B-FP8 was more sensitive to shot wording (`F1_zero_shot` and `F2_only_single` competitive). See `prompt_lab/results_*/summary.json` for the full grid.
 
-**Two-stage hybrid pipelines (exp55–exp60, leak-free) — NEW BEST**: insight from the prompt sweep — V10_factual + 27B-FP8 produces sharper *refs* (IoU 0.7998 vs exp38's 0.6906) but worse *answers* (RougeL/SS drop); exp38's E5 + AWQ produces stronger *answers* but weaker *refs*. Decoupling the two — Stage A picks refs, Stage B writes the answer — captures both halves. **Stage A is always Qwen3.6-27B-FP8 + V10_factual + exp38 shots** running on the full doc. All values are FRESH model output — no precomputed CSVs are read (the constraint that drove this design: refs and answer must both be generated, not joined from prior runs).
+**Two-stage hybrid pipelines (exp55–exp66, leak-free) — NEW BEST**: insight from the prompt sweep — V10_factual + 27B-FP8 produces sharper *refs* (IoU 0.7998 vs exp38's 0.6906) but worse *answers* (RougeL/SS drop); exp38's E5 + AWQ produces stronger *answers* but weaker *refs*. Decoupling the two — Stage A picks refs, Stage B writes the answer — captures both halves. **Stage A is always Qwen3.6-27B-FP8 + V10_factual + exp38 shots** running on the full doc. All values are FRESH model output — no precomputed CSVs are read (the constraint that drove this design: refs and answer must both be generated, not joined from prior runs).
 
 Three Stage-B variants × two Stage-B models (32B-AWQ vs A3B-Instruct, same A100-40GB):
 
@@ -177,6 +180,16 @@ Key findings:
 - **32B-AWQ Stage B narrowly beats A3B** (exp56 0.7215 vs exp59 0.7196 = +0.0019). A3B is ~4× faster wall-clock but the AWQ answer quality edge is the headline.
 - **Letting Stage B override refs (pipeline 3) is flat** — exp60 (0.7199) only +0.0003 over exp59. Stage A's V10_factual refs are already near-optimal; A3B mostly agrees and occasionally adds noise.
 - **IoU breaks the citation ceiling**: exp38's IoU 0.6906 → exp59's **0.8006** (+0.0100). The "model answers spanning multi-paras but forgets the citation tag" failure mode that bottlenecked single-stage exp38 (153/1239 → IoU=0 fallbacks) is solved by giving citation its own dedicated model+prompt that *only* picks refs.
+
+**Stage-A swap to A3B (exp64–exp66, leak-free) — REGRESSES, don't pursue**: mirror exp55/56/57 (pipeline 1/2/3) but swap the *ref-picker* (Stage A) from Qwen3.6-27B-FP8 to A3B-Instruct; Stage B stays 32B-AWQ.
+
+| Pipeline | 27B-FP8 Stage A | A3B Stage A |
+|---|--:|--:|
+| 1 (filter) | `exp55/` | `exp64/` = 0.7032 |
+| 2 (hint, fixed) | `exp56/` = **0.7215** ⭐ | `exp65/` = 0.7118 |
+| 3 (hint, free) | `exp57/` | `exp66/` = 0.7148 |
+
+Every pipeline loses (exp65 0.7118 < exp56 0.7215 = −0.0097). **Root cause is IoU**: 27B-FP8 + V10_factual Stage A gives IoU 0.8006 (exp56/exp59); A3B Stage A drops it to ~0.762–0.770 (−0.04). 27B's *dense* factual extraction (all 27B params active) does NOT transfer to A3B's ~3B-active MoE for the ref-picking job — A3B emits the right *count* (avg 2.0–2.1 refs/query, same as 27B) but picks the wrong paragraphs more often. A3B's ~4× speed edge doesn't compensate. Secondary note: within the A3B-Stage-A family the order *inverts* vs the 27B family — pipeline 3 (refs free, exp66 0.7148) > pipeline 2 (fixed, exp65 0.7118), because when Stage A refs are weaker, letting 32B-AWQ Stage B override them recovers some IoU; with strong 27B Stage A refs, pipeline 3 ≈ pipeline 2 (exp57 ≈ exp56). **Verdict: keep 27B-FP8 as the Stage-A ref-picker; A3B is a dead-end for Stage A.**
 
 **Current best**: `exp56/` — Stage A = Qwen3.6-27B-FP8 + V10_factual prompt + exp38 multi-ref shots (refs only); Stage B = Qwen3-32B-AWQ + exp38 E5 prompt with `**โดยเน้นย่อหน้าหมายเลข [X, Y, Z] เป็นข้อมูลหลัก**` hint pointing at Stage A's selection; **final refs FIXED to Stage A**, abstractive from Stage B. Composite **0.7215** leak-free (+0.0228 over exp38). The Docker pipeline still runs single-model v16 (port of exp42, composite 0.7087); exp56 is not yet containerized — would need a hybrid SIF (~50 GB, both model weights) and `del llm; gc.collect(); torch.cuda.empty_cache()` between stages. exp38 remains the canonical single-AWQ reference (0.6987); exp03 the no-few-shot baseline (0.6256 full-1239); exp30 (0.6783) the previous-best retrieval-line score before exp35 closed the retrieval phase.
 
