@@ -25,6 +25,11 @@ From: nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
     add-apt-repository -y ppa:deadsnakes/ppa
     apt-get update && apt-get install -y python3.11 python3.11-dev python3.11-distutils python3-pip && rm -rf /var/lib/apt/lists/*
     ln -sf /usr/bin/python3.11 /usr/bin/python3
+    # v21: install the CUDA 12.8 compiler toolkit (nvcc) + ninja so the Hopper
+    # FP8 JIT paths (DeepGEMM / FlashInfer fp8 KV) compile at runtime instead of
+    # dying with `nvcc: not found` (the v19 H100 crash). cuda-minimal-build pulls
+    # nvcc + cudart-dev without the full ~6GB toolkit.
+    apt-get update && apt-get install -y cuda-minimal-build-12-8 ninja-build && rm -rf /var/lib/apt/lists/*
     # torch 2.10.0 wheels live on the cu128 index (matches CUDA 12.8.1 base).
     pip3 install --no-cache-dir --timeout 300 --retries 5 torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
     pip3 install --no-cache-dir --timeout 300 --retries 5 -r /requirements.txt
