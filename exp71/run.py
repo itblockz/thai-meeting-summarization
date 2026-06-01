@@ -171,19 +171,19 @@ def main():
     # limit_mm_per_prompt skips the vision encoder cache budget.
     #
     # Single-A100-40GB fit (vs exp51's A3B 30.87 GB): the 32 GB gemma-4
-    # weights leave only ~5.7 GiB for KV at util 0.95, and bf16 KV for the
-    # 32K context needs 9.54 GiB → OOM. Fix per memory:prefer-single-gpu
-    # (adjust, don't TP=2): util 0.97 (→6.49 GiB KV, 1.36x concurrency at
-    # 32K) + FP8 KV cache. MUST be **fp8_e5m2**, not the default "fp8"
-    # (=e4m3 / fp8e4nv): A100 (sm80) has no e4m3 reshape_and_cache Triton
-    # kernel ("type fp8e4nv not supported … supported: fp8e4b15, fp8e5").
-    # max_model_len stays 32768; measured worst prompt is only ~18.1K tok
-    # (largest doc_006 ctx 17,569), so no truncation. FP8 KV is a minor
-    # confound vs exp51's bf16 KV but needed to fit on one 40 GB card.
+    # weights leave only ~6.49 GiB for KV at util 0.97. FP8 KV cache is NOT
+    # an option on A100 with an FP8 checkpoint — default "fp8"(=e4m3) has no
+    # sm80 reshape_and_cache Triton kernel ("fp8e4nv not supported"), and
+    # "fp8_e5m2" is rejected outright ("fp8_e5m2 kv-cache is not supported
+    # with fp8 checkpoints"). So KV stays bf16, and the only lever is
+    # max_model_len (memory:prefer-single-gpu — adjust, don't TP=2).
+    # Measured worst prompt is ~18.1K tok (largest doc_006 ctx 17,569);
+    # bf16 KV ≈0.30 MB/tok → 6.49 GiB fits ~21.8K tok, so MAX_MODEL_LEN=
+    # 20480 (set in submit script) covers the worst prompt + 1K generation
+    # with no doc truncation.
     llm = LLM(model=MODEL_NAME, max_model_len=MAX_MODEL_LEN,
               tensor_parallel_size=TP_SIZE,
               gpu_memory_utilization=0.97,
-              kv_cache_dtype="fp8_e5m2",
               dtype="bfloat16", enforce_eager=True,
               trust_remote_code=True,
               limit_mm_per_prompt={"image": 0, "video": 0})

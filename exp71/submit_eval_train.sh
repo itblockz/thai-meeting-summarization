@@ -21,7 +21,7 @@ source "$SHARED/venv/bin/activate"
 export TEST_DIR="$PROJECT/textsum/eval_train"
 export RESULT_DIR="$PROJECT/exp71/eval_result"
 export PROGRESS_LIB="$PROJECT/textsum/benchmark_lib/progress"
-export MAX_MODEL_LEN="32768"
+export MAX_MODEL_LEN="20480"   # bf16 KV only fits ~21.8K tok on 40GB after 32GB weights; worst prompt ~18.1K
 export TP_SIZE="1"
 export LLM_MODEL="RedHatAI/gemma-4-31B-it-FP8-Dynamic"
 
