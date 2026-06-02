@@ -31,14 +31,14 @@ RUN pip3 install --no-cache-dir --timeout 300 --retries 5 \
     torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 RUN pip3 install --no-cache-dir --timeout 300 --retries 5 -r requirements.txt
 
-# v19: two-stage hybrid (exp56 port, leak-free 0.7215, +0.0128 over v16's
-# 0.7087). Stage A picks refs with Qwen3.6-27B-FP8 (dense, ~30 GB FP8);
-# Stage B writes the answer with Qwen3-32B-AWQ (~18 GB INT4) + hint
-# pointing at Stage A's refs. Both stages share one 40 GB GPU sequentially
-# (combined weights 48 GB > 40 GB → cannot coexist; `del + empty_cache`
-# between). Optimised for H100 40 GB (native FP8 + FA3 + FP8 KV cache,
-# auto-detected at runtime); falls back gracefully on A100 (~exp56's
-# 2h45m). Bundle BOTH model weights in the SIF (~50 GB image).
+# v22: two-stage hybrid (exp56 port). Stage A picks refs with
+# gemma-4-31B-it-NVFP4 (4-bit NVFP4, ~22 GB — the exp73 model, swapped in
+# for v21's Qwen3.6-27B-FP8); Stage B writes the answer with Qwen3-32B-AWQ
+# (~18 GB INT4) + hint pointing at Stage A's refs. Both stages share one
+# 40 GB GPU sequentially (combined weights ~40 GB → cannot coexist;
+# `del + empty_cache` between). Optimised for H100 40 GB (native FP8 + FA3
+# + FP8 KV cache, auto-detected at runtime); falls back gracefully on A100.
+# Bundle BOTH model weights in the SIF (~42 GB image).
 # Download each model in its OWN cached layer so a network drop (or a future
 # rebuild) never re-pulls a model that already completed. With BuildKit, editing
 # model/run.py below invalidates only the COPY layer — these ~45 GB weight layers
@@ -46,7 +46,7 @@ RUN pip3 install --no-cache-dir --timeout 300 --retries 5 -r requirements.txt
 # multi-part pulls for the large FP8/AWQ shards.
 RUN pip3 install --no-cache-dir hf_transfer
 RUN HF_HUB_ENABLE_HF_TRANSFER=1 python3 -c \
-    "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3.6-27B-FP8')"
+    "from huggingface_hub import snapshot_download; snapshot_download('RedHatAI/gemma-4-31B-it-NVFP4')"
 RUN HF_HUB_ENABLE_HF_TRANSFER=1 python3 -c \
     "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-32B-AWQ')"
 

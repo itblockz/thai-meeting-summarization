@@ -1,13 +1,16 @@
 """
-v21 — exp56 port (two-stage hybrid), H100 40GB single-GPU optimised.
+v22 — exp56 hybrid with the Stage-A ref-picker swapped to gemma-4-31B-NVFP4
+(the exp73 model). H100 40GB single-GPU optimised.
 
 NO RETRIEVAL: the full list of *valid* paragraphs from `doc_id` is fed to
 both stages in document order. Two sequential LLMs share one 40 GB GPU
-(weights together = 30 + 18 ≈ 48 GB > 40 GB, so they cannot coexist):
+(weights together ≈ 22 + 18 = 40 GB at the edge, so they cannot coexist —
+loaded one at a time with del + empty_cache between):
 
-  Stage A — Qwen/Qwen3.6-27B-FP8 (dense, FP8-e4m3 weights ≈ 30 GB) with
-            V10_factual prompt + the exp38 multi-ref shot pair. Picks
-            *refs* via [อ้างอิง: …] tags from the full doc.
+  Stage A — RedHatAI/gemma-4-31B-it-NVFP4 (4-bit NVFP4 weights ≈ 22 GB via
+            NvFp4LinearBackend.MARLIN) with the V10_factual prompt + the
+            exp38 multi-ref shot pair. Picks *refs* via [อ้างอิง: …] tags
+            from the full doc. (v21 used Qwen3.6-27B-FP8 here.)
   --- free weights, gc.collect(), torch.cuda.empty_cache() ---
   Stage B — Qwen/Qwen3-32B-AWQ (INT4 AWQ-Marlin, ≈ 18 GB) with exp38's
             E5 prompt + a "เน้นย่อหน้าหมายเลข [X, Y, Z]" hint pointing
@@ -202,7 +205,13 @@ MAX_MODEL_LEN          = int(os.environ.get("MAX_MODEL_LEN",          "32768"))
 MAX_NUM_BATCHED_TOKENS = int(os.environ.get("MAX_NUM_BATCHED_TOKENS", "16384"))
 GPU_MEM_UTIL           = float(os.environ.get("GPU_MEM_UTIL",         "0.92"))
 
-MODEL_27B = os.environ.get("LLM_MODEL_STAGE_A", "Qwen/Qwen3.6-27B-FP8")
+# v22: Stage A ref-picker swapped Qwen3.6-27B-FP8 → gemma-4-31B-it-NVFP4
+# (the exp73 model). Loads at ~22 GB via vLLM's NvFp4LinearBackend.MARLIN
+# (auto-detected from config.json — no `quantization` arg). The Stage A
+# extra_kwargs below (dtype="bfloat16" + limit_mm_per_prompt to skip the
+# gemma-4 vision encoder) are already exactly exp73's loader, so only the
+# model name changes. Stage B (answer-writer) stays 32B-AWQ.
+MODEL_A   = os.environ.get("LLM_MODEL_STAGE_A", "RedHatAI/gemma-4-31B-it-NVFP4")
 MODEL_AWQ = os.environ.get("LLM_MODEL_STAGE_B", "Qwen/Qwen3-32B-AWQ")
 
 SYSTEM_MSG = (
@@ -441,8 +450,8 @@ def main():
     queries = data["queries"]
     n = len(queries)
     half = n // 2
-    print(f"v21 hybrid (exp56 port): {n} queries, {len(doc_index)} docs | "
-          f"Stage A = {MODEL_27B} | Stage B = {MODEL_AWQ} | "
+    print(f"v22 hybrid (exp56 port, gemma Stage A): {n} queries, {len(doc_index)} docs | "
+          f"Stage A = {MODEL_A} | Stage B = {MODEL_AWQ} | "
           f"max_model_len={MAX_MODEL_LEN}",
           flush=True)
     benchmark_lib(0)
@@ -486,7 +495,7 @@ def main():
     # range. Map stage-local n_done → overall via integer halving so the
     # benchmark sees a smooth monotonic count.
     raws_A = run_stage(
-        "Stage A (refs)", MODEL_27B,
+        "Stage A (refs)", MODEL_A,
         dict(dtype="bfloat16",
              limit_mm_per_prompt={"image": 0, "video": 0}),
         stage_a_items,

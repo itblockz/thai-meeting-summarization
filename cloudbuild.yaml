@@ -1,4 +1,4 @@
-# Build the v21 two-stage hybrid image (~50 GB, both Qwen3.6-27B-FP8 +
+# Build the v22 two-stage hybrid image (~42 GB, both gemma-4-31B-it-NVFP4 +
 # Qwen3-32B-AWQ weights embedded) on Google Cloud Build, then push to the
 # competition registry. GitHub Actions can't do this (runner disk ~14 GB);
 # LANTA podman is blocked (no /etc/subuid). GCB gives a configurable disk.
@@ -18,8 +18,8 @@ steps:
         echo "$$REGISTRY_PASSWORD" | docker login registry.ai.in.th \
           -u nontapat.jf0n --password-stdin
         docker build \
-          -t registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v21 .
-        docker push registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v21
+          -t registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v22 .
+        docker push registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v22
 
 availableSecrets:
   secretManager:
@@ -27,10 +27,10 @@ availableSecrets:
       env: 'REGISTRY_PASSWORD'
 
 options:
-  # ~50 GB image + uncompressed layers (base ~10 GB, torch/vllm, 27B-FP8 ~30 GB,
-  # 32B-AWQ ~18 GB) need well over the default 100 GB. 250 GB leaves headroom.
+  # ~42 GB image + uncompressed layers (base ~10 GB, torch/vllm, gemma-NVFP4
+  # ~22 GB, 32B-AWQ ~18 GB) need well over the default 100 GB. 250 GB leaves headroom.
   diskSizeGb: 250
-  # HIGHCPU_8 = faster pip install + better network throughput for the 45 GB
+  # HIGHCPU_8 = faster pip install + better network throughput for the ~40 GB
   # HF pull. Bumping machineType/disk above defaults exits the free 120 min/day
   # tier (billed from minute 1) — covered by the $300 trial credit.
   machineType: 'E2_HIGHCPU_8'
