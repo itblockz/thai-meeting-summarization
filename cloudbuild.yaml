@@ -3,22 +3,61 @@
 # competition registry. GitHub Actions can't do this (runner disk ~14 GB);
 # LANTA podman is blocked (no /etc/subuid). GCB gives a configurable disk.
 #
-# PER-MODEL BUILD CACHE: GCB workers are ephemeral (no local layer cache), so
-# we push/pull a BuildKit registry cache (`type=registry,...,mode=max`) under a
-# stable `:buildcache` tag. mode=max exports EVERY intermediate stage — incl.
-# the isolated `dl-gemma` / `dl-awq` model-download stages — so a rebuild that
-# only touches model/run.py restores both ~20 GB model stages from cache
-# instead of re-pulling from HuggingFace. Changing one model's snapshot_download
-# line re-downloads only that stage; the other stays a cache hit. Needs the
-# `docker-container` buildx driver (the default `docker` driver can't export a
-# registry cache).
+# PERSISTENT MODEL CACHE VIA GCS: the model weights are NOT downloaded inside
+# `docker build`. Instead a GCS bucket ($_HF_BUCKET) holds a HuggingFace cache
+# that accumulates EVERY model we have ever pulled. Each build (1) syncs the
+# bucket down into the workspace, (2) snapshot_download's only the models that
+# are still missing, (3) syncs anything new back up, then (4) bakes the cache
+# into the image via `COPY hf-cache`. Switching the Stage-A model away and
+# later back is a full cache hit — the old model never left the bucket. The
+# heavy, flaky HF pull happens at most ONCE per model, ever.
+#
+# One-time setup (run manually before the first build):
+#   gsutil mb -l <region> gs://<bucket>            # create the bucket
+#   # grant the Cloud Build service account read/write on it:
+#   gsutil iam ch serviceAccount:<PROJECT_NUMBER>@cloudbuild.gserviceaccount.com:roles/storage.objectAdmin gs://<bucket>
+# Then set _HF_BUCKET below (or pass --substitutions=_HF_BUCKET=gs://<bucket>/hf).
 #
 # Run:  gcloud builds submit --config cloudbuild.yaml .
-# (run from repo root D:\textsum — the build context below is textsum/)
+# (run from repo root D:\textsum — the docker build context is textsum/)
+
+substitutions:
+  _HF_BUCKET: 'gs://CHANGE-ME-textsum-hf/hf'   # GCS path holding the HF cache
 
 steps:
+  # 1. Seed the workspace HF cache from GCS (first run: bucket empty → no-op).
+  - name: 'gcr.io/cloud-builders/gsutil'
+    entrypoint: 'bash'
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        mkdir -p textsum/hf-cache
+        gsutil -m rsync -r "${_HF_BUCKET}" textsum/hf-cache || \
+          echo "no GCS cache yet (first build) — will download all models"
+
+  # 2. Download ONLY the models not already present (seeded by step 1). The
+  #    model list lives here; keep it in sync with run.py's LLM_MODEL_STAGE_*
+  #    defaults. snapshot_download skips repos already complete in the cache.
+  - name: 'python:3.11-slim'
+    entrypoint: 'bash'
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        pip install --no-cache-dir --timeout 300 --retries 5 huggingface_hub hf_transfer
+        export HF_HOME=/workspace/textsum/hf-cache HF_HUB_ENABLE_HF_TRANSFER=1
+        python -c "from huggingface_hub import snapshot_download; \
+          snapshot_download('RedHatAI/gemma-4-31B-it-NVFP4'); \
+          snapshot_download('Qwen/Qwen3-32B-AWQ')"
+
+  # 3. Persist any newly downloaded weights back to GCS (no -d → only adds).
+  - name: 'gcr.io/cloud-builders/gsutil'
+    args: ['-m', 'rsync', '-r', 'textsum/hf-cache', '${_HF_BUCKET}']
+
+  # 4. Build the image (weights come from the context via COPY) + push.
   - name: 'gcr.io/cloud-builders/docker'
-    dir: 'textsum'              # build context = ./textsum (matches the GH workflow)
+    dir: 'textsum'              # build context = ./textsum (now incl. hf-cache/)
     entrypoint: 'bash'
     secretEnv: ['REGISTRY_PASSWORD']
     args:
@@ -28,16 +67,14 @@ steps:
         IMG=registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n
         echo "$$REGISTRY_PASSWORD" | docker login registry.ai.in.th \
           -u nontapat.jf0n --password-stdin
-        # buildx with the docker-container driver enables registry cache export.
-        docker buildx create --name textsum --driver docker-container --use \
-          2>/dev/null || docker buildx use textsum
-        docker buildx inspect --bootstrap
-        docker buildx build \
-          --cache-from type=registry,ref=$IMG:buildcache \
-          --cache-to   type=registry,ref=$IMG:buildcache,mode=max \
-          -t $IMG:v22 \
-          --push \
-          .
+        # Inline cache from the previous image reuses the apt/pip/torch base
+        # layers (the COPY hf-cache layer is cache-hit when the weights are
+        # unchanged; the COPY model layer is the only thing a run.py edit busts).
+        DOCKER_BUILDKIT=1 docker build \
+          --cache-from $$IMG:v22 \
+          --build-arg BUILDKIT_INLINE_CACHE=1 \
+          -t $$IMG:v22 .
+        docker push $$IMG:v22
 
 availableSecrets:
   secretManager:
@@ -45,15 +82,14 @@ availableSecrets:
       env: 'REGISTRY_PASSWORD'
 
 options:
-  # ~42 GB image + uncompressed layers (base ~10 GB, torch/vllm, gemma-NVFP4
-  # ~22 GB, 32B-AWQ ~18 GB) + the registry cache export need well over the
-  # default 100 GB. 250 GB leaves headroom.
+  # workspace HF cache (~40 GB) + docker context + image layers + the ~42 GB
+  # image need well over the default 100 GB. 250 GB leaves headroom.
   diskSizeGb: 250
-  # HIGHCPU_8 = faster pip install + better network throughput for the ~40 GB
-  # HF pull. Bumping machineType/disk above defaults exits the free 120 min/day
-  # tier (billed from minute 1) — covered by the $300 trial credit.
+  # HIGHCPU_8 = faster pip install + better network for the GCS sync. Bumping
+  # machineType/disk above defaults exits the free 120 min/day tier (billed from
+  # minute 1) — covered by the $300 trial credit.
   machineType: 'E2_HIGHCPU_8'
 
-# Default GCB timeout is 10 min; the FIRST build is ~1-2 h (HF download +
-# cache export). Cached rebuilds (run.py-only) are minutes. 4 h ceiling.
+# First build (cold GCS bucket) ~1-2 h (HF download). Warm builds skip the
+# download — only the GCS sync + docker layer assembly, ~10-20 min. 4 h ceiling.
 timeout: 14400s

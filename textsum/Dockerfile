@@ -6,19 +6,15 @@
 # (~18 GB INT4). Both stages share one 40 GB GPU sequentially (combined
 # weights ~40 GB → cannot coexist; `del + empty_cache` between).
 #
-# MULTI-STAGE FOR PER-MODEL BUILD CACHE: each model is downloaded in its OWN
-# leaf stage (`dl-gemma`, `dl-awq`) that derives from `base`. Changing one
-# model's snapshot_download line invalidates ONLY that stage — the other
-# model stays a cache hit (no cascade, unlike a single linear Dockerfile
-# where a later RUN re-downloads whenever an earlier one changes). On GCB
-# (ephemeral workers, no local layer cache) this only pays off with a
-# registry cache backend — cloudbuild.yaml uses
-# `buildx --cache-to/--cache-from type=registry,...,mode=max`, which (unlike
-# inline cache) exports EVERY intermediate stage so a fresh VM restores the
-# already-downloaded model stages instead of re-pulling ~40 GB from HF.
+# MODEL WEIGHTS ARE NOT DOWNLOADED HERE. cloudbuild.yaml seeds them from a
+# persistent GCS bucket (a HuggingFace cache that accumulates every model we
+# have ever pulled), so a rebuild never re-fetches from HF — even after
+# switching the Stage-A model away and back. The build context therefore
+# carries `hf-cache/` (synced from GCS by the earlier Cloud Build steps), and
+# we just COPY it in. Order matters: COPY hf-cache BEFORE COPY model so a
+# run.py edit invalidates only the tiny final layer, never the ~40 GB weights.
 
-# ---- base: python + CUDA toolkit + pip deps (shared by every stage) ----------
-FROM docker.io/nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04 AS base
+FROM docker.io/nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 # Ubuntu 22.04's default python3.11 is 3.11.0~rc1 (a 2022 release candidate
@@ -50,27 +46,11 @@ COPY requirements.txt ./
 RUN pip3 install --no-cache-dir --timeout 300 --retries 5 \
     torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 RUN pip3 install --no-cache-dir --timeout 300 --retries 5 -r requirements.txt
-# hf_transfer = faster, resumable multi-part pulls for the large FP8/NVFP4/AWQ
-# shards. In `base` so both download stages share the single cached install.
-RUN pip3 install --no-cache-dir hf_transfer
 
-# ---- dl-gemma: Stage A weights ONLY (own stage → isolated cache) -------------
-FROM base AS dl-gemma
-RUN HF_HUB_ENABLE_HF_TRANSFER=1 python3 -c \
-    "from huggingface_hub import snapshot_download; snapshot_download('RedHatAI/gemma-4-31B-it-NVFP4')"
-
-# ---- dl-awq: Stage B weights ONLY (own stage → isolated cache) ---------------
-FROM base AS dl-awq
-RUN HF_HUB_ENABLE_HF_TRANSFER=1 python3 -c \
-    "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-32B-AWQ')"
-
-# ---- final: assemble both model caches + the app onto base -------------------
-# Each COPY --from merges that stage's HF hub tree (different models → disjoint
-# subdirs, no overwrite). A run.py edit invalidates ONLY the `COPY model` layer;
-# the two weight COPY layers ride on the cached dl-* stages.
-FROM base AS final
-COPY --from=dl-gemma /root/.cache/huggingface /root/.cache/huggingface
-COPY --from=dl-awq   /root/.cache/huggingface /root/.cache/huggingface
+# Bake both models' HF cache (gemma-4-31B-NVFP4 + Qwen3-32B-AWQ), seeded from
+# GCS by cloudbuild.yaml. This is the ~40 GB layer; it only changes when the
+# model set changes, so run.py edits leave it cache-hit.
+COPY hf-cache /root/.cache/huggingface
 
 RUN mkdir -p /scratch && chmod 1777 /scratch
 
