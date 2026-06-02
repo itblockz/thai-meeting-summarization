@@ -19,9 +19,10 @@ FP8 checkpoints' ~30.4 GB of bf16-loaded weights leave only ~6.49 GiB for
 KV, and FP8 KV cache is impossible here (e4m3 has no sm80 Triton kernel;
 e5m2 is rejected with fp8 checkpoints). vLLM then caps context at ~7.7K
 tokens → 89% of queries (44/50 docs) truncated. NVFP4 packs weights to
-4-bit (~22 GB) → ~12.9 GiB KV at util 0.92 → the full 32768 context fits
-(needed 9.54 GiB) with NO truncation. See exp71/exp72 docstrings for the
-full FP8 dead-end trace.
+4-bit and fits. NB: this nvidia build is heavier than exp73's RedHatAI one
+(it keeps self_attn in bf16 → 29.96 GiB load, not ~22 GiB), so the full
+32768 context no longer fits — see the load comment for the 20480 + util
+0.97 sizing. See exp71/exp72 docstrings for the full FP8 dead-end trace.
 
 RESOLVED on first run (job 5824096): the ModelOpt *weight* loader is fine
 on A100/sm80 (quantization=modelopt_fp4 loaded). The wall was the *KV*
@@ -198,16 +199,23 @@ def main():
     # to bf16 and ignores the FP8 directive — making the nvidia build behave
     # exactly like exp73's RedHatAI build (NVFP4 weights, bf16 KV).
     #
-    # Single-A100-40GB fit (identical KV math to exp73, quant-independent):
-    # at util 0.92 (~36.8 GB budget − 22 weights − ~1.9 activations) ≈ 12.9
-    # GiB KV. gemma-4's attention layout needs 9.54 GiB for the full 32768
-    # context → fits with ~3 GiB headroom, MAX_MODEL_LEN=32768 with NO
-    # truncation. enable_prefix_caching=True reuses the doc-grouped few-shot
-    # +context prefix across a doc's queries (exp63: honored, output-neutral
-    # under greedy).
+    # Single-A100-40GB fit — TIGHTER than exp73 (RedHatAI). The nvidia
+    # ModelOpt build EXCLUDES every self_attn* from NVFP4 (hf_quant_config
+    # exclude_modules), so attention weights stay bf16 → model loads at
+    # 29.96 GiB, ~8 GiB heavier than RedHatAI's ~22 GiB (which quantized
+    # attention too). At util 0.92 that left only 4.94 GiB KV — far short of
+    # the 9.54 GiB the full 32768 context needs (OOM, est. max len 5856).
+    # Per memory:prefer-single-gpu (trim max_model_len + raise util, not
+    # TP=2): measure_tokens.py shows the worst prompt is 18,309 tok +1024
+    # new = 19,333, so MAX_MODEL_LEN=20480 truncates 0/1239 and needs only
+    # ~5.96 GiB KV (9.54 × 20480/32768). util 0.97 yields ~6.94 GiB KV after
+    # activation profiling → fits with ~1 GiB headroom. (Set both in
+    # submit_eval_train.sh: MAX_MODEL_LEN=20480.) enable_prefix_caching=True
+    # reuses the doc-grouped few-shot+context prefix across a doc's queries
+    # (exp63: honored, output-neutral under greedy).
     llm = LLM(model=MODEL_NAME, max_model_len=MAX_MODEL_LEN,
               tensor_parallel_size=TP_SIZE,
-              gpu_memory_utilization=0.92,
+              gpu_memory_utilization=0.97,
               enable_prefix_caching=True,
               dtype="bfloat16", kv_cache_dtype="bfloat16",
               enforce_eager=True,

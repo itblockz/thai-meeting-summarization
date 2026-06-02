@@ -21,7 +21,7 @@ source "$SHARED/venv/bin/activate"
 export TEST_DIR="$PROJECT/textsum/eval_train"
 export RESULT_DIR="$PROJECT/exp75/eval_result"
 export PROGRESS_LIB="$PROJECT/textsum/benchmark_lib/progress"
-export MAX_MODEL_LEN="32768"
+export MAX_MODEL_LEN="20480"   # nvidia ModelOpt build: self_attn kept bf16 -> 30 GiB weights, KV-starved at 32768; 20480 covers worst prompt (19,333 tok) with 0 truncation
 export TP_SIZE="1"
 export LLM_MODEL="nvidia/Gemma-4-31B-IT-NVFP4"
 
