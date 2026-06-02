@@ -23,7 +23,6 @@ export RESULT_DIR="$PROJECT/exp77/eval_result"
 export PROGRESS_LIB="$PROJECT/textsum/benchmark_lib/progress"
 export MAX_MODEL_LEN="32768"
 export TP_SIZE="1"
-export LLM_MODEL="nvidia/Gemma-4-26B-A4B-NVFP4"
 
 export HF_HOME="$SHARED/.hf_cache"
 export TRANSFORMERS_CACHE="$SHARED/.hf_cache"
@@ -32,6 +31,36 @@ export TRANSFORMERS_OFFLINE=1
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 mkdir -p "$RESULT_DIR" "$PROJECT/logs"
+
+# Build a local override of the nvidia/ModelOpt checkpoint: symlink the
+# snapshot but strip the FP8 KV directive from the configs so vLLM's "auto"
+# kv_cache_dtype resolves to bf16 (sm80 has no fp8e4nv reshape_and_cache
+# kernel; the TRITON_ATTN MoE path also rejects an explicit "bfloat16"). See
+# run.py's KV comment for the full two-sided trap. Rebuilt fresh each run.
+SNAP=$(ls -d "$SHARED"/.hf_cache/hub/models--nvidia--Gemma-4-26B-A4B-NVFP4/snapshots/*/ | head -1)
+OVR="$PROJECT/exp77/model_override"
+rm -rf "$OVR"; mkdir -p "$OVR"
+for f in "$SNAP"*; do ln -s "$f" "$OVR/$(basename "$f")"; done
+python3 - "$OVR" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+# hf_quant_config.json: neutralize the FP8 KV directive
+p = os.path.join(d, "hf_quant_config.json")
+j = json.load(open(p, encoding="utf-8"))
+j.get("quantization", {}).pop("kv_cache_quant_algo", None)
+os.remove(p)  # drop the symlink before writing a real file (keep blob intact)
+json.dump(j, open(p, "w", encoding="utf-8"), indent=2)
+# config.json: drop any kv_cache_scheme / kv_cache_quant_algo in quantization_config
+p = os.path.join(d, "config.json")
+j = json.load(open(p, encoding="utf-8"))
+qc = j.get("quantization_config", {})
+qc.pop("kv_cache_scheme", None)
+qc.pop("kv_cache_quant_algo", None)
+os.remove(p)
+json.dump(j, open(p, "w", encoding="utf-8"), indent=2)
+print("override built at", d)
+PY
+export LLM_MODEL="$OVR"
 
 echo "=== exp77: gemma-4-26B-A4B-NVFP4 (nvidia/ModelOpt, single A100-40GB) + exp51 prompt/shots ==="
 cd "$PROJECT/exp77"

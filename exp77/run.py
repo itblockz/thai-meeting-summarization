@@ -16,12 +16,20 @@ shared attention stays bf16, a far smaller slice than in the dense 31B. So
 the nvidia build SHOULD fit where its dense sibling did not — but the load
 size is the open question (see fit comment + first-run log).
 
-KV — the exp75 LOAD-BEARING fix carries over: nvidia/ModelOpt bakes
-"kv_cache_quant_algo": "FP8" into hf_quant_config.json (RedHatAI does NOT),
-so kv_cache_dtype="auto" would resolve to fp8_e4m3 → sm80 has no fp8e4nv
-reshape_and_cache kernel → engine init dies (the exp71/72/75 wall). Forcing
-kv_cache_dtype="bfloat16" makes resolve_kv_cache_dtype_string return it
-verbatim, ignoring the FP8 directive → bf16 KV, exactly like exp76.
+KV — a TWO-SIDED trap, RESOLVED on first run (job 5824680). nvidia/ModelOpt
+bakes "kv_cache_quant_algo": "FP8" into hf_quant_config.json (RedHatAI does
+NOT), so kv_cache_dtype="auto" promotes to fp8_e4m3 → sm80 has no fp8e4nv
+reshape_and_cache kernel → engine init dies (the exp71/72/75 wall). BUT the
+exp75 dense fix (kv_cache_dtype="bfloat16") does NOT work here either: this
+MoE selects the TRITON_ATTN backend, whose triton_reshape_and_cache_flash
+asserts kv_cache_dtype ∈ {"auto","fp8*"} → "bfloat16" raises
+AssertionError. FIX: submit_eval_train.sh builds a local override dir
+(symlinks the snapshot, strips kv_cache_quant_algo + kv_cache_scheme from
+the configs) so "auto" resolves to bf16 — matching exp76's working config —
+and run.py leaves kv_cache_dtype at the default "auto". (FIT itself was
+never the issue: first run profiled GPU KV = 82,096 tokens / 7.88x at
+32768, so the nvidia MoE build DOES fit a single A100, unlike the dense 31B
+exp75 — confirming the bet that quantized experts dominate the footprint.)
 
 Quality bet: identical to exp76 — this is an MoE answer-quality ceiling task
 (active-param count, cf. exp74 = 0.6970), so neither publisher is expected
@@ -189,14 +197,25 @@ def main():
     # RISK, same as exp76). MoE A4B routes ~4B active params/token. arch=
     # Gemma4ForConditionalGeneration; limit_mm_per_prompt skips vision cache.
     #
-    # ⚠️ kv_cache_dtype="bfloat16" is LOAD-BEARING (vs exp76, which omits it).
-    # nvidia/ModelOpt bakes "kv_cache_quant_algo": "FP8" into
-    # hf_quant_config.json; with kv_cache_dtype="auto" vLLM's
-    # resolve_kv_cache_dtype_string() reads that → fp8_e4m3 → sm80
-    # reshape_and_cache has no fp8e4nv path ("type fp8e4nv not supported") →
-    # engine init dies (the exp71/72/75 KV wall). Passing "bfloat16" (a valid
-    # CacheDType) is returned verbatim → forces bf16 KV, ignoring the FP8
-    # directive, matching exp76's RedHatAI behaviour.
+    # ⚠️ KV-dtype on the nvidia/ModelOpt build is a TWO-SIDED trap on this
+    # vLLM (job 5824680, first run). The MoE path selects the TRITON_ATTN
+    # backend whose triton_reshape_and_cache_flash kernel asserts
+    # kv_cache_dtype ∈ {"auto", "fp8*"} — so the exp75 dense fix
+    # (kv_cache_dtype="bfloat16") is REJECTED here:
+    #   AssertionError: unsupported kv_cache_dtype (str), got bfloat16.
+    # But leaving it "auto" is no good either: ModelOpt bakes
+    # "kv_cache_quant_algo": "FP8" into hf_quant_config.json (+ a
+    # kv_cache_scheme in config.json's quantization_config), so "auto"
+    # promotes to fp8_e4m3 → sm80 has no fp8e4nv reshape_and_cache kernel
+    # (the exp71/72/75 wall). RedHatAI (exp76) sidesteps this only because
+    # its checkpoint carries NO kv directive, so its "auto" resolves to bf16.
+    #
+    # FIX (submit_eval_train.sh): point LLM_MODEL at a local override dir that
+    # symlinks the snapshot but STRIPS kv_cache_quant_algo / kv_cache_scheme
+    # from the two config files → "auto" resolves to bf16 (matching exp76's
+    # working config exactly), and the triton assertion's "auto" branch
+    # passes. So here kv_cache_dtype is left at the default "auto" — the
+    # neutralized config, not a dtype override, is what forces bf16 KV.
     #
     # Fit — HEAVIER than exp76 (RedHatAI). nvidia/ModelOpt `exclude_modules`
     # the self_attn* layers from NVFP4 → attention stays bf16. In the dense
@@ -213,7 +232,7 @@ def main():
               tensor_parallel_size=TP_SIZE,
               gpu_memory_utilization=0.95,
               enable_prefix_caching=True,
-              dtype="bfloat16", kv_cache_dtype="bfloat16",
+              dtype="bfloat16", kv_cache_dtype="auto",
               enforce_eager=True,
               trust_remote_code=True,
               limit_mm_per_prompt={"image": 0, "video": 0})
