@@ -2,27 +2,94 @@
 # RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic MoE weight embedded) on Google Cloud
 # Build, then push to the competition registry. Packaged exp74 variant
 # (KNOWN-NEGATIVE on train, 0.6970; faster near-A3B MoE — prefer v16.2's 0.7140
-# for quality). The v21 two-stage hybrid (~50 GB) lives on master. GitHub
-# Actions can't do even this (runner disk ~14 GB); LANTA podman is blocked (no
-# /etc/subuid). GCB gives a configurable disk.
+# for quality). The v21/v22 two-stage hybrid (~42-50 GB) lives on master/v22.
+# GitHub Actions can't do even this (runner disk ~14 GB); LANTA podman is
+# blocked (no /etc/subuid). GCB gives a configurable disk.
 #
-# Run:  gcloud builds submit --config cloudbuild.yaml .
-# (run from repo root D:\textsum — the build context below is textsum/)
+# PERSISTENT MODEL CACHE VIA GCS (same scheme as v22): the model weight is NOT
+# downloaded inside `docker build`. A GCS tar ($_HF_BUCKET/v16.3/hf-cache.tar)
+# holds a HuggingFace cache; each build (1) restores it into the workspace,
+# (2) snapshot_download's the model only if missing, (3) re-uploads if changed,
+# then (4) bakes it into the image via `COPY hf-cache`. The heavy, flaky HF
+# pull happens at most ONCE, ever — warm rebuilds (e.g. a run.py edit) skip it.
+# This image uses its OWN tar (v16.3/ prefix), SEPARATE from v22's two-model
+# hf-cache.tar, so the lean single-model image never bakes v22's extra weights.
+#
+# Region: asia-southeast1 is the persistent default (gcloud config
+# builds/region + the regional default staging bucket) — submit with a bare
+# `gcloud builds submit --config cloudbuild.yaml .`, no --region needed.
+# One-time bucket setup was already done for v22 (bucket
+# textsum-hf-cache-437476422274, Cloud Build SA has roles/storage.objectAdmin).
+
+substitutions:
+  _HF_BUCKET: 'gs://textsum-hf-cache-437476422274/hf'   # GCS path holding the HF cache (asia-southeast1)
 
 steps:
+  # 1. Restore the v16.3 HF cache from a single tar in GCS. Stored as a TAR
+  #    (not an rsync'd tree) because the HF layout is blobs/ + snapshots/
+  #    symlinks; GCS can't hold symlinks, so rsync would store every file twice.
+  #    tar keeps the symlinks intact. First build: no tar yet → start empty.
+  - name: 'gcr.io/cloud-builders/gsutil'
+    entrypoint: 'bash'
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        mkdir -p textsum/hf-cache
+        if gsutil -q stat "${_HF_BUCKET}/v16.3/hf-cache.tar"; then
+          gsutil -m cp "${_HF_BUCKET}/v16.3/hf-cache.tar" /workspace/hf-cache.tar
+          tar -xf /workspace/hf-cache.tar -C textsum
+          echo "restored v16.3 HF cache from tar"
+        else
+          echo "no v16.3 cache tar yet (first build) — will download the model"
+        fi
+
+  # 2. Download the model only if not already present (restored by step 1).
+  #    Keep this in sync with run.py's LLM_MODEL default. snapshot_download
+  #    skips a repo already complete in the cache.
+  - name: 'python:3.11-slim'
+    entrypoint: 'bash'
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        pip install --no-cache-dir --timeout 300 --retries 5 huggingface_hub hf_transfer
+        export HF_HOME=/workspace/textsum/hf-cache HF_HUB_ENABLE_HF_TRANSFER=1
+        python -c "from huggingface_hub import snapshot_download; \
+          snapshot_download('RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic')"
+
+  # 3. Repack the cache as a single tar (symlinks preserved, no -h → ~26 GB not
+  #    ~52) and upload, replacing the previous tar.
+  - name: 'gcr.io/cloud-builders/gsutil'
+    entrypoint: 'bash'
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        tar -cf /workspace/hf-cache.tar -C textsum hf-cache
+        gsutil -m cp /workspace/hf-cache.tar "${_HF_BUCKET}/v16.3/hf-cache.tar"
+        echo "uploaded v16.3 cache tar: $(du -h /workspace/hf-cache.tar | cut -f1)"
+
+  # 4. Build the image (weights come from the context via COPY hf-cache) + push.
   - name: 'gcr.io/cloud-builders/docker'
-    dir: 'textsum'              # build context = ./textsum (matches the GH workflow)
+    dir: 'textsum'              # build context = ./textsum (now incl. hf-cache/)
     entrypoint: 'bash'
     secretEnv: ['REGISTRY_PASSWORD']
     args:
       - -c
       - |
         set -euo pipefail
+        IMG=registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n
         echo "$$REGISTRY_PASSWORD" | docker login registry.ai.in.th \
           -u nontapat.jf0n --password-stdin
-        docker build \
-          -t registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v16.3 .
-        docker push registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v16.3
+        # Inline cache from the previous image reuses the apt/pip/torch base
+        # layers; the COPY hf-cache layer is cache-hit when the weight is
+        # unchanged, so a run.py edit busts only the tiny final COPY model layer.
+        DOCKER_BUILDKIT=1 docker build \
+          --cache-from $$IMG:v16.3 \
+          --build-arg BUILDKIT_INLINE_CACHE=1 \
+          -t $$IMG:v16.3 .
+        docker push $$IMG:v16.3
 
 availableSecrets:
   secretManager:
@@ -30,14 +97,14 @@ availableSecrets:
       env: 'REGISTRY_PASSWORD'
 
 options:
-  # ~26 GB image + uncompressed layers (base ~10 GB, torch/vllm, gemma-4 MoE
-  # FP8 ~26 GB) exceed the default 100 GB once layers stack. 150 GB leaves headroom.
+  # workspace HF cache (~26 GB) + docker context + image layers + the ~26 GB
+  # image exceed the default 100 GB once layers stack. 150 GB leaves headroom.
   diskSizeGb: 150
-  # HIGHCPU_8 = faster pip install + better network throughput for the ~26 GB
-  # HF pull. Bumping machineType/disk above defaults exits the free 120 min/day
-  # tier (billed from minute 1) — covered by the $300 trial credit.
+  # HIGHCPU_8 = faster pip install + better network for the GCS sync. Bumping
+  # machineType/disk above defaults exits the free 120 min/day tier (billed from
+  # minute 1) — covered by the $300 trial credit.
   machineType: 'E2_HIGHCPU_8'
 
-# Default GCB timeout is 10 min; this build is ~1 h (dominated by the HF
-# weight download). 4 h ceiling so a slow pull doesn't get killed.
+# First build (cold cache) ~1 h (HF download). Warm builds skip the download —
+# only the GCS restore + docker layer assembly, ~10-20 min. 4 h ceiling.
 timeout: 14400s

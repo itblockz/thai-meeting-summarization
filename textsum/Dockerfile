@@ -1,3 +1,11 @@
+# syntax=docker/dockerfile:1
+#
+# MODEL WEIGHT IS NOT DOWNLOADED HERE. cloudbuild.yaml seeds it from a
+# persistent GCS tar (a HuggingFace cache), so a rebuild never re-fetches from
+# HF. The build context carries `hf-cache/` (restored from GCS by the earlier
+# Cloud Build steps) and we just COPY it in. Order matters: COPY hf-cache
+# BEFORE COPY model so a run.py edit invalidates only the tiny final layer,
+# never the ~26 GB weights.
 FROM docker.io/nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -30,15 +38,13 @@ RUN pip3 install --no-cache-dir --timeout 300 --retries 5 -r requirements.txt
 # LLM changes. ⚠️ KNOWN-NEGATIVE on train (exp74 leak-free 0.6970, −0.0170 vs
 # v16.2's 0.7140): the ~4B-active answers lose RougeL/SS more than the
 # best-on-record IoU (0.8139) recovers. Kept as a packaged faster variant
-# (near-A3B speed), NOT a quality win — prefer v16.2 for score. Single-model
-# fallback to the v21 two-stage hybrid (~50 GB) on master. Its own cached
-# layer so a network drop / future rebuild never re-pulls a completed model.
-# With BuildKit, editing model/run.py below invalidates only the COPY layer —
-# the ~26 GB weight layer stays cached. hf_transfer = faster, resumable
-# multi-part pulls for the large shards.
-RUN pip3 install --no-cache-dir hf_transfer
-RUN HF_HUB_ENABLE_HF_TRANSFER=1 python3 -c \
-    "from huggingface_hub import snapshot_download; snapshot_download('RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic')"
+# (near-A3B speed), NOT a quality win — prefer v16.2 for score.
+#
+# Bake the model's HF cache, seeded from the GCS tar by cloudbuild.yaml (NOT
+# downloaded here — see the header). This is the ~26 GB layer; it only changes
+# when the model set changes, so a run.py edit leaves it cache-hit (COPY model
+# below is the only busted layer).
+COPY hf-cache /root/.cache/huggingface
 
 RUN mkdir -p /scratch && chmod 1777 /scratch
 
