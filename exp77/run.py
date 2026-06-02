@@ -221,16 +221,22 @@ def main():
     # the self_attn* layers from NVFP4 → attention stays bf16. In the dense
     # 31B that added ~8 GiB → 29.96 GiB → didn't fit (exp75). On THIS MoE the
     # quantized experts are the bulk and stay 4-bit, so the bf16-attention
-    # penalty is a smaller fraction → expected to fit a single A100 (the
-    # first-run load log is the verdict). util 0.95 (not 0.92 like exp76) to
-    # claw back the KV the bf16 attention costs; MAX_MODEL_LEN=32768. If KV
-    # won't fit 32768, trim MAX_MODEL_LEN (exp75: worst prompt ~19.3K →
-    # 20480 truncates 0/1239) — never TP=2 (memory:prefer-single-gpu).
+    # penalty is a smaller fraction → fits a single A100 (first run profiled
+    # GPU KV = 82,096 tok / 7.88x at 32768). util 0.90 (LOWER than exp76's
+    # 0.92, not higher): the heavier ~18 GiB weights + a near-full KV at the
+    # original util 0.95 left only ~246 MiB free → the sampling-time
+    # frequency-penalty buffer (repetition_penalty=1.05, batched over all
+    # prompts) OOM'd at the first decode (job 5824692, "Tried to allocate
+    # 256.00 MiB ... 246.12 MiB free"). 0.90 keeps full-32768 KV (need ~9.54
+    # GiB of ~18 free) while leaving ~4 GiB truly-free GPU RAM for vLLM's
+    # untracked sampling allocations. MAX_MODEL_LEN=32768; if KV ever won't
+    # fit, trim it (exp75: worst prompt ~19.3K → 20480 truncates 0/1239) —
+    # never TP=2 (memory:prefer-single-gpu).
     # enable_prefix_caching=True reuses the doc-grouped few-shot+context
     # prefix (verify honored for this MoE arch in the engine log).
     llm = LLM(model=MODEL_NAME, max_model_len=MAX_MODEL_LEN,
               tensor_parallel_size=TP_SIZE,
-              gpu_memory_utilization=0.95,
+              gpu_memory_utilization=0.90,
               enable_prefix_caching=True,
               dtype="bfloat16", kv_cache_dtype="auto",
               enforce_eager=True,
