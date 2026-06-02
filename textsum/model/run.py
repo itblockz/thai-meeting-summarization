@@ -1,48 +1,61 @@
 """
-v16.1 — exp51 port (single-model A3B + V10_factual prompt), H100-safe.
+v16.2 — exp73 port (single-model gemma-4-31B-NVFP4 + V10_factual prompt).
 
 NO RETRIEVAL: the full list of *valid* paragraphs from `doc_id` is fed to
-Qwen3-30B-A3B-Instruct-2507-FP8 (MoE, 30 GB FP8 weights) in document
-order. The model is shown the paragraphs as a numbered [1..N] context,
-answers in Thai, then cites which paragraphs it used as [อ้างอิง: X];
-the cited paragraphs become `refs` (E5 self-citation, adaptive count).
-Two worked few-shot examples are prepended as multi-turn chat turns.
+RedHatAI/gemma-4-31B-it-NVFP4 (4-bit-weight, ~22 GB) in document order.
+The model is shown the paragraphs as a numbered [1..N] context, answers
+in Thai, then cites which paragraphs it used as [อ้างอิง: X]; the cited
+paragraphs become `refs` (E5 self-citation, adaptive count). Two worked
+few-shot examples are prepended as multi-turn chat turns.
 
-v16.1 = exp51 port. Single-variable change from v16 (exp42, 0.7087): the
-instruction prompt is swapped from exp38's E5 wording ("กระชับและ
-ครอบคลุม") to **V10_factual** ("สั้นและตรงประเด็น, ระบุข้อเท็จจริงเท่านั้น,
-ห้ามตีความ"). Same model, same shots, same decoding. Leak-free composite
-**0.7110** (venv run, exp51 — RougeL 0.4858 / SS 0.8574 / IoU 0.7754),
-+0.0023 over v16's 0.7087. The sharper "facts only, no interpretation"
-directive lifts IoU (0.7410 → 0.7754) by trimming over-cited refs.
+v16.2 = exp73 port. SINGLE-VARIABLE change from v16.1 (exp51, 0.7110):
+the LLM is swapped from Qwen3-30B-A3B-Instruct-2507-FP8 to gemma-4-31B-
+it-NVFP4. SAME V10_factual prompt, SAME exp38 shots, SAME greedy decoding
+(temp 0, rep-pen 1.05). Leak-free composite **0.7140** (venv run, exp73 —
+RougeL 0.4790 / SS 0.8546 / IoU 0.8091), +0.0030 over v16.1's 0.7110 and
++0.0053 over v16/exp42. The win is IoU: gemma-4 follows V10_factual's
+citation instruction near-perfectly (99.7% tag rate, 4/1239 fallbacks)
+— a single model matching the exp56/exp59 *hybrid* citation quality
+(0.8006) without the two-stage cost. Answer quality (RougeL/SS) is a
+touch below the A3B line, but the 0.20-weighted IoU more than compensates.
 
-This is the SINGLE-MODEL v16 lineage (one ~30 GB A3B image), kept as a
-proven-buildable, H100-safe alternative to the v17–v21 two-stage hybrid
-(~50 GB, both 27B-FP8 + 32B-AWQ weights) that lives on `master`. The
-hybrid scores higher (0.7215) but has been hard to build/ship; this
-branch is the low-risk fallback.
+This is the SINGLE-MODEL v16 lineage (one ~22 GB image now — smaller than
+v16.1's ~30 GB A3B), kept as a proven-buildable alternative to the
+v17–v21 two-stage hybrid (~50 GB, both 27B-FP8 + 32B-AWQ weights) on
+`master`. The hybrid scores marginally higher (0.7215) but has been hard
+to build/ship; this branch is the low-risk fallback.
 
-Why this model on a 40 GB GPU:
-- A3B = 30 B params but 3 B activated per token (MoE). FP8-e4m3 weights
-  total 29.54 GiB → fits 40 GB GPU with ~6 GB KV-cache headroom (vLLM
-  reported 73,744-token KV size at gpu_memory_utilization=0.95).
-- A100 has no native FP8 cores → vLLM picks MarlinFP8ScaledMMLinearKernel
-  (linear) + MARLIN Fp8 MoE backend, dequantises FP8 → FP16 on the fly.
+Why NVFP4 on a 40 GB GPU (vs the FP8 variants, exp71/72 — infeasible):
+- gemma-4-31B FP8 checkpoints load ~30.4 GB of bf16 weights → only
+  ~6.49 GiB for KV, and FP8 KV cache is impossible on A100 with an FP8
+  checkpoint (e4m3 has no sm80 reshape_and_cache Triton kernel; e5m2 is
+  rejected). vLLM then caps context at ~7.7K tokens → 89% of queries
+  truncated. For FP8 you need TP=2.
+- NVFP4 packs weights to 4-bit (~22 GB). vLLM loads them via the
+  NvFp4LinearBackend.MARLIN weight-only FP4 dequant kernel (it warns it
+  degrades compute-heavy/prefill, but runs). At gpu_memory_utilization
+  0.92 (~36.8 GB budget − 22 − ~1.9 activations) ≈ 12.9 GiB KV; gemma-4's
+  attention layout needs 9.54 GiB for the full 32768 context → fits with
+  ~3 GiB headroom, so MAX_MODEL_LEN=32768 with NO truncation (matches
+  exp73/exp51). KV stays bf16 (no FP8-KV kernel issues here).
 - Multimodal vision blocks load idle for text-only chat;
-  limit_mm_per_prompt={"image":0,"video":0} stops vLLM from reserving
-  the encoder cache budget (was eating ~5 GB on prior 35B-A3B-FP8 try).
-- gpu_memory_utilization 0.95: confirmed safe in the exp42/exp51 venv
-  runs (peak ~36 GB on a 40 GB GPU).
+  limit_mm_per_prompt={"image":0,"video":0} stops vLLM reserving the
+  encoder cache budget.
+- gpu_memory_utilization 0.92 (not v16.1's 0.95): NVFP4 has ample KV room
+  now, so the looser util buys activation headroom — exp73's verified
+  value.
 
-H100-safe (carry over the v20 fix): the benchmark backend runs on H100
-(SM 9.0); LANTA is A100-only so no local test exercises the Hopper path.
-On H100 vLLM's Hopper-only FP8 fast path — DeepGEMM (block-FP8 GEMM) —
-JIT-compiles CUDA kernels with nvcc at first use, which dies on the
-runtime base image (`nvcc: not found`). VLLM_USE_DEEP_GEMM=0 (set below
-before any torch/vllm import) + the default kv_cache_dtype="auto" (no
-FlashInfer fp8 KV) force the precompiled Marlin/Triton FP8 path that the
-A100 sim already validates. Costs the H100 FP8 speed bonus; output
-unchanged. This image needs NO nvcc — keeps the SIF lean (~30 GB).
+H100-safe (carry over the v20 fix), with one OPEN RISK: the benchmark
+backend runs on H100 (SM 9.0); LANTA is A100-only so no local test
+exercises the Hopper path. VLLM_USE_DEEP_GEMM=0 (set below before any
+torch/vllm import) + the default kv_cache_dtype="auto" force the
+precompiled Marlin/Triton path on H100 with no runtime nvcc JIT — same
+guard as v16.1. ⚠️ NVFP4 (nvfp4-pack-quantized) natively targets
+Blackwell (sm100) FP4 tensor cores and vLLM has sm100 guards; the A100
+sim exercises the Marlin FP4 dequant path, but whether H100/sm90 takes
+that same precompiled path or a JIT one is UNVERIFIED (carried from
+exp73). The first-run raw-output dump below guards against silent
+gibberish. This image needs NO nvcc — keeps the SIF lean (~22 GB).
 
 v14→v16 infra (carry over):
 - Sort queries by doc_id before submission so the ~14K-token full-doc
@@ -87,15 +100,16 @@ PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
 
 MAX_NEW_TOKENS         = 1024
 MAX_MODEL_LEN          = int(os.environ.get("MAX_MODEL_LEN", "32768"))
-# 16384 = sweet spot for the prior 32B-AWQ build. Kept for A3B-FP8 too:
-# the MoE intermediate dim per expert is smaller (~2048) than 32B-AWQ's
-# 27648, so MLP activations are cheaper; the 14K-tok median prompt is
-# still single-chunk and the 28K-tok max prompt still fits 2 chunks.
+# 16384 = sweet spot carried from the 32B-AWQ / A3B builds: the 14K-tok
+# median prompt is still single-chunk and the 28K-tok max prompt fits 2
+# chunks. gemma-4-31B NVFP4 keeps it — the Marlin FP4 dequant makes prefill
+# heavier, but the per-step batched-token budget is unchanged.
 MAX_NUM_BATCHED_TOKENS = int(os.environ.get("MAX_NUM_BATCHED_TOKENS", "16384"))
-# 0.95 confirmed safe on the exp42/exp51 venv runs: 29.54 GiB weights +
-# 6.75 GiB KV cache + activations on a 40 GB GPU → peak ~36 GB.
-GPU_MEM_UTIL           = float(os.environ.get("GPU_MEM_UTIL", "0.95"))
-MODEL_NAME             = os.environ.get("LLM_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8")
+# 0.92 (not v16.1's 0.95): NVFP4 weights ~22 GB leave ~12.9 GiB for KV at
+# 0.92 — far more than the 9.54 GiB the full 32768 context needs — so the
+# looser util buys activation headroom. exp73's verified value on A100-40GB.
+GPU_MEM_UTIL           = float(os.environ.get("GPU_MEM_UTIL", "0.92"))
+MODEL_NAME             = os.environ.get("LLM_MODEL", "RedHatAI/gemma-4-31B-it-NVFP4")
 
 SYSTEM_MSG = (
     "คุณเป็นผู้ช่วยสรุปเอกสารภาษาไทย "
@@ -232,9 +246,10 @@ def main():
     doc_index = {doc["doc_id"]: doc["paragraphs"] for doc in data["docs"]}
     queries = data["queries"]
     n = len(queries)
-    print(f"v16.1 (exp51: A3B + V10_factual) — {n} queries, {len(doc_index)} docs "
-          f"(NO RETRIEVAL — full doc, max_model_len={MAX_MODEL_LEN}, "
-          f"gpu_mem_util={GPU_MEM_UTIL}, max_num_batched_tokens={MAX_NUM_BATCHED_TOKENS})",
+    print(f"v16.2 (exp73: gemma-4-31B-NVFP4 + V10_factual) — {n} queries, "
+          f"{len(doc_index)} docs (NO RETRIEVAL — full doc, model={MODEL_NAME}, "
+          f"max_model_len={MAX_MODEL_LEN}, gpu_mem_util={GPU_MEM_UTIL}, "
+          f"max_num_batched_tokens={MAX_NUM_BATCHED_TOKENS})",
           flush=True)
     benchmark_lib(0)
 
@@ -268,13 +283,15 @@ def main():
         print(f"pool sizes — mean={sum(pool_sizes)/len(pool_sizes):.2f}, "
               f"min={min(pool_sizes)}, max={max(pool_sizes)}", flush=True)
 
-    # FP8 quantization auto-detected from the model's config.json
-    # (quant_method=fp8); vLLM picks MarlinFP8ScaledMMLinearKernel on A100
-    # and (with VLLM_USE_DEEP_GEMM=0) the same precompiled path on H100.
-    # kv_cache_dtype defaults to "auto" (FP16 KV) — no FlashInfer fp8 path,
-    # so nothing JIT-compiles at runtime. limit_mm_per_prompt={"image":0,
-    # "video":0} stops vLLM from reserving the multimodal encoder cache
-    # (was ~5 GB on the prior 35B-A3B-FP8 attempt → KV cache went negative).
+    # NVFP4 quantization auto-detected from the model's config.json
+    # (nvfp4-pack-quantized); vLLM loads it via NvFp4LinearBackend.MARLIN
+    # weight-only FP4 dequant on A100, and (with VLLM_USE_DEEP_GEMM=0) the
+    # same precompiled path on H100 — see the OPEN RISK in the module
+    # docstring re: sm90/sm100 NVFP4. kv_cache_dtype defaults to "auto"
+    # (bf16 KV) — no FlashInfer fp8 path, so nothing JIT-compiles at runtime;
+    # gemma-4 also has no A100 FP8-KV kernel, so bf16 KV is mandatory here.
+    # limit_mm_per_prompt={"image":0,"video":0} stops vLLM from reserving the
+    # multimodal encoder cache budget (gemma-4 is multimodal, text-only here).
     engine_args = EngineArgs(
         model=MODEL_NAME,
         max_model_len=MAX_MODEL_LEN,

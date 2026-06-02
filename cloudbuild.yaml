@@ -1,6 +1,6 @@
-# Build the v16.1 single-model image (~30 GB, one Qwen3-30B-A3B-Instruct-2507
-# -FP8 weight embedded) on Google Cloud Build, then push to the competition
-# registry. This is the lean single-model fallback (exp51, 0.7110) — the v21
+# Build the v16.2 single-model image (~22 GB, one RedHatAI/gemma-4-31B-it
+# -NVFP4 weight embedded) on Google Cloud Build, then push to the competition
+# registry. This is the lean single-model fallback (exp73, 0.7140) — the v21
 # two-stage hybrid (~50 GB) lives on master. GitHub Actions can't do even
 # this (runner disk ~14 GB); LANTA podman is blocked (no /etc/subuid). GCB
 # gives a configurable disk.
@@ -20,8 +20,8 @@ steps:
         echo "$$REGISTRY_PASSWORD" | docker login registry.ai.in.th \
           -u nontapat.jf0n --password-stdin
         docker build \
-          -t registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v16.1 .
-        docker push registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v16.1
+          -t registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v16.2 .
+        docker push registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v16.2
 
 availableSecrets:
   secretManager:
@@ -29,10 +29,10 @@ availableSecrets:
       env: 'REGISTRY_PASSWORD'
 
 options:
-  # ~30 GB image + uncompressed layers (base ~10 GB, torch/vllm, A3B-FP8
-  # ~30 GB) exceed the default 100 GB once layers stack. 150 GB leaves headroom.
+  # ~22 GB image + uncompressed layers (base ~10 GB, torch/vllm, gemma-4-NVFP4
+  # ~22 GB) exceed the default 100 GB once layers stack. 150 GB leaves headroom.
   diskSizeGb: 150
-  # HIGHCPU_8 = faster pip install + better network throughput for the ~30 GB
+  # HIGHCPU_8 = faster pip install + better network throughput for the ~22 GB
   # HF pull. Bumping machineType/disk above defaults exits the free 120 min/day
   # tier (billed from minute 1) — covered by the $300 trial credit.
   machineType: 'E2_HIGHCPU_8'
