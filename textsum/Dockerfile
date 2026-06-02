@@ -54,11 +54,18 @@ COPY hf-cache /root/.cache/huggingface
 
 RUN mkdir -p /scratch && chmod 1777 /scratch
 
+# vllm 0.19.1 is V1-ONLY (V0 removed; `VLLM_USE_V1` is no longer a recognised env
+# var — setting it just warns). The two-stage handoff RELIES on V1 multiprocessing:
+# each stage's EngineCore runs in a child process, so `del engine` tears that
+# process down and the OS reclaims ALL its GPU memory before the next stage loads.
+# In-process mode (VLLM_ENABLE_V1_MULTIPROCESSING=0) leaves Stage A's ~22 GB
+# resident after del+empty_cache → Stage B OOMs on init (verified job 5824350:
+# "Free memory 3.27/39.5 GiB"). Pin it ON so a future default flip can't break us.
 ENV HF_HOME=/root/.cache/huggingface \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     TEXTSUM_SCRATCH_DIR=/scratch \
-    VLLM_USE_V1=0
+    VLLM_ENABLE_V1_MULTIPROCESSING=1
 
 COPY model /model
 WORKDIR /model

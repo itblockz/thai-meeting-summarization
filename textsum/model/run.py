@@ -31,11 +31,17 @@ H100 40 GB optimisations (vs the A100-targeted exp56 reference):
   - gpu_memory_utilization 0.92 (vs A100's 0.90): H100 firmware is
     stable enough at higher mem util. Stage A budget: 36.8 GB → 30 GB
     weights + ~5–6 GB FP8 KV. Stage B: 18 GB weights + ~17 GB FP8 KV.
-  - enforce_eager remains True: vllm 0.19.1's V1 engine still segfaults
-    inside Apptainer (verified at v15 bump attempt, job 5787048 —
-    FLASHINFER / TRITON_ATTN / FLEX_ATTENTION all SIGSEGV after model
-    load). `VLLM_USE_V1=0` (set in textsum.def) pins V0 in-process
-    workers. Eager mode in V0 costs ~0 latency at this batch size.
+  - vllm 0.19.1 is V1-ONLY (V0 was removed; `VLLM_USE_V1` is a dead env var).
+    The two-stage handoff DEPENDS on V1 multiprocessing being ON
+    (VLLM_ENABLE_V1_MULTIPROCESSING=1, set in the Dockerfile): each stage's
+    EngineCore is a child process, so `del engine` tears it down and the OS
+    reclaims its GPU memory before the next stage loads. In-process mode
+    leaves Stage A's weights resident → Stage B OOMs (job 5824350). Verified
+    end-to-end on A100 under apptainer --containall (job 5824281).
+  - enforce_eager remains True: keeps the torch.compile/CUDAGraph path out of
+    the picture inside Apptainer (the v15 V1-bump attempt, job 5787048, saw
+    FLASHINFER/TRITON_ATTN/FLEX_ATTENTION SIGSEGV with compile on). ~0 latency
+    cost at this batch size.
   - max_num_batched_tokens 16384: long-context (full doc ≈ 14K tok)
     throughput is bound by prefill chunking, not decode.
 
