@@ -41,13 +41,22 @@ ARCH knobs (same as exp77, confirmed by exp41/exp48):
   variant — chose off to stay comparable to exp73/74/76/77). First-run raw
   dump guards against leaked <think> text.
 
-FIT (open, verify first run): 35B total params, NVFP4-quantized experts
-(the bulk) + bf16 attention (ModelOpt excludes self_attn from NVFP4). Qwen3-
-MoE attention is GQA → cheaper KV than gemma-4's sliding-window layout, so
-full 32768 ctx should fit comfortably on a single A100-40GB (the gemma MoE
-exp77 already fit at 82,096 tok / 7.88x). util kept at 0.90 (exp77's
-sampling-OOM-safe value); raise toward 0.92-0.95 if the load log shows ample
-free GPU RAM. Never TP=2 (memory:prefer-single-gpu).
+ARCH (confirmed from the checkpoint, NOT gemma-like): this is
+Qwen3_5MoeForConditionalGeneration — a HYBRID linear-attention MoE.
+hf_quant_config quant_algo=MIXED_PRECISION: the experts/shared-experts are
+W4A16_NVFP4 (group_size 16, the bulk), but ATTENTION IS FP8, not bf16 — and
+3 of every 4 layers use `linear_attn` (Mamba-style state, no standard KV
+cache); only every 4th layer (3,7,…,39) is full `self_attn`. So the KV-cache
+footprint is tiny (10 attention layers, not 40) → full 32768 ctx should fit
+a single A100-40GB easily at 4-bit (cf. exp41/48 fit the 35B family at Int4
+~22.78 GiB). util kept at 0.90 (exp77's sampling-OOM-safe value); raise
+toward 0.92-0.95 if the load log shows ample free GPU RAM. Never TP=2
+(memory:prefer-single-gpu).
+
+⚠️ BIGGEST open risk is vLLM SUPPORT for this hybrid linear-attn MoE arch on
+the installed version (linear_attn = SSM-style state; needs a mamba/hybrid
+code path). If the engine rejects the arch or the linear-attn layers, that is
+the verdict — read the load log first.
 
 ⚠️ OPEN RISKS (first-run raw dump guards against silent failure):
 - NVFP4 *MoE* fused-expert dequant on A100/sm80 — exp76/exp77 confirmed the
@@ -218,16 +227,16 @@ def main():
     # path, Qwen3-MoE likely selects FLASH_ATTN on sm80; the strip-directive
     # override is backend-agnostic, so it is correct either way.)
     #
-    # ARCH: the 35B-A3B family resolves to a MULTIMODAL arch in vLLM (vision
-    # blocks loaded, idle for text-only chat) — exp41/exp48 (Qwen3.5-35B-A3B-
-    # GPTQ-Int4, the direct predecessor) BOTH needed limit_mm_per_prompt to
-    # stop vLLM reserving the encoder cache (was eating ~5 GiB). Keep it here.
-    # Fit: exp41/48 confirmed this family fits a single A100-40GB at 4-bit
-    # (Int4 was ~22.78 GiB weights); NVFP4 experts (bulk) + bf16 GQA attention
-    # are the same order → full 32768 KV expected to fit. util 0.90 (exp77's
-    # sampling-OOM-safe value; exp41/48 ran 0.95 fine on GPTQ — raise if the
-    # load log shows ample free RAM). If KV ever won't fit, trim MAX_MODEL_LEN
-    # — never TP=2.
+    # ARCH (confirmed from checkpoint): Qwen3_5MoeForConditionalGeneration, a
+    # MULTIMODAL (vision/video preprocessor present) HYBRID linear-attention
+    # MoE. exp41/exp48 (Qwen3.5-35B-A3B-GPTQ-Int4, predecessor) needed
+    # limit_mm_per_prompt to stop vLLM reserving the encoder cache (~5 GiB) —
+    # kept here. quant: experts=W4A16_NVFP4 (bulk), attention=FP8; 3/4 layers
+    # are linear_attn (SSM state, no KV), only every 4th is self_attn → tiny
+    # KV footprint → full 32768 ctx fits a single A100-40GB at 4-bit (exp41/48
+    # fit the 35B family at Int4 ~22.78 GiB). util 0.90 (exp77 sampling-OOM-
+    # safe; exp41/48 ran 0.95 on GPTQ — raise if load log shows free RAM).
+    # ⚠️ Real risk = vLLM support for this hybrid linear-attn arch; read log.
     # enable_prefix_caching=True reuses the doc-grouped few-shot+context
     # prefix (verify honored for this arch in the engine log).
     llm = LLM(model=MODEL_NAME, max_model_len=MAX_MODEL_LEN,
