@@ -23,12 +23,14 @@ tokens → 89% of queries (44/50 docs) truncated. NVFP4 packs weights to
 (needed 9.54 GiB) with NO truncation. See exp71/exp72 docstrings for the
 full FP8 dead-end trace.
 
-⚠️ OPEN RISK: NVFP4 natively targets Blackwell (sm100) FP4 tensor cores;
-vLLM has sm100 guards. On A100/sm80 vLLM falls back to a Marlin FP4 weight-
-only path (NvFp4LinearBackend.MARLIN, as exp73 confirmed for the RedHatAI
-build). The ModelOpt loader takes a *different* code path — if it lacks the
-sm80 Marlin fallback, engine init will error like the FP8-KV walls did. The
-first-run raw-output dump below also guards against silent gibberish.
+RESOLVED on first run (job 5824096): the ModelOpt *weight* loader is fine
+on A100/sm80 (quantization=modelopt_fp4 loaded). The wall was the *KV*
+cache: NVIDIA's hf_quant_config.json carries "kv_cache_quant_algo": "FP8"
+(RedHatAI's does not), so vLLM's default kv_cache_dtype="auto" resolved to
+fp8_e4m3 → sm80's reshape_and_cache Triton kernel has no fp8e4nv path
+("type fp8e4nv not supported in this architecture") and engine init died.
+Fix: force kv_cache_dtype="bfloat16" in LLM() (see the load comment below).
+The first-run raw-output dump also guards against silent gibberish.
 
 Compatibility (verified, vllm 0.19.1 / transformers 5.8.1):
 - Gemma4ForConditionalGeneration registered; chat template supports the
@@ -183,19 +185,32 @@ def main():
     # confirmed for the compressed-tensors NVFP4 build). Weights ~22 GB.
     # limit_mm_per_prompt skips the vision encoder cache budget.
     #
+    # ⚠️ kv_cache_dtype="bfloat16" is LOAD-BEARING here (vs exp73, which
+    # omitted it). Unlike RedHatAI's compressed-tensors build, NVIDIA's
+    # ModelOpt checkpoint bakes "kv_cache_quant_algo": "FP8" into
+    # hf_quant_config.json. With kv_cache_dtype left at the default "auto",
+    # vLLM's resolve_kv_cache_dtype_string() reads that and picks fp8_e4m3
+    # → the sm80 reshape_and_cache Triton kernel has no fp8e4nv path
+    # ("type fp8e4nv not supported in this architecture") and engine init
+    # dies (the exp71/72 FP8-KV wall, here triggered by the *KV* directive,
+    # not the weights). resolve_kv_cache_dtype_string returns any non-"auto"
+    # value verbatim, so passing "bfloat16" (a valid CacheDType) forces KV
+    # to bf16 and ignores the FP8 directive — making the nvidia build behave
+    # exactly like exp73's RedHatAI build (NVFP4 weights, bf16 KV).
+    #
     # Single-A100-40GB fit (identical KV math to exp73, quant-independent):
     # at util 0.92 (~36.8 GB budget − 22 weights − ~1.9 activations) ≈ 12.9
     # GiB KV. gemma-4's attention layout needs 9.54 GiB for the full 32768
     # context → fits with ~3 GiB headroom, MAX_MODEL_LEN=32768 with NO
-    # truncation. KV stays bf16 (no FP8-KV kernel issues here).
-    # enable_prefix_caching=True reuses the doc-grouped few-shot+context
-    # prefix across a doc's queries (exp63: honored for this arch, output-
-    # neutral under greedy).
+    # truncation. enable_prefix_caching=True reuses the doc-grouped few-shot
+    # +context prefix across a doc's queries (exp63: honored, output-neutral
+    # under greedy).
     llm = LLM(model=MODEL_NAME, max_model_len=MAX_MODEL_LEN,
               tensor_parallel_size=TP_SIZE,
               gpu_memory_utilization=0.92,
               enable_prefix_caching=True,
-              dtype="bfloat16", enforce_eager=True,
+              dtype="bfloat16", kv_cache_dtype="bfloat16",
+              enforce_eager=True,
               trust_remote_code=True,
               limit_mm_per_prompt={"image": 0, "video": 0})
     tokenizer = llm.get_tokenizer()
