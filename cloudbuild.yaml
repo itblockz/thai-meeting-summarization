@@ -97,9 +97,12 @@ availableSecrets:
       env: 'REGISTRY_PASSWORD'
 
 options:
-  # workspace HF cache (~26 GB) + docker context + image layers + the ~26 GB
-  # image exceed the default 100 GB once layers stack. 150 GB leaves headroom.
-  diskSizeGb: 150
+  # All on one disk: workspace hf-cache (~26 GB extracted) + the repacked
+  # hf-cache.tar (~26 GB) + docker layers (base+torch+vllm ~30 GB) + the
+  # COPY hf-cache image layer (~26 GB) + transient COPY scratch (~26 GB) peak
+  # to ~160 GB during step 4. 150 GB OOM'd ("no space left" mid-COPY, build
+  # 855a672a); 250 GB (matches v22) leaves headroom.
+  diskSizeGb: 250
   # HIGHCPU_8 = faster pip install + better network for the GCS sync. Bumping
   # machineType/disk above defaults exits the free 120 min/day tier (billed from
   # minute 1) — covered by the $300 trial credit.
