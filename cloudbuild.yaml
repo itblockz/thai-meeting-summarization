@@ -3,6 +3,16 @@
 # competition registry. GitHub Actions can't do this (runner disk ~14 GB);
 # LANTA podman is blocked (no /etc/subuid). GCB gives a configurable disk.
 #
+# PER-MODEL BUILD CACHE: GCB workers are ephemeral (no local layer cache), so
+# we push/pull a BuildKit registry cache (`type=registry,...,mode=max`) under a
+# stable `:buildcache` tag. mode=max exports EVERY intermediate stage — incl.
+# the isolated `dl-gemma` / `dl-awq` model-download stages — so a rebuild that
+# only touches model/run.py restores both ~20 GB model stages from cache
+# instead of re-pulling from HuggingFace. Changing one model's snapshot_download
+# line re-downloads only that stage; the other stays a cache hit. Needs the
+# `docker-container` buildx driver (the default `docker` driver can't export a
+# registry cache).
+#
 # Run:  gcloud builds submit --config cloudbuild.yaml .
 # (run from repo root D:\textsum — the build context below is textsum/)
 
@@ -15,11 +25,19 @@ steps:
       - -c
       - |
         set -euo pipefail
+        IMG=registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n
         echo "$$REGISTRY_PASSWORD" | docker login registry.ai.in.th \
           -u nontapat.jf0n --password-stdin
-        docker build \
-          -t registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v22 .
-        docker push registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n:v22
+        # buildx with the docker-container driver enables registry cache export.
+        docker buildx create --name textsum --driver docker-container --use \
+          2>/dev/null || docker buildx use textsum
+        docker buildx inspect --bootstrap
+        docker buildx build \
+          --cache-from type=registry,ref=$IMG:buildcache \
+          --cache-to   type=registry,ref=$IMG:buildcache,mode=max \
+          -t $IMG:v22 \
+          --push \
+          .
 
 availableSecrets:
   secretManager:
@@ -28,13 +46,14 @@ availableSecrets:
 
 options:
   # ~42 GB image + uncompressed layers (base ~10 GB, torch/vllm, gemma-NVFP4
-  # ~22 GB, 32B-AWQ ~18 GB) need well over the default 100 GB. 250 GB leaves headroom.
+  # ~22 GB, 32B-AWQ ~18 GB) + the registry cache export need well over the
+  # default 100 GB. 250 GB leaves headroom.
   diskSizeGb: 250
   # HIGHCPU_8 = faster pip install + better network throughput for the ~40 GB
   # HF pull. Bumping machineType/disk above defaults exits the free 120 min/day
   # tier (billed from minute 1) — covered by the $300 trial credit.
   machineType: 'E2_HIGHCPU_8'
 
-# Default GCB timeout is 10 min; this build is ~1-2 h (dominated by the HF
-# weight download). 4 h ceiling so a slow pull doesn't get killed.
+# Default GCB timeout is 10 min; the FIRST build is ~1-2 h (HF download +
+# cache export). Cached rebuilds (run.py-only) are minutes. 4 h ceiling.
 timeout: 14400s
