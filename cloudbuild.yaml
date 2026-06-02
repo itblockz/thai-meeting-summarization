@@ -22,7 +22,7 @@
 # (run from repo root D:\textsum — the docker build context is textsum/)
 
 substitutions:
-  _HF_BUCKET: 'gs://CHANGE-ME-textsum-hf/hf'   # GCS path holding the HF cache
+  _HF_BUCKET: 'gs://textsum-hf-cache-437476422274/hf'   # GCS path holding the HF cache (asia-southeast1)
 
 steps:
   # 1. Seed the workspace HF cache from GCS (first run: bucket empty → no-op).
