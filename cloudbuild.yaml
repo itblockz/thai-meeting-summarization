@@ -25,7 +25,13 @@ substitutions:
   _HF_BUCKET: 'gs://textsum-hf-cache-437476422274/hf'   # GCS path holding the HF cache (asia-southeast1)
 
 steps:
-  # 1. Seed the workspace HF cache from GCS (first run: bucket empty → no-op).
+  # 1. Restore the HF cache from a single tar in GCS. The cache is stored as a
+  #    TAR (not an rsync'd tree) because the HF layout is blobs/ + snapshots/
+  #    symlinks; GCS can't hold symlinks, so `gsutil rsync` dereferences them and
+  #    stores every file TWICE (blobs + resolved snapshots ≈ 2× size). tar keeps
+  #    the symlinks intact → one ~40 GB object, no duplication, and a single
+  #    large transfer is faster than thousands of small blob files. First build:
+  #    no tar yet → start empty.
   - name: 'gcr.io/cloud-builders/gsutil'
     entrypoint: 'bash'
     args:
@@ -33,10 +39,15 @@ steps:
       - |
         set -euo pipefail
         mkdir -p textsum/hf-cache
-        gsutil -m rsync -r "${_HF_BUCKET}" textsum/hf-cache || \
-          echo "no GCS cache yet (first build) — will download all models"
+        if gsutil -q stat "${_HF_BUCKET}/hf-cache.tar"; then
+          gsutil -m cp "${_HF_BUCKET}/hf-cache.tar" /workspace/hf-cache.tar
+          tar -xf /workspace/hf-cache.tar -C textsum
+          echo "restored HF cache from tar"
+        else
+          echo "no cache tar yet (first build) — will download all models"
+        fi
 
-  # 2. Download ONLY the models not already present (seeded by step 1). The
+  # 2. Download ONLY the models not already present (restored by step 1). The
   #    model list lives here; keep it in sync with run.py's LLM_MODEL_STAGE_*
   #    defaults. snapshot_download skips repos already complete in the cache.
   - name: 'python:3.11-slim'
@@ -51,9 +62,18 @@ steps:
           snapshot_download('RedHatAI/gemma-4-31B-it-NVFP4'); \
           snapshot_download('Qwen/Qwen3-32B-AWQ')"
 
-  # 3. Persist any newly downloaded weights back to GCS (no -d → only adds).
+  # 3. Repack the cache as a single tar (symlinks preserved → no blob/snapshot
+  #    duplication) and upload, replacing the previous tar. tar defaults to
+  #    storing symlinks AS symlinks (no -h), so the archive is ~40 GB not ~80.
   - name: 'gcr.io/cloud-builders/gsutil'
-    args: ['-m', 'rsync', '-r', 'textsum/hf-cache', '${_HF_BUCKET}']
+    entrypoint: 'bash'
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        tar -cf /workspace/hf-cache.tar -C textsum hf-cache
+        gsutil -m cp /workspace/hf-cache.tar "${_HF_BUCKET}/hf-cache.tar"
+        echo "uploaded cache tar: $(du -h /workspace/hf-cache.tar | cut -f1)"
 
   # 4. Build the image (weights come from the context via COPY) + push.
   - name: 'gcr.io/cloud-builders/docker'
