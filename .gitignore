@@ -15,3 +15,4 @@ eval_retrieval/cache/*.json
 prompt_lab/dev_sample.json
 exp_hybrid_*/submission.csv
 hybrid_*/submission.csv
+model_override/
