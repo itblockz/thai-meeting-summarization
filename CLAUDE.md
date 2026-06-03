@@ -78,11 +78,12 @@ sbatch textsum/submit_apptainer_test_v8.sh            # binds mirror benchmark b
 
 **Generation (E5 self-citation):** paragraphs are passed as numbered `[1..K]` context to vLLM; the model answers in Thai and cites paragraphs as `[อ้างอิง: X]` → cited paras become `refs`. Context-first prompt order lets vLLM `enable_prefix_caching` reuse the ~14K-token doc prefix across queries of the same doc.
 
-### Current best — `exp56` (0.7215 leak-free), two-stage LLM hybrid
-- **Stage A** (ref-picker): Qwen3.6-27B-FP8 + **V10_factual** prompt + exp38 multi-ref shots, on the full doc. Produces sharp refs (IoU 0.8006). Refs ONLY.
-- **Stage B** (answer-writer): Qwen3-32B-AWQ + exp38 E5 prompt + hint `**โดยเน้นย่อหน้าหมายเลข [X, Y, Z] เป็นข้อมูลหลัก**` pointing at Stage A's selection, on the full doc.
-- Final **refs FIXED to Stage A**; abstractive from Stage B.
-- Both models can't coexist on one A100-40GB → `del llm; gc.collect(); torch.cuda.empty_cache()` between stages. Not yet containerized (needs ~50 GB SIF with both weights).
+### Current best — `exp86` (0.7235 leak-free), two-stage LLM hybrid (base exp81)
+- **Stage A** (ref-picker): `nvidia/Gemma-4-26B-A4B-NVFP4` (exp77) + **V10_factual** prompt + exp38 multi-ref shots, full doc. Sharp refs (IoU **0.8155**) → refs ONLY, and the ref-INDEX hint for Stage B.
+- **Stage B** (answer-writer): Qwen3-32B-AWQ + **exp37 E5 prompt + exp37 single-ref shots** + exp81 hint line `ย่อหน้าที่เกี่ยวข้องเบื้องต้น: [X, Y]`, full doc. RougeL 0.4913 / SS 0.8631.
+- Final **refs FIXED to Stage A** (combo `ansB_refA`); abstractive from Stage B. The grid emits all 4 `ans{A,B}×ref{A,B}` combos; `ansA_refA` reproduces exp77 (IoU 0.8155 ≈ 0.8165) as a sanity check.
+- Beats exp56 (prev best 0.7215) **+0.0020** and exp81 (0.7207) +0.0028 — the win is Stage A's NVFP4 refs (IoU 0.8155 vs exp56's 27B-FP8 0.7982), only slightly offset by ansB RougeL (0.4913 vs exp56's 0.4940). Realized 0.7235 vs the invalid column-merge ceiling 0.7243 → ref-hinting costs only −0.0008. Both models load one at a time on a single A100-40GB (`del llm; gc.collect(); torch.cuda.empty_cache()`). Not yet containerized (~40 GB SIF, both weights).
+- **Previous best `exp56` (0.7215):** Stage A Qwen3.6-27B-FP8 + V10_factual (refs IoU 0.8006) → Stage B 32B-AWQ + exp38 E5 + hint `**โดยเน้นย่อหน้าหมายเลข [X, Y, Z] เป็นข้อมูลหลัก**`, refs fixed to Stage A.
 
 ### Production — image **v16** (`textsum/model/run.py`), single-model port of exp42 (0.7087)
 Qwen3-30B-A3B-Instruct-2507-FP8 (MoE, ~3B active) + exp38 E5 prompt + 2-shot few-shot (single-ref shot1 + multi-ref shot2 = Q0746) + `enforce_eager=True`. A3B follows the citation format reliably without exp38's fallback queue.
@@ -122,17 +123,18 @@ Qwen3-30B-A3B-Instruct-2507-FP8 (MoE, ~3B active) + exp38 E5 prompt + 2-shot few
 | exp78 | exp77 pipeline + model → **nvidia/Qwen3.6-35B-A3B-NVFP4** (hybrid linear-attn MoE) — INFEASIBLE on 1×A100-40GB (`modelopt_mixed` quant hard-gated to sm89+) | — |
 | exp79 † | exp78 pipeline + model → **unsloth/Qwen3.6-35B-A3B-NVFP4** (compressed-tensors pure NVFP4 — runs on A100; RougeL 0.4430 / SS 0.8163 / IoU 0.8042) | 0.6832 |
 | exp80–85 † | **A3B↔gemma combo-matrix grid** (hint-type × direction × 4 answer×ref combos): best = exp81 `s2ans` (gemma cite cold → A3B answer+cite hinted by gemma's REF indices) = **0.7207**, ties exp56. *(exp80/81 here REPLACE the earlier gemma-Stage-A run, 0.7191/0.7188, preserved at commit 30cae9c.)* | **0.7207** |
+| **exp86** ⭐⭐⭐ | best-of-both grid (base exp81): **exp77 NVFP4 gemma-26B refs → exp37 32B-AWQ answer**, refs fixed (`ansB_refA`) — breaks the ~0.721 two-model ceiling | **0.7235** |
 
 **Score breakdown (leak-free except baseline/exp03):**
 
-|          | exp03  | exp22  | exp30  | exp37  | exp38  | exp59  | **exp56** |
-|----------|--------|--------|--------|--------|--------|--------|-----------|
-| RougeL   | 0.3928 | 0.4454 | 0.4584 | 0.4939 | 0.4935 | 0.4899 | —         |
-| SS-score | 0.8096 | 0.8384 | 0.8467 | 0.8626 | 0.8619 | 0.8624 | —         |
-| IoU      | 0.6190 | 0.6575 | 0.6844 | 0.6669 | 0.6906 | 0.8006 | 0.8006    |
-| **Composite** | **0.6256** | **0.6647** | **0.6783** | **0.6944** | **0.6987** | **0.7196** | **0.7215** |
+|          | exp03  | exp22  | exp30  | exp37  | exp38  | exp59  | exp56  | **exp86** |
+|----------|--------|--------|--------|--------|--------|--------|--------|-----------|
+| RougeL   | 0.3928 | 0.4454 | 0.4584 | 0.4939 | 0.4935 | 0.4899 | 0.4940 | 0.4913    |
+| SS-score | 0.8096 | 0.8384 | 0.8467 | 0.8626 | 0.8619 | 0.8624 | 0.8642 | 0.8631    |
+| IoU      | 0.6190 | 0.6575 | 0.6844 | 0.6669 | 0.6906 | 0.8006 | 0.8006 | 0.8155    |
+| **Composite** | **0.6256** | **0.6647** | **0.6783** | **0.6944** | **0.6987** | **0.7196** | **0.7215** | **0.7235** |
 
-exp03 on the leak-free 1218 subset = 0.6270, so exp56 is **+0.0945** over exp03 and **+0.0228** over the best single-stage (exp38). exp56 IoU = exp59 (both fix refs to the same Stage A); the +0.0019 is 32B-AWQ Stage B's slightly better answer quality.
+exp03 on the leak-free 1218 subset = 0.6270, so exp56 is **+0.0945** over exp03 and **+0.0228** over the best single-stage (exp38). exp56 IoU = exp59 (both fix refs to the same Stage A); the +0.0019 is 32B-AWQ Stage B's slightly better answer quality. **exp86** (NEW best, 0.7235) swaps exp56's Stage-A ref-picker to exp77's NVFP4 gemma-26B → IoU 0.8006→**0.8155** (+0.0149), and uses exp37's E5 prompt for the 32B-AWQ Stage B — net **+0.0020** over exp56 (the +0.0149 IoU × 0.20 outweighs ansB's RougeL/SS dip).
 
 ### Key experiment findings (verdicts)
 - **Few-shot (E7, exp06–exp16):** 2-shot is the inverted-U peak; dynamic k-NN few-shot is the most *reproducible* (+0.0052 on full 1239). exp08's hand-picked pair is the chosen production few-shot.
@@ -142,6 +144,7 @@ exp03 on the leak-free 1218 subset = 0.6270, so exp56 is **+0.0945** over exp03 
 - **Hybrid pipelines (exp55–66):** decoupling refs (sharp via V10_factual+27B-FP8) from answers (strong via AWQ/A3B) is the win. **Pipeline 2 (full doc + hint, refs fixed) beats filtered-context (pipeline 1) by +0.012.** 32B-AWQ Stage B narrowly beats A3B (+0.0019). IoU breaks the single-stage citation ceiling: 0.6906 → 0.8006.
 - **gemma-4-31B on this task (exp71–73):** the model swap (exp51 pipeline, V10_factual + exp38 shots, single A100-40GB) lands at **0.7140 leak-free with the NVFP4 quant (exp73, +0.0030 over exp51, +0.0053 over v16/exp42)** — RougeL 0.4790 / SS 0.8546 / **IoU 0.8091**. The standout is IoU: a *single* model matching the exp56/exp59 *hybrid* citation quality (0.8006), because gemma-4 follows V10_factual's citation instruction near-perfectly (99.7% tag rate, 4/1239 fallbacks vs exp38's 153). Answer quality (RougeL/SS) is a touch below the A3B line, but the 0.20-weighted IoU more than compensates. **The two FP8 checkpoints (exp71 FP8-Dynamic, exp72 FP8-block) are infeasible on a single A100-40GB** for this full-doc task — see gotchas. exp71/72 code is committed but unrun; a real Dynamic-vs-block comparison needs TP=2. The **MoE** sibling gemma-4-26B-A4B-FP8 *does* fit a single A100 (exp74) — FP8 is only infeasible for the *dense* 31B — but its answer quality loses (see "What does NOT help"). The **NVFP4 *publisher* matters**: exp73's working build is **RedHatAI** (compressed-tensors `nvfp4-pack-quantized`, `config_groups.targets:['Linear']` → quantizes the decoder's self_attn too → 18.54 GiB load). The **nvidia/NVIDIA ModelOpt** build (exp75) `exclude_modules` *all 60* `language_model…self_attn*` → attention stays bf16 → 29.96 GiB load, +11.4 GiB, which **doesn't fit a single A100-40GB** (see "What does NOT help"). For the *dense* 31B, use the RedHatAI checkpoint, not NVIDIA's.
 - **NVFP4 publisher REVERSES on the MoE (exp76/exp77):** both NVFP4 26B-A4B builds fit a single A100 (quantized experts dominate the footprint), and here `nvidia/Gemma-4-26B-A4B-NVFP4` (**0.6982**) *beats* `RedHatAI/gemma-4-26B-A4B-it-NVFP4` (**0.6882**) by **+0.0100** — the exact thing that doomed the dense build, ModelOpt keeping `self_attn` in **bf16**, is a *quality advantage* on the MoE (RougeL/SS/IoU all higher: 0.4524/0.8367/0.8165 vs 0.4436/0.8257/0.8070). So: **dense ≥30B → RedHatAI (ModelOpt won't fit); MoE → ModelOpt is both feasible and slightly better.** exp77 (0.6982) ≈ the FP8 MoE exp74 (0.6970); neither beats dense exp73 (0.7140) — the ~4B-active answer-quality ceiling holds (cf. exp74). The NVFP4 *fused-MoE* runs on sm80 via the `MARLIN NvFp4 MoE backend` (FlashInfer/CUTLASS options need Blackwell). Two MoE-specific traps fixed (see "What does NOT help"): the `TRITON_ATTN` MoE path *rejects* the exp75 `kv_cache_dtype="bfloat16"` dense fix (`AssertionError: …got bfloat16`; assert ∈ {"auto","fp8*"}) → must strip the FP8-KV directive from the config so `"auto"` resolves to bf16; and util 0.95 OOM'd the batched frequency-penalty buffer at first decode → use **util 0.90**.
+- **exp86 — NVFP4 gemma as the hybrid Stage-A ref-picker BREAKS the ceiling (NEW BEST 0.7235).** exp80–85 concluded the two-model hybrid caps at ~0.721, but that verdict assumed an **A3B Stage-B answer-writer** (~4B-active ceiling). exp86 = exp81's 4-combo grid with both stages upgraded: Stage A = exp77 `nvidia/Gemma-4-26B-A4B-NVFP4` (the NVFP4 *publisher*, IoU 0.8155 — reproduces exp77's 0.8165) picks refs; Stage B = exp37 `Qwen3-32B-AWQ` + E5 prompt + exp37 single-ref shots writes the answer hinted by Stage A's ref *indices* (exp81 hint line). Best cell **`ansB_refA` = 0.7235** (RougeL 0.4913 / SS 0.8631 / IoU 0.8155), +0.0020 over exp56. The win: NVFP4 refs (0.8155) clear 27B-FP8's 0.7982 by +0.0173, and a strong 32B-AWQ (not A3B) Stage-B keeps the answer near exp37's. Confirms `refA`>`refB` (fixed-refs/pipeline-2 still beats free-refs: 0.7235>0.7215). So the hybrid lever is **both** a higher-IoU Stage-A *and* a 32B-AWQ Stage-B — gemma-Stage-A was never the problem; A3B-Stage-B was. The earlier "gemma Stage-A is a wash" (exp80/81, A3B answer) is superseded.
 
 ### What does NOT help (verified — don't retry without new evidence)
 - **Reranker swaps** Qwen3-Reranker-0.6B/4B, jina-reranker-v3: bge-reranker-v2-m3 already ≥ them on MIRACL Thai. Qwen3-Reranker-8B lifts every retrieval metric but only +0.0016 composite (exp23) — gold already in top-5 ≥91%.
