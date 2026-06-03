@@ -1,29 +1,16 @@
 """
-exp82 — A3B answer + gemma ref, gemma hinted by A3B's answer.
+exp82 — S1=A3B → S2=gemma (hint = ANSWER text only); score ALL 4 combos.
 
-Shared pipeline with exp83 (they differ ONLY in which model's answer becomes
-the final abstractive):
+Part of the 3×2 hint-type × direction grid (exp80–85). This cell:
+  hint = preliminary answer text only (exp82/83), direction A3B→gemma.
 
-Stage 1: A3B-Instruct-2507-FP8 does NORMAL V10 (answer + cite) on the full doc.
-         Keep its answer (refs discarded).
-Stage 2: gemma-4-26B-A4B-it-FP8-Dynamic does NORMAL V10 (answer + cite) on the
-         full doc, with A3B's answer added as a "คำตอบเบื้องต้น" hint. Both
-         models stay in the exact V10 groove they were measured in.
+Stage 1: A3B-Instruct-2507-FP8 does NORMAL V10 (answer + cite) → (S1 ans, S1 ref).
+Stage 2: gemma-4-26B-A4B-it-FP8-Dynamic does NORMAL V10, its prompt carrying
+         ONLY A3B's answer ("คำตอบเบื้องต้น: …") — no ref indices →
+         (S2 ans, S2 ref).
 
-exp82 (this): final abstractive = A3B's answer, final refs = gemma's cite.
-exp83:        final abstractive = gemma's answer, final refs = gemma's cite
-              (both taken from gemma).
-
-WHY: gemma has the record single-model citation (exp74 IoU 0.8139) but weak
-~4B-active answers; A3B writes strong answers (exp51 V10 0.7110). This pairs
-A3B's answer with gemma's cite, gemma hinted by A3B's answer so its citation
-aligns to the same content (may push IoU past exp80's cold-pick 0.8074). The
-exp82-vs-exp83 A/B isolates one question: is A3B's original answer better than
-gemma's hinted rewrite? (Expected yes — gemma's active-param ceiling — but the
-hint anchors gemma to A3B's good answer, so it's worth measuring.)
-
-Decision rule: accept if leak-free composite >= exp59 (0.7196); prize is
-beating exp56 (0.7215) if gemma's hinted IoU > 27B-FP8's 0.8006.
+Emits all 4 answer×ref combos (s1ans_s1ref / s1ans_s2ref / s2ans_s1ref /
+s2ans_s2ref), scored full + leak-free. exp83 is the model-swapped twin.
 """
 from pathlib import Path
 import os
@@ -41,8 +28,10 @@ PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
 
 MAX_NEW_TOKENS = 1024
 MAX_MODEL_LEN  = int(os.environ.get("MAX_MODEL_LEN", "32768"))
-MODEL_ANSWER = os.environ.get("ANSWER_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8")
-MODEL_REFS   = os.environ.get("REFS_MODEL",   "RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic")
+MODEL_STAGE1 = os.environ.get("STAGE1_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8")
+MODEL_STAGE2 = os.environ.get("STAGE2_MODEL", "RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic")
+STAGE1_UTIL = float(os.environ.get("STAGE1_UTIL", "0.90"))  # A3B
+STAGE2_UTIL = float(os.environ.get("STAGE2_UTIL", "0.95"))  # gemma
 
 SYSTEM_MSG = (
     "คุณเป็นผู้ช่วยสรุปเอกสารภาษาไทย "
@@ -93,7 +82,7 @@ def filter_valid_paragraphs(paragraphs):
 
 
 def build_prompt_v10(query, paras):
-    """V10_factual — normal answer+cite prompt (Stage 1 A3B)."""
+    """V10_factual — normal answer+cite prompt (Stage 1)."""
     context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
     return (
         f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
@@ -106,7 +95,7 @@ def build_prompt_v10(query, paras):
 
 
 def build_prompt_v10_hinted(query, paras, prelim):
-    """Normal V10 + A3B's answer added as a 'คำตอบเบื้องต้น' hint (Stage 2 gemma)."""
+    """Normal V10 + Stage 1's ANSWER text only as the hint (Stage 2)."""
     context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
     return (
         f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
@@ -120,7 +109,7 @@ def build_prompt_v10_hinted(query, paras, prelim):
     )
 
 
-def build_messages_answer(query, paras):
+def build_messages_stage1(query, paras):
     return [
         {"role": "system", "content": SYSTEM_MSG},
         {"role": "user",      "content": build_prompt_v10(_SHOT1_QUERY, _SHOT1_PARAS)},
@@ -131,7 +120,7 @@ def build_messages_answer(query, paras):
     ]
 
 
-def build_messages_hinted(query, paras, prelim):
+def build_messages_stage2(query, paras, prelim):
     return [
         {"role": "system", "content": SYSTEM_MSG},
         {"role": "user",      "content": build_prompt_v10_hinted(_SHOT1_QUERY, _SHOT1_PARAS, _SHOT1_ANSWER_TEXT)},
@@ -176,74 +165,16 @@ def run_stage(model_name, model_kwargs, messages_list, gpu_mem_util=0.90):
     return raws
 
 
-def main():
-    data = load_data(TEST_DIR)
-    doc_index = {doc["doc_id"]: doc["paragraphs"] for doc in data["docs"]}
-    queries = data["queries"]
-    n = len(queries)
-    print(f"exp82 (A3B answer + gemma ref, gemma hinted by A3B answer): "
-          f"{n} queries, {len(doc_index)} docs", flush=True)
-
-    doc_paras = {}
-    for doc_id, paragraphs in doc_index.items():
-        doc_paras[doc_id] = filter_valid_paragraphs(paragraphs)
-
-    # ----- Stage 1: A3B normal V10 (keep its answer) -----
-    print(f"\n=== Stage 1: {MODEL_ANSWER} → answer (final abstractive) ===", flush=True)
-    items = []
-    for i, query in enumerate(queries):
-        benchmark_lib(i)
-        valid = doc_paras.get(query["doc_id"], [])
-        q_text = query["query"]
-        gen_pids  = [p["para_id"] for p in valid]
-        gen_texts = [p["text"]    for p in valid]
-        msgs = build_messages_answer(q_text, gen_texts) if valid \
-            else [{"role": "user", "content": q_text}]
-        items.append((query["ID"], gen_pids, gen_texts, msgs, q_text))
-
-    a3b_kwargs = dict(dtype="bfloat16", trust_remote_code=True,
-                      limit_mm_per_prompt={"image": 0, "video": 0})
-    raws_answer = run_stage(MODEL_ANSWER, a3b_kwargs,
-                            [it[3] for it in items], gpu_mem_util=0.90)
-
-    answers = {}
-    empty_answers = 0
-    for it, raw in zip(items, raws_answer):
+def decode_outputs(items, raws):
+    """Parse each raw output into (answer, ref_para_ids) keyed by query ID."""
+    ans, refs = {}, {}
+    empty = 0
+    for it, raw in zip(items, raws):
         qid, gen_pids, gen_texts, _, q_text = it
         answer = split_answer(raw)
         if not answer:
             answer = gen_texts[0] if gen_texts else q_text
-            empty_answers += 1
-        answers[qid] = answer
-    print(f"Stage 1 wrote {len(answers)} answers; empty_answers={empty_answers}",
-          flush=True)
-    del raws_answer
-
-    # ----- Stage 2: gemma normal V10, hinted by A3B's answer (keep its cite) -----
-    print(f"\n=== Stage 2: {MODEL_REFS} → answer+cite hinted by A3B answer (keep cite) ===", flush=True)
-    msgs_hinted = []
-    for it in items:
-        qid, gen_pids, gen_texts, _, q_text = it
-        if gen_pids:
-            msgs_hinted.append(build_messages_hinted(q_text, gen_texts, answers[qid]))
-        else:
-            msgs_hinted.append([{"role": "user", "content": q_text}])
-
-    gemma_kwargs = dict(dtype="bfloat16", trust_remote_code=True,
-                        enable_prefix_caching=True,
-                        limit_mm_per_prompt={"image": 0, "video": 0})
-    raws_refs = run_stage(MODEL_REFS, gemma_kwargs, msgs_hinted, gpu_mem_util=0.95)
-
-    # FIRST-RUN SANITY: dump a few raw gemma outputs (answer+cite; answer discarded here).
-    for it, raw in list(zip(items, raws_refs))[:3]:
-        print(f"[gemma {it[0]}] {raw[:200]!r}", flush=True)
-
-    cite_re = re.compile(r'\[อ้างอิง[:\s]+[0-9,\s]+\]')
-    results = []
-    n_explicit = 0
-    ref_counts = []
-    for it, raw in zip(items, raws_refs):
-        qid, gen_pids, gen_texts, _, q_text = it
+            empty += 1
         cited_idx = parse_citation(raw, len(gen_pids))
         if gen_pids:
             ref_ids = [gen_pids[j] for j in cited_idx if j < len(gen_pids)]
@@ -251,22 +182,90 @@ def main():
                 ref_ids = [gen_pids[0]]
         else:
             ref_ids = []
-        if cite_re.search(raw):
-            n_explicit += 1
-        ref_counts.append(len(ref_ids))
-        # abstractive from A3B (Stage 1); refs from gemma (Stage 2)
-        results.append({"ID": qid, "abstractive": answers[qid],
-                        "refs": ",".join(ref_ids)})
-    print(f"gemma cite: {n_explicit}/{len(results)} emitted tag, "
-          f"avg refs/query={sum(ref_counts)/len(ref_counts):.2f}", flush=True)
+        ans[qid] = answer
+        refs[qid] = ref_ids
+    return ans, refs, empty
 
-    out_path = Path(RESULT_DIR) / "submission.csv"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
+
+def write_submission(path, order, answers, refs):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["ID", "abstractive", "refs"])
         writer.writeheader()
-        writer.writerows(results)
-    print(f"Written {len(results)} rows to {out_path}", flush=True)
+        for qid in order:
+            writer.writerow({"ID": qid, "abstractive": answers[qid],
+                             "refs": ",".join(refs[qid])})
+
+
+def main():
+    data = load_data(TEST_DIR)
+    doc_index = {doc["doc_id"]: doc["paragraphs"] for doc in data["docs"]}
+    queries = data["queries"]
+    n = len(queries)
+    print(f"exp82: S1={MODEL_STAGE1} → S2={MODEL_STAGE2} (hint=answer only); "
+          f"emit 4 combos. {n} queries, {len(doc_index)} docs", flush=True)
+
+    doc_paras = {}
+    for doc_id, paragraphs in doc_index.items():
+        doc_paras[doc_id] = filter_valid_paragraphs(paragraphs)
+
+    # ----- Stage 1: normal V10 → (answer, ref) -----
+    print(f"\n=== Stage 1: {MODEL_STAGE1} → answer + ref ===", flush=True)
+    items = []
+    for i, query in enumerate(queries):
+        benchmark_lib(i)
+        valid = doc_paras.get(query["doc_id"], [])
+        q_text = query["query"]
+        gen_pids  = [p["para_id"] for p in valid]
+        gen_texts = [p["text"]    for p in valid]
+        msgs = build_messages_stage1(q_text, gen_texts) if valid \
+            else [{"role": "user", "content": q_text}]
+        items.append((query["ID"], gen_pids, gen_texts, msgs, q_text))
+
+    s1_kwargs = dict(dtype="bfloat16", trust_remote_code=True,
+                     enable_prefix_caching=True,
+                     limit_mm_per_prompt={"image": 0, "video": 0})
+    raws_s1 = run_stage(MODEL_STAGE1, s1_kwargs,
+                        [it[3] for it in items], gpu_mem_util=STAGE1_UTIL)
+    s1_ans, s1_ref, empty1 = decode_outputs(items, raws_s1)
+    print(f"Stage 1: {len(s1_ans)} answers, empty={empty1}, "
+          f"avg refs={sum(len(r) for r in s1_ref.values())/len(s1_ref):.2f}", flush=True)
+    del raws_s1
+
+    # ----- Stage 2: normal V10 hinted by S1's ANSWER → (answer, ref) -----
+    print(f"\n=== Stage 2: {MODEL_STAGE2} → answer + ref (hinted by S1 answer) ===", flush=True)
+    msgs_s2 = []
+    for it in items:
+        qid, gen_pids, gen_texts, _, q_text = it
+        if gen_pids:
+            msgs_s2.append(build_messages_stage2(q_text, gen_texts, s1_ans[qid]))
+        else:
+            msgs_s2.append([{"role": "user", "content": q_text}])
+
+    s2_kwargs = dict(dtype="bfloat16", trust_remote_code=True,
+                     enable_prefix_caching=True,
+                     limit_mm_per_prompt={"image": 0, "video": 0})
+    raws_s2 = run_stage(MODEL_STAGE2, s2_kwargs, msgs_s2, gpu_mem_util=STAGE2_UTIL)
+    for it, raw in list(zip(items, raws_s2))[:3]:
+        print(f"[S2 {it[0]}] {raw[:200]!r}", flush=True)
+    s2_ans, s2_ref, empty2 = decode_outputs(items, raws_s2)
+    print(f"Stage 2: {len(s2_ans)} answers, empty={empty2}, "
+          f"avg refs={sum(len(r) for r in s2_ref.values())/len(s2_ref):.2f}", flush=True)
+    del raws_s2
+
+    # ----- Emit all 4 answer×ref combos -----
+    order = [it[0] for it in items]
+    combos = {
+        "s1ans_s1ref": (s1_ans, s1_ref),
+        "s1ans_s2ref": (s1_ans, s2_ref),
+        "s2ans_s1ref": (s2_ans, s1_ref),
+        "s2ans_s2ref": (s2_ans, s2_ref),
+    }
+    print(f"\nLegend: S1={MODEL_STAGE1}, S2={MODEL_STAGE2}", flush=True)
+    for name, (ans, refs) in combos.items():
+        out_path = Path(RESULT_DIR) / name / "submission.csv"
+        write_submission(out_path, order, ans, refs)
+        print(f"Written combo {name} → {out_path}", flush=True)
     return n
 
 

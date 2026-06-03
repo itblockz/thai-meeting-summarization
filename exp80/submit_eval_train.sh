@@ -31,13 +31,16 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 mkdir -p "$RESULT_DIR" "$PROJECT/logs"
 
-echo "=== exp80: pipeline 2 — Stage A=gemma-4-26B-A4B-FP8 refs, A3B writes answer, refs fixed ==="
+echo "=== exp80: S1=A3B -> S2=gemma (hint=ref only), emit 4 combos ==="
 cd "$PROJECT/exp80"
 python3 run.py
 
-echo "=== exp80: scoring (full 1239) ==="
-python3 "$PROJECT/textsum/eval_train/score.py" "$RESULT_DIR/submission.csv"
-
-echo "=== exp80: leak-free scoring (excl. doc_050) ==="
-cd "$PROJECT/textsum/eval_train"
-python3 score_heldout.py "$RESULT_DIR/submission.csv" doc_050
+for combo in s1ans_s1ref s1ans_s2ref s2ans_s1ref s2ans_s2ref; do
+  echo ""
+  echo "######## combo $combo : scoring (full 1239) ########"
+  python3 "$PROJECT/textsum/eval_train/score.py" "$RESULT_DIR/$combo/submission.csv"
+  echo "######## combo $combo : leak-free (excl. doc_050) ########"
+  cd "$PROJECT/textsum/eval_train"
+  python3 score_heldout.py "$RESULT_DIR/$combo/submission.csv" doc_050
+  cd "$PROJECT/exp80"
+done

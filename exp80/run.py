@@ -1,27 +1,16 @@
 """
-exp80 — exp59 pipeline (Pipeline 2, hint, refs FIXED) with Stage A's
-ref-picker swapped from Qwen3.6-27B-FP8 → RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic
-(the exp74 model). Stage B unchanged (A3B-Instruct-2507-FP8).
+exp80 — S1=A3B → S2=gemma (hint = REF indices only); score ALL 4 combos.
 
-Stage A: gemma-4-26B-A4B-it-FP8-Dynamic picks refs on full doc (V10_factual).
-Stage B: A3B-Instruct-2507-FP8 writes answer on FULL doc + hint
-         "เน้นย่อหน้า [X, Y, Z] เป็นข้อมูลหลัก" (Stage A's 1-based
-         indices). Stage B's emitted citations DISCARDED — refs FIXED
-         to Stage A's selection.
+Part of the 3×2 hint-type × direction grid (exp80–85). This cell:
+  hint = ref indices only (exp80/81), direction A3B→gemma.
 
-WHY swap Stage A: exp74 showed gemma-4-26B-A4B's near-perfect V10_factual
-citation (single-stage IoU 0.8139, the best single-model number on record,
-99.9% tag rate) — but its ~4B-active answer quality sank exp74 to 0.6970.
-The hybrid decouples the two: let gemma do what it's best at (refs) and let
-A3B write the answer. The bet is gemma's citation > 27B-FP8's (exp56/59
-Stage A IoU 0.8006) without paying gemma's answer-quality penalty.
+Stage 1: A3B-Instruct-2507-FP8 does NORMAL V10 (answer + cite) → (S1 ans, S1 ref).
+Stage 2: gemma-4-26B-A4B-it-FP8-Dynamic does NORMAL V10, its prompt carrying
+         ONLY A3B's ref indices ("ย่อหน้าที่เกี่ยวข้องเบื้องต้น: [X, Y]") — no
+         preliminary answer text → (S2 ans, S2 ref).
 
-Memory / infra (per exp74): gemma FP8-Dynamic ~26 GB weights on A100-40GB;
-needs util 0.95 + bf16 KV (NO kv_cache_dtype="fp8" — no sm80 e4m3 kernel)
-to fit the full 32768 context with no truncation. Both stages still load
-separately (del llm; gc; empty_cache between them), so each gets the whole
-GPU. Stage A runs at util 0.95 (gemma, claw back KV the heavier FP8 weights
-cost); Stage B keeps util 0.90 (A3B, unchanged from exp59).
+Emits all 4 answer×ref combos (s1ans_s1ref / s1ans_s2ref / s2ans_s1ref /
+s2ans_s2ref), scored full + leak-free. exp81 is the model-swapped twin.
 """
 from pathlib import Path
 import os
@@ -39,8 +28,10 @@ PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
 
 MAX_NEW_TOKENS = 1024
 MAX_MODEL_LEN  = int(os.environ.get("MAX_MODEL_LEN", "32768"))
-MODEL_STAGE_A = os.environ.get("STAGE_A_MODEL", "RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic")
-MODEL_STAGE_B = os.environ.get("STAGE_B_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8")
+MODEL_STAGE1 = os.environ.get("STAGE1_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8")
+MODEL_STAGE2 = os.environ.get("STAGE2_MODEL", "RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic")
+STAGE1_UTIL = float(os.environ.get("STAGE1_UTIL", "0.90"))  # A3B
+STAGE2_UTIL = float(os.environ.get("STAGE2_UTIL", "0.95"))  # gemma
 
 SYSTEM_MSG = (
     "คุณเป็นผู้ช่วยสรุปเอกสารภาษาไทย "
@@ -55,7 +46,9 @@ _SHOT1_PARAS = [
     "_________________________",
     "กรรมาธิการผู้มาประชุม",
 ]
-_SHOT1_ANSWER = "การประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้น ณ ห้องประชุมกรรมาธิการ N 406 ชั้น ๔ อาคารรัฐสภา [อ้างอิง: 3]"
+_SHOT1_ANSWER_TEXT = "การประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้น ณ ห้องประชุมกรรมาธิการ N 406 ชั้น ๔ อาคารรัฐสภา"
+_SHOT1_HINT_IDX = [3]
+_SHOT1_ANSWER = f"{_SHOT1_ANSWER_TEXT} [อ้างอิง: 3]"
 
 _SHOT2_QUERY = "ในการประชุมคณะกรรมาธิการการเงิน การคลัง สถาบันการเงินและตลาดการเงิน ครั้งที่ 49 มีกรรมการผู้ที่ไม่มาประชุมมีจำนวนกี่คน"
 _SHOT2_PARAS = [
@@ -65,7 +58,9 @@ _SHOT2_PARAS = [
     "๒. นายธนยศ ทิมสุวรรณ (ลาการประชุม)",
     "๓. นายอัคร ทองใจสด (ลาการประชุม)",
 ]
-_SHOT2_ANSWER = "ในการประชุมคณะกรรมาธิการการเงิน การคลัง สถาบันการเงินและตลาดการเงิน ครั้งที่ 49 มีกรรมการผู้ที่ไม่มาประชุมจำนวน 3 คน [อ้างอิง: 2, 3, 4, 5]"
+_SHOT2_ANSWER_TEXT = "ในการประชุมคณะกรรมาธิการการเงิน การคลัง สถาบันการเงินและตลาดการเงิน ครั้งที่ 49 มีกรรมการผู้ที่ไม่มาประชุมจำนวน 3 คน"
+_SHOT2_HINT_IDX = [2, 3, 4, 5]
+_SHOT2_ANSWER = f"{_SHOT2_ANSWER_TEXT} [อ้างอิง: 2, 3, 4, 5]"
 
 
 def benchmark_lib(i):
@@ -89,7 +84,7 @@ def filter_valid_paragraphs(paragraphs):
 
 
 def build_prompt_v10(query, paras):
-    """V10_factual — used by Stage A and Stage B's few-shot examples."""
+    """V10_factual — normal answer+cite prompt (Stage 1)."""
     context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
     return (
         f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
@@ -101,22 +96,23 @@ def build_prompt_v10(query, paras):
     )
 
 
-def build_prompt_v10_hint(query, paras, hint_idx):
-    """V10_factual + hint pointing at Stage A's picks (final user turn)."""
+def build_prompt_v10_hinted(query, paras, hint_idx):
+    """Normal V10 + Stage 1's REF INDICES only as the hint (Stage 2)."""
     context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
     hint_str = ", ".join(str(i) for i in hint_idx) if hint_idx else "—"
     return (
         f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
         f"คำถาม: {query}\n\n"
+        f"ย่อหน้าที่เกี่ยวข้องเบื้องต้น: [{hint_str}]\n\n"
         f"คำสั่ง: ตอบคำถามเป็นภาษาไทย**สั้นและตรงประเด็น** "
+        f"โดยใช้ย่อหน้าที่เกี่ยวข้องข้างต้นเป็นแนวทาง "
         f"ระบุข้อเท็จจริงที่ปรากฏในย่อหน้าเท่านั้น ห้ามตีความหรือสรุปเกินขอบเขต "
-        f"**โดยเน้นย่อหน้าหมายเลข [{hint_str}] เป็นข้อมูลหลัก** "
         f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y]\n"
         f"คำตอบ:"
     )
 
 
-def build_messages_stage_a(query, paras):
+def build_messages_stage1(query, paras):
     return [
         {"role": "system", "content": SYSTEM_MSG},
         {"role": "user",      "content": build_prompt_v10(_SHOT1_QUERY, _SHOT1_PARAS)},
@@ -127,14 +123,14 @@ def build_messages_stage_a(query, paras):
     ]
 
 
-def build_messages_stage_b(query, paras, hint_idx):
+def build_messages_stage2(query, paras, hint_idx):
     return [
         {"role": "system", "content": SYSTEM_MSG},
-        {"role": "user",      "content": build_prompt_v10(_SHOT1_QUERY, _SHOT1_PARAS)},
+        {"role": "user",      "content": build_prompt_v10_hinted(_SHOT1_QUERY, _SHOT1_PARAS, _SHOT1_HINT_IDX)},
         {"role": "assistant", "content": _SHOT1_ANSWER},
-        {"role": "user",      "content": build_prompt_v10(_SHOT2_QUERY, _SHOT2_PARAS)},
+        {"role": "user",      "content": build_prompt_v10_hinted(_SHOT2_QUERY, _SHOT2_PARAS, _SHOT2_HINT_IDX)},
         {"role": "assistant", "content": _SHOT2_ANSWER},
-        {"role": "user",      "content": build_prompt_v10_hint(query, paras, hint_idx)},
+        {"role": "user",      "content": build_prompt_v10_hinted(query, paras, hint_idx)},
     ]
 
 
@@ -172,95 +168,112 @@ def run_stage(model_name, model_kwargs, messages_list, gpu_mem_util=0.90):
     return raws
 
 
+def decode_outputs(items, raws):
+    """Parse each raw output into (answer, ref_para_ids) keyed by query ID."""
+    ans, refs = {}, {}
+    empty = 0
+    for it, raw in zip(items, raws):
+        qid, gen_pids, gen_texts, _, q_text = it
+        answer = split_answer(raw)
+        if not answer:
+            answer = gen_texts[0] if gen_texts else q_text
+            empty += 1
+        cited_idx = parse_citation(raw, len(gen_pids))
+        if gen_pids:
+            ref_ids = [gen_pids[j] for j in cited_idx if j < len(gen_pids)]
+            if not ref_ids:
+                ref_ids = [gen_pids[0]]
+        else:
+            ref_ids = []
+        ans[qid] = answer
+        refs[qid] = ref_ids
+    return ans, refs, empty
+
+
+def write_submission(path, order, answers, refs):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["ID", "abstractive", "refs"])
+        writer.writeheader()
+        for qid in order:
+            writer.writerow({"ID": qid, "abstractive": answers[qid],
+                             "refs": ",".join(refs[qid])})
+
+
 def main():
     data = load_data(TEST_DIR)
     doc_index = {doc["doc_id"]: doc["paragraphs"] for doc in data["docs"]}
     queries = data["queries"]
     n = len(queries)
-    print(f"exp80 (exp59 pipeline, Stage A=gemma-4-26B-A4B-FP8, refs fixed): "
-          f"{n} queries, {len(doc_index)} docs", flush=True)
+    print(f"exp80: S1={MODEL_STAGE1} → S2={MODEL_STAGE2} (hint=ref only); "
+          f"emit 4 combos. {n} queries, {len(doc_index)} docs", flush=True)
 
     doc_paras = {}
     for doc_id, paragraphs in doc_index.items():
         doc_paras[doc_id] = filter_valid_paragraphs(paragraphs)
 
-    # ----- Stage A -----
-    print(f"\n=== Stage A: {MODEL_STAGE_A} → fresh refs ===", flush=True)
-    items_A = []
+    # ----- Stage 1: normal V10 → (answer, ref) -----
+    print(f"\n=== Stage 1: {MODEL_STAGE1} → answer + ref ===", flush=True)
+    items = []
     for i, query in enumerate(queries):
         benchmark_lib(i)
         valid = doc_paras.get(query["doc_id"], [])
         q_text = query["query"]
         gen_pids  = [p["para_id"] for p in valid]
         gen_texts = [p["text"]    for p in valid]
-        msgs = build_messages_stage_a(q_text, gen_texts) if valid \
+        msgs = build_messages_stage1(q_text, gen_texts) if valid \
             else [{"role": "user", "content": q_text}]
-        items_A.append((query["ID"], gen_pids, gen_texts, msgs, q_text))
+        items.append((query["ID"], gen_pids, gen_texts, msgs, q_text))
 
-    # gemma-4-26B-A4B-it-FP8-Dynamic Stage A: util 0.95 + prefix caching, as
-    # exp74 verified fits the full 32768 ctx on a single A100-40GB. bf16 KV.
-    stage_a_kwargs = dict(dtype="bfloat16", trust_remote_code=True,
-                          enable_prefix_caching=True,
-                          limit_mm_per_prompt={"image": 0, "video": 0})
-    raws_A = run_stage(MODEL_STAGE_A, stage_a_kwargs,
-                       [it[3] for it in items_A], gpu_mem_util=0.95)
+    s1_kwargs = dict(dtype="bfloat16", trust_remote_code=True,
+                     enable_prefix_caching=True,
+                     limit_mm_per_prompt={"image": 0, "video": 0})
+    raws_s1 = run_stage(MODEL_STAGE1, s1_kwargs,
+                        [it[3] for it in items], gpu_mem_util=STAGE1_UTIL)
+    s1_ans, s1_ref, empty1 = decode_outputs(items, raws_s1)
+    s1_hint_idx = {}
+    for it in items:
+        qid, gen_pids = it[0], it[1]
+        pid_to_idx = {pid: j + 1 for j, pid in enumerate(gen_pids)}
+        s1_hint_idx[qid] = [pid_to_idx[p] for p in s1_ref.get(qid, []) if p in pid_to_idx]
+    print(f"Stage 1: {len(s1_ans)} answers, empty={empty1}, "
+          f"avg refs={sum(len(r) for r in s1_ref.values())/len(s1_ref):.2f}", flush=True)
+    del raws_s1
 
-    stage_a_refs = {}
-    stage_a_hint = {}
-    for it, raw in zip(items_A, raws_A):
-        qid, gen_pids, _, _, _ = it
-        cited_idx = parse_citation(raw, len(gen_pids))
-        valid_idx = [j for j in cited_idx if j < len(gen_pids)]
-        ref_pids = [gen_pids[j] for j in valid_idx]
-        if not ref_pids and gen_pids:
-            ref_pids = [gen_pids[0]]
-            valid_idx = [0]
-        stage_a_refs[qid] = ref_pids
-        stage_a_hint[qid] = [j + 1 for j in valid_idx]
-    print(f"Stage A produced refs for {len(stage_a_refs)} queries; "
-          f"avg refs/query = {sum(len(r) for r in stage_a_refs.values())/len(stage_a_refs):.2f}",
-          flush=True)
-    del items_A, raws_A
+    # ----- Stage 2: normal V10 hinted by S1's REF indices → (answer, ref) -----
+    print(f"\n=== Stage 2: {MODEL_STAGE2} → answer + ref (hinted by S1 refs) ===", flush=True)
+    msgs_s2 = []
+    for it in items:
+        qid, gen_pids, gen_texts, _, q_text = it
+        if gen_pids:
+            msgs_s2.append(build_messages_stage2(q_text, gen_texts, s1_hint_idx[qid]))
+        else:
+            msgs_s2.append([{"role": "user", "content": q_text}])
 
-    # ----- Stage B: full context + hint -----
-    print(f"\n=== Stage B: {MODEL_STAGE_B} → answer w/ hint (refs fixed) ===", flush=True)
-    items_B = []
-    for query in queries:
-        qid = query["ID"]
-        valid = doc_paras.get(query["doc_id"], [])
-        q_text = query["query"]
-        gen_pids  = [p["para_id"] for p in valid]
-        gen_texts = [p["text"]    for p in valid]
-        hint_idx = stage_a_hint.get(qid, [])
-        msgs = build_messages_stage_b(q_text, gen_texts, hint_idx) if valid \
-            else [{"role": "user", "content": q_text}]
-        items_B.append((qid, gen_pids, gen_texts, msgs, q_text, stage_a_refs.get(qid, [])))
+    s2_kwargs = dict(dtype="bfloat16", trust_remote_code=True,
+                     enable_prefix_caching=True,
+                     limit_mm_per_prompt={"image": 0, "video": 0})
+    raws_s2 = run_stage(MODEL_STAGE2, s2_kwargs, msgs_s2, gpu_mem_util=STAGE2_UTIL)
+    for it, raw in list(zip(items, raws_s2))[:3]:
+        print(f"[S2 {it[0]}] {raw[:200]!r}", flush=True)
+    s2_ans, s2_ref, empty2 = decode_outputs(items, raws_s2)
+    print(f"Stage 2: {len(s2_ans)} answers, empty={empty2}, "
+          f"avg refs={sum(len(r) for r in s2_ref.values())/len(s2_ref):.2f}", flush=True)
+    del raws_s2
 
-    stage_b_kwargs = dict(dtype="bfloat16", trust_remote_code=True,
-                          limit_mm_per_prompt={"image": 0, "video": 0})
-    raws_B = run_stage(MODEL_STAGE_B, stage_b_kwargs,
-                       [it[3] for it in items_B], gpu_mem_util=0.90)
-
-    results = []
-    empty_answers = 0
-    for it, raw in zip(items_B, raws_B):
-        qid, gen_pids, gen_texts, _, q_text, ref_pids = it
-        answer = split_answer(raw)
-        if not answer:
-            answer = gen_texts[0] if gen_texts else q_text
-            empty_answers += 1
-        # refs FIXED to Stage A
-        results.append({"ID": qid, "abstractive": answer,
-                        "refs": ",".join(ref_pids)})
-    print(f"empty_answers={empty_answers}", flush=True)
-
-    out_path = Path(RESULT_DIR) / "submission.csv"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["ID", "abstractive", "refs"])
-        writer.writeheader()
-        writer.writerows(results)
-    print(f"Written {len(results)} rows to {out_path}", flush=True)
+    # ----- Emit all 4 answer×ref combos -----
+    order = [it[0] for it in items]
+    combos = {
+        "s1ans_s1ref": (s1_ans, s1_ref),
+        "s1ans_s2ref": (s1_ans, s2_ref),
+        "s2ans_s1ref": (s2_ans, s1_ref),
+        "s2ans_s2ref": (s2_ans, s2_ref),
+    }
+    print(f"\nLegend: S1={MODEL_STAGE1}, S2={MODEL_STAGE2}", flush=True)
+    for name, (ans, refs) in combos.items():
+        out_path = Path(RESULT_DIR) / name / "submission.csv"
+        write_submission(out_path, order, ans, refs)
+        print(f"Written combo {name} → {out_path}", flush=True)
     return n
 
 
