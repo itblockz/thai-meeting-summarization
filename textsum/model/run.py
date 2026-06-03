@@ -1,80 +1,94 @@
 """
-v16.3 — exp74 port (single-model gemma-4-26B-A4B-FP8 MoE + V10_factual).
+v16.4 — exp77 port (single-model gemma-4-26B-A4B-NVFP4 MoE + V10_factual).
 
 NO RETRIEVAL: the full list of *valid* paragraphs from `doc_id` is fed to
-RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic (26B MoE, ~4B active, FP8 weights
-~26 GB) in document order. The model is shown the paragraphs as a numbered
-[1..N] context, answers in Thai, then cites which paragraphs it used as
-[อ้างอิง: X]; the cited paragraphs become `refs` (E5 self-citation,
-adaptive count). Two worked few-shot examples are prepended as multi-turn
-chat turns.
+nvidia/Gemma-4-26B-A4B-NVFP4 (26B MoE, ~4B active, NVFP4 experts ~18 GB
+load — attention stays bf16) in document order. The model is shown the
+paragraphs as a numbered [1..N] context, answers in Thai, then cites which
+paragraphs it used as [อ้างอิง: X]; the cited paragraphs become `refs`
+(E5 self-citation, adaptive count). Two worked few-shot examples are
+prepended as multi-turn chat turns.
 
-v16.3 = exp74 port. SINGLE-VARIABLE change from v16.2 (exp73, 0.7140):
-the LLM is swapped from gemma-4-31B-it-NVFP4 (dense, 4-bit) to gemma-4-
-26B-A4B-it-FP8-Dynamic (MoE, FP8). SAME V10_factual prompt, SAME exp38
-shots, SAME greedy decoding (temp 0, rep-pen 1.05).
+v16.4 = exp77 port. SINGLE-VARIABLE change from v16.3 (exp74, 0.6970): the
+LLM swaps from RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic (MoE, compressed-
+tensors FP8) to nvidia/Gemma-4-26B-A4B-NVFP4 (same MoE, NVFP4 experts via
+TensorRT-Model-Optimizer). SAME V10_factual prompt, SAME exp38 shots, SAME
+greedy decoding (temp 0, rep-pen 1.05). This is a quant *publisher/format*
+swap on the identical base model — exp77 ran it primarily for the FIT
+verdict and the format-equivalence delta vs the FP8 build.
 
-⚠️ KNOWN-NEGATIVE on the train set: leak-free composite **0.6970** (venv
-run, exp74 — RougeL 0.4528 / SS 0.8350 / IoU 0.8139), −0.0170 vs v16.2's
-0.7140 and −0.0140 vs v16.1's 0.7110. The MoE *citation* is the best
-single-model number on record (99.9% tag rate, 1/1239 fallback, IoU
-0.8139 even beats dense gemma-4-31B's 0.8091), but the ~4B-active answers
-lose RougeL −0.0262 and SS −0.0196 vs the dense 31B, and that
-0.45+0.35-weighted answer-quality loss swamps the +0.0048 IoU gain. Same
-lesson as the A3B ref-picker and the <10B self-cite: active-param count
-caps abstractive quality even when citation is flawless. This image is
-kept as a packaged variant (faster than the dense 31B, near-A3B speed),
-NOT as a train-score improvement — prefer v16.2 (0.7140) for quality.
+⚠️ KNOWN-NEGATIVE on the train set: leak-free composite **0.6982** (venv
+run, exp77), essentially flat vs v16.3's 0.6970 and still −0.0158 below
+v16.2's 0.7140. Same MoE answer-quality ceiling as v16.3/exp74: the
+~4B-active experts cap RougeL/SS regardless of the quant format. exp77 was
+worth running because the nvidia/ModelOpt NVFP4 MoE build is what the
+exp77-Stage-A hybrid (memory:hybrid-stage-a-refpicker, 0.7235 NEW BEST)
+uses as its ref-picker — this image packages that same checkpoint stand-
+alone. Kept as a proven-buildable variant, NOT a single-model score win —
+prefer v16.2 (0.7140) for single-model quality.
 
-This is the SINGLE-MODEL v16 lineage (one ~26 GB image — between v16.2's
-~22 GB NVFP4 and v16.1's ~30 GB A3B), kept as a proven-buildable
-alternative to the v17–v21 two-stage hybrid (~50 GB) on `master`.
+This is the SINGLE-MODEL v16 lineage (one ~18 GB-weights image), kept as a
+proven-buildable alternative to the v17–v21 two-stage hybrid (~50 GB) on
+`master`.
 
-Why this 26B MoE can use the FP8 checkpoint where the dense 31B could NOT
-(exp71/72 — infeasible on a single A100-40GB):
-- gemma-4-31B *dense* FP8 weights load ~30.4 GB → only ~6.49 GiB for KV,
-  and FP8 KV cache is impossible on A100 with an FP8 checkpoint (e4m3 has
-  no sm80 reshape_and_cache Triton kernel; e5m2 rejected). vLLM then caps
-  context at ~7.7K → 89% truncated. For the dense 31B FP8 you need TP=2.
-- This 26B MoE keeps ALL 26B params resident but FP8-packed → ~26 GB, not
-  ~30 GB. At gpu_memory_utilization 0.95 (~38 GB budget − 26 weights − ~2
-  activations) ≈ 10 GiB KV pool; gemma-4's attention layout needs 9.54 GiB
-  for the full 32768 context (exp73) → fits with thin headroom, so
-  MAX_MODEL_LEN=32768 with NO truncation (exp74-verified at 0.95 on A100).
-  v16.3.1 cut MAX_NUM_BATCHED_TOKENS 16384→8192 after a 98% crash on the
-  H100-40GB backend (util stays 0.95 — see GPU_MEM_UTIL note for why
-  raising it was the wrong lever). KV stays bf16 — do NOT set
-  kv_cache_dtype="fp8" (same sm80 e4m3 wall as exp71/72).
-- On A100 (no native FP8 cores) vLLM reads compressed-tensors FP8 from
-  config.json and picks fp8_marlin / fp8_w8a16 software dequant, but the
-  MoE routes only ~4B active params/token → wall-time lands near the A3B
-  line (~9 min generation, exp74-verified), not the dense 27B-FP8 line.
-- MAX_NUM_BATCHED_TOKENS 8192 (v16.3.1; was 16384), util kept at 0.95.
-  v16.1 (A3B-FP8, weights 29.54 GiB but tiny KV ~3 GiB) and v16.2 (NVFP4,
-  weights 22 + KV 9.54) both PASSED on the H100-40GB backend with ~5–6 GiB
-  physical free. v16.3 carries gemma-4's big KV (9.54) AND heavier FP8
-  weights (26) → only ~2.5 GiB free at full context → the prefill scratch
-  spike overran it at 98%. Raising util would SHRINK that buffer (wrong
-  way); the fix is a smaller prefill chunk (8192 → halved spike). Drops
-  ZERO paragraphs → no score loss. If it still crashes the cause is the FP8
-  Hopper kernel path, not memory → fall back to v16.2 (0.7140).
+Why this nvidia/ModelOpt NVFP4 MoE fits a single A100-40GB where the dense
+31B nvidia build did NOT (exp75 — infeasible):
+- nvidia/ModelOpt `exclude_modules` ALL self_attn* from NVFP4 → attention
+  stays bf16. On the DENSE 31B that bf16-attention slice was ~8 GiB →
+  ~29.96 GiB load → KV-floor overrun on 1×A100 (exp75). On THIS MoE the
+  ~22B of expert params (the bulk) stay 4-bit and only the small shared
+  attention is bf16 → ~18 GiB load → fits with room (exp77 first-run
+  profiled GPU KV = 82,096 tok / 7.88x at 32768). The bet that quantized
+  experts dominate the footprint held.
+- gpu_memory_utilization 0.90 (NOT 0.95 — see GPU_MEM_UTIL note). At 0.95
+  the lighter ~18 GiB weights + a near-full 32768 KV left only ~246 MiB
+  free → the sampling-time frequency-penalty buffer (repetition_penalty=
+  1.05, batched over all prompts) OOM'd at first decode (exp77 job
+  5824692). 0.90 keeps the full-32768 KV while leaving ~4 GiB truly-free
+  GPU RAM for vLLM's untracked sampling allocations → MAX_MODEL_LEN=32768,
+  NO truncation.
+- On A100 (no native FP4 cores) vLLM reads NVFP4 from config and uses an
+  FP4 weight-only dequant path (Marlin for dense Linear; the MoE experts
+  need the analogous sm80 fused-MoE FP4 dequant). The MoE routes only ~4B
+  active params/token → near-A3B latency (exp77-verified).
 - Multimodal vision blocks load idle for text-only chat;
   limit_mm_per_prompt={"image":0,"video":0} stops vLLM reserving the
   encoder cache budget.
-- enable_prefix_caching is honored for this MoE arch (exp74-verified — NOT
-  auto-disabled like the 27B-FP8 multimodal arch; see the engine log line).
+- enable_prefix_caching is honored for this MoE arch (NOT auto-disabled
+  like the 27B-FP8 multimodal arch; see the engine log line).
+
+⚠️ KV-dtype is a TWO-SIDED trap on the nvidia/ModelOpt build (exp77 job
+5824680) — RESOLVED here by a runtime config override (see
+build_kv_neutralized_model below). nvidia/ModelOpt bakes
+"kv_cache_quant_algo": "FP8" into hf_quant_config.json (RedHatAI's FP8
+build, v16.3, carried NO kv directive — its "auto" resolved to bf16 for
+free). With that directive present, kv_cache_dtype="auto" PROMOTES to
+fp8_e4m3:
+  - on A100 (sm80): no fp8e4nv reshape_and_cache kernel → engine init dies
+    (the exp71/72/75 wall);
+  - on H100 (sm90): fp8-KV pulls the FlashInfer/DeepGEMM path that
+    JIT-compiles with nvcc — absent from this runtime image → the v19
+    crash (memory:h100-fp8-nvcc-jit-trap).
+And the exp75 dense fix (kv_cache_dtype="bfloat16") is REJECTED here: this
+MoE selects the TRITON_ATTN backend, whose triton_reshape_and_cache_flash
+asserts kv_cache_dtype ∈ {"auto","fp8*"} → "bfloat16" raises
+AssertionError. FIX (matches exp77's submit-time override, but built at
+runtime so the baked container cache needs no surgery): symlink the HF
+snapshot into a scratch dir and rewrite config.json + hf_quant_config.json
+with the kv directive STRIPPED, so "auto" resolves to bf16 on BOTH
+platforms — the universal, JIT-free, sm80/sm90-safe KV path. run.py then
+leaves kv_cache_dtype at the default "auto".
 
 H100-safe (carry over the v20 fix), with one OPEN RISK: the benchmark
 backend runs on H100 (SM 9.0); LANTA is A100-only so no local test
-exercises the Hopper path. This is an FP8 checkpoint, so H100 has a native
-fast path — VLLM_USE_DEEP_GEMM=0 (set below before any torch/vllm import)
-disables the DeepGEMM block-FP8 GEMM that JIT-compiles with nvcc (absent
-here), forcing the precompiled CUTLASS/Marlin FP8 path; kv_cache_dtype
-defaults to "auto" → bf16 (this RedHatAI checkpoint carries no
-kv_cache_quant_algo directive, so nothing resolves to fp8-KV / FlashInfer
-JIT). Whether sm90 takes the precompiled path with no other JIT is
-UNVERIFIED (A100-only locally). The first-run raw-output dump below guards
-against silent gibberish. This image needs NO nvcc — keeps the SIF lean.
+exercises the Hopper path. VLLM_USE_DEEP_GEMM=0 (set below before any
+torch/vllm import) disables the DeepGEMM block-FP8 GEMM that JIT-compiles
+with nvcc; the KV override above forces bf16 KV so the fp8-KV FlashInfer
+JIT never fires either. v16.2 (also NVFP4, dense 31B) PASSED on the
+H100-40GB backend, de-risking the NVFP4 weight-dequant path on Hopper;
+v16.4's only new wrinkle vs v16.2 is the kv directive, neutralized above.
+The first-run raw-output dump below guards against silent gibberish. This
+image needs NO nvcc — keeps the SIF lean.
 
 v14→v16 infra (carry over):
 - Sort queries by doc_id before submission so the ~14K-token full-doc
@@ -96,6 +110,8 @@ import os
 import re
 import json
 import csv
+import glob
+import shutil
 import time
 
 # --- Hopper/H100: force the precompiled FP8 path (no runtime nvcc) -----------
@@ -119,41 +135,28 @@ PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
 
 MAX_NEW_TOKENS         = 1024
 MAX_MODEL_LEN          = int(os.environ.get("MAX_MODEL_LEN", "32768"))
-# 8192 (v16.3.1; was 16384): the chunked-prefill budget = peak activation /
-# fp8_marlin dequant *scratch* per step, which lives OUTSIDE vLLM's
-# pre-allocated KV pool and eats the ~2.5 GiB physical buffer (see
-# GPU_MEM_UTIL note: weights 26 + KV 9.54 leave only ~2.5 GiB free on
-# H100-40GB at full context). The 98% crash hits on the largest doc (sorted
-# last) whose ~28-32K-token prompt prefills in 2 chunks of ~15K at 16384 →
-# activation/scratch peak overruns that buffer. Halving to 8192 → ~4 chunks
-# of ~7.5K → peak ~halved, fits the buffer, and NO paragraph is dropped
-# (chunking is transparent) → zero score loss vs truncation. Costs only
-# slightly slower prefill. Was 16384 = the 32B-AWQ / A3B sweet spot (median
-# 14K prompt single-chunk; those models had a fatter buffer to absorb it);
-# gemma-4 FP8's big KV + heavy weights is exactly why the smaller chunk is
-# now needed. Drop to 4096 if 8192 still spikes.
+# 8192 (carried from v16.3.1): the chunked-prefill budget = peak activation /
+# FP4 dequant *scratch* per step, which lives OUTSIDE vLLM's pre-allocated KV
+# pool. v16.4's NVFP4 weights are LIGHTER than v16.3's FP8 (~18 vs ~26 GiB),
+# so at util 0.90 there is ~4 GiB physical free — a fatter buffer than v16.3's
+# ~2.5 GiB. 8192 was the value that fixed v16.3's 98% crash on a tighter
+# buffer, so it is comfortably safe here; kept as a correctness-neutral
+# default (chunking is transparent — drops ZERO paragraphs). Raise to 16384
+# for slightly faster prefill if the H100 run shows headroom; drop to 4096 if
+# it ever spikes.
 MAX_NUM_BATCHED_TOKENS = int(os.environ.get("MAX_NUM_BATCHED_TOKENS", "8192"))
-# 0.95 (kept; NOT raised). The benchmark backend is H100-*40GB* (confirmed).
-# Cross-checking the two single-model images that PASSED on it:
-#   v16.1 A3B-FP8: weights 29.54 GiB, KV 6.75 GiB (73,744 tok → ~3.0 GiB at
-#                  32768), peak ~36 → ~5.5 GiB physical free. PASS.
-#   v16.2 NVFP4:   weights 22, KV 9.54, peak ~33.5 → ~6.5 GiB free. PASS.
-#   v16.3 FP8:     weights 26 + gemma-4's big KV 9.54 = 35.5 occupied → only
-#                  ~2.5 GiB physical free at full context. CRASH at 98%.
-# Lesson from v16.1: the crash is a PHYSICAL-BUFFER / prefill-scratch spike,
-# not KV-pool exhaustion (a short pool only makes vLLM preempt, never crash).
-# physical_buffer = (1-util)*40: at 0.95 = 2.0 GiB, at 0.97 = only 1.2 GiB —
-# so RAISING util shrinks the very buffer the spike needs (an earlier 0.97
-# bump here was backwards and was reverted). 0.95 keeps KV-pool ~10 ≥ 9.54
-# (full 32768, no truncation) AND preserves the 2.0 GiB buffer. Structural
-# ceiling: weights 26 + KV 9.54 means v16.3 can never get the 5–6 GiB buffer
-# v16.1/v16.2 enjoyed — so the spike MUST be shrunk instead, via
-# MAX_NUM_BATCHED_TOKENS=8192 above (drop to 4096 if it still spikes). That
-# lever, not util, is the real fix and drops ZERO paragraphs (no score loss).
-# If it still crashes, the residual cause is the FP8 Hopper kernel path
-# (docstring OPEN RISK), not memory — fall back to v16.2 (NVFP4, 0.7140).
-GPU_MEM_UTIL           = float(os.environ.get("GPU_MEM_UTIL", "0.95"))
-MODEL_NAME             = os.environ.get("LLM_MODEL", "RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic")
+# 0.90 (exp77 value; LOWER than v16.3's 0.95 — and that is deliberate). The
+# benchmark backend is H100-*40GB*. NVFP4 weights ~18 GiB leave more KV room
+# than v16.3's FP8 26 GiB, BUT exp77 found 0.95 fatal here for a different
+# reason than v16.3's prefill spike: with the lighter weights vLLM grows the
+# KV pool to fill 0.95 → only ~246 MiB physically free → the sampling-time
+# frequency-penalty buffer (repetition_penalty=1.05, batched over all prompts)
+# OOM'd at the FIRST decode (exp77 job 5824692, "Tried to allocate 256 MiB ...
+# 246 MiB free"). 0.90 caps the KV pool lower (still ≫ the 9.54 GiB needed for
+# full 32768 — exp77 profiled 82,096 tok / 7.88x) and leaves ~4 GiB truly-free
+# for vLLM's untracked sampling allocations. Do NOT raise it.
+GPU_MEM_UTIL           = float(os.environ.get("GPU_MEM_UTIL", "0.90"))
+MODEL_NAME             = os.environ.get("LLM_MODEL", "nvidia/Gemma-4-26B-A4B-NVFP4")
 
 SYSTEM_MSG = (
     "คุณเป็นผู้ช่วยสรุปเอกสารภาษาไทย "
@@ -212,6 +215,87 @@ def filter_valid_paragraphs(paragraphs):
             return False
         return True
     return [p for p in paragraphs if is_valid(p)]
+
+
+def build_kv_neutralized_model(model_name):
+    """Return a model path whose configs carry NO fp8-KV directive.
+
+    The nvidia/Gemma-4-26B-A4B-NVFP4 checkpoint bakes
+    "kv_cache_quant_algo": "FP8" into hf_quant_config.json (+ a
+    kv_cache_scheme in config.json's quantization_config). With it present,
+    vLLM's kv_cache_dtype="auto" promotes KV to fp8_e4m3 → on A100 (sm80)
+    there is no fp8e4nv reshape_and_cache kernel, and on the H100 backend
+    fp8-KV pulls the FlashInfer/DeepGEMM JIT that needs nvcc (absent from
+    this runtime image). The exp75 dense fix (kv_cache_dtype="bfloat16") is
+    rejected too — this MoE selects TRITON_ATTN, whose kernel asserts
+    kv_cache_dtype ∈ {"auto","fp8*"}. The only universal, JIT-free path is
+    to make "auto" resolve to bf16 by STRIPPING the directive (mirrors
+    exp77's submit-time override, here built at runtime from the baked
+    cache). Idempotent: re-stripping an already-clean config is a no-op.
+
+    If LLM_MODEL already points at an existing local dir (an override the
+    caller pre-built), use it verbatim. If the repo carries no kv directive
+    (e.g. the RedHatAI FP8 build, or a future clean checkpoint), return the
+    snapshot path unchanged — no override needed.
+    """
+    # Already a local path? Trust it as-is.
+    if os.path.isdir(model_name):
+        return model_name
+
+    # Locate the snapshot in the baked HF cache (HF_HOME/hub/models--org--name).
+    hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    repo_dir = "models--" + model_name.replace("/", "--")
+    snap_glob = os.path.join(hf_home, "hub", repo_dir, "snapshots", "*")
+    snaps = sorted(glob.glob(snap_glob))
+    if not snaps:
+        # Not in cache as a snapshot dir — hand the repo id back to vLLM and
+        # let it resolve (online or a non-standard layout). No override.
+        return model_name
+    snap = snaps[-1]
+
+    quant_cfg = os.path.join(snap, "hf_quant_config.json")
+    has_kv_directive = False
+    if os.path.isfile(quant_cfg):
+        try:
+            qj = json.load(open(quant_cfg, encoding="utf-8"))
+            has_kv_directive = "kv_cache_quant_algo" in qj.get("quantization", {})
+        except (ValueError, OSError):
+            has_kv_directive = False
+    if not has_kv_directive:
+        # RedHatAI-style checkpoint (no directive) → "auto" is already bf16.
+        return snap
+
+    # Build a scratch override: symlink every snapshot entry, then replace
+    # config.json + hf_quant_config.json with kv-directive-stripped copies.
+    scratch = os.environ.get("TEXTSUM_SCRATCH_DIR", "/scratch")
+    ovr = os.path.join(scratch, "model_override")
+    shutil.rmtree(ovr, ignore_errors=True)
+    os.makedirs(ovr, exist_ok=True)
+    rewrite = {"config.json", "hf_quant_config.json"}
+    for name in os.listdir(snap):
+        if name in rewrite:
+            continue
+        os.symlink(os.path.join(snap, name), os.path.join(ovr, name))
+
+    # hf_quant_config.json: drop kv_cache_quant_algo from quantization{}.
+    qj = json.load(open(quant_cfg, encoding="utf-8"))
+    qj.get("quantization", {}).pop("kv_cache_quant_algo", None)
+    json.dump(qj, open(os.path.join(ovr, "hf_quant_config.json"), "w",
+                       encoding="utf-8"), indent=2)
+
+    # config.json: drop kv_cache_scheme / kv_cache_quant_algo from
+    # quantization_config{} (present in some ModelOpt exports).
+    cfg_path = os.path.join(snap, "config.json")
+    cj = json.load(open(cfg_path, encoding="utf-8"))
+    qc = cj.get("quantization_config", {})
+    qc.pop("kv_cache_scheme", None)
+    qc.pop("kv_cache_quant_algo", None)
+    json.dump(cj, open(os.path.join(ovr, "config.json"), "w",
+                       encoding="utf-8"), indent=2)
+
+    print(f"KV override: stripped fp8-KV directive → {ovr} "
+          f"(symlinked {snap})", flush=True)
+    return ovr
 
 
 def build_prompt(query, paras):
@@ -290,7 +374,7 @@ def main():
     doc_index = {doc["doc_id"]: doc["paragraphs"] for doc in data["docs"]}
     queries = data["queries"]
     n = len(queries)
-    print(f"v16.3 (exp74: gemma-4-26B-A4B-FP8 MoE + V10_factual) — {n} queries, "
+    print(f"v16.4 (exp77: gemma-4-26B-A4B-NVFP4 MoE + V10_factual) — {n} queries, "
           f"{len(doc_index)} docs (NO RETRIEVAL — full doc, model={MODEL_NAME}, "
           f"max_model_len={MAX_MODEL_LEN}, gpu_mem_util={GPU_MEM_UTIL}, "
           f"max_num_batched_tokens={MAX_NUM_BATCHED_TOKENS})",
@@ -327,21 +411,28 @@ def main():
         print(f"pool sizes — mean={sum(pool_sizes)/len(pool_sizes):.2f}, "
               f"min={min(pool_sizes)}, max={max(pool_sizes)}", flush=True)
 
-    # FP8 quantization auto-detected from the model's config.json
-    # (compressed-tensors FP8-Dynamic, llm-compressor scheme); on A100 (no
-    # native FP8 cores) vLLM's CompressedTensors backend picks the
-    # fp8_marlin / fp8_w8a16 software-dequant path, and (with
-    # VLLM_USE_DEEP_GEMM=0) the precompiled CUTLASS/Marlin path on H100 — see
-    # the OPEN RISK in the module docstring. The MoE (A4B) routes only ~4B
-    # active params/token → near-A3B latency despite the marlin tax.
-    # kv_cache_dtype defaults to "auto" → bf16 KV: this RedHatAI checkpoint
-    # carries no kv_cache_quant_algo directive, so nothing resolves to fp8-KV
-    # / FlashInfer JIT, and gemma-4 has no A100 FP8-KV kernel anyway (bf16 KV
-    # is mandatory; do NOT set kv_cache_dtype="fp8").
-    # limit_mm_per_prompt={"image":0,"video":0} stops vLLM from reserving the
-    # multimodal encoder cache budget (gemma-4 is multimodal, text-only here).
+    # Resolve a KV-neutralized model path: nvidia/ModelOpt's NVFP4 checkpoint
+    # bakes "kv_cache_quant_algo": "FP8" into its config, which would make
+    # kv_cache_dtype="auto" promote KV to fp8 (no sm80 kernel on A100; nvcc-JIT
+    # FlashInfer path on H100). build_kv_neutralized_model symlinks the snapshot
+    # and strips that directive so "auto" → bf16 on both platforms. Returns the
+    # plain snapshot/repo path unchanged for checkpoints with no kv directive.
+    model_path = build_kv_neutralized_model(MODEL_NAME)
+
+    # NVFP4 quantization auto-detected from the model's config (ModelOpt /
+    # compressed-tensors NVFP4); on A100 (no native FP4 cores) vLLM uses an FP4
+    # weight-only dequant path (Marlin for dense Linear + the sm80 fused-MoE FP4
+    # dequant), and (with VLLM_USE_DEEP_GEMM=0) the precompiled path on H100 —
+    # see the OPEN RISK in the module docstring. The MoE (A4B) routes only ~4B
+    # active params/token → near-A3B latency despite the dequant tax.
+    # kv_cache_dtype defaults to "auto" → bf16 KV here because model_path's
+    # config has had its fp8-KV directive stripped above (gemma-4 has no A100
+    # FP8-KV kernel and the H100 fp8-KV path needs nvcc — bf16 KV is mandatory;
+    # do NOT set kv_cache_dtype="fp8"). limit_mm_per_prompt={"image":0,"video":0}
+    # stops vLLM reserving the multimodal encoder cache budget (gemma-4 is
+    # multimodal, text-only here).
     engine_args = EngineArgs(
-        model=MODEL_NAME,
+        model=model_path,
         max_model_len=MAX_MODEL_LEN,
         gpu_memory_utilization=GPU_MEM_UTIL,
         dtype="bfloat16", enforce_eager=True,
@@ -352,8 +443,10 @@ def main():
     )
     # Load tokenizer separately via AutoTokenizer — vllm 0.19.1's
     # engine.get_tokenizer() exists but AutoTokenizer keeps init order
-    # identical between container (0.19.1) and venv (0.19.1).
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+    # identical between container (0.19.1) and venv (0.19.1). Use model_path
+    # (the override dir symlinks the tokenizer files, so this resolves the
+    # same tokenizer as the snapshot).
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     engine = LLMEngine.from_engine_args(engine_args)
     sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS,
                               repetition_penalty=1.05)

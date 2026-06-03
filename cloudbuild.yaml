@@ -1,19 +1,22 @@
-# Build the v16.3 single-model image (~26 GB, one
-# RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic MoE weight embedded) on Google Cloud
-# Build, then push to the competition registry. Packaged exp74 variant
-# (KNOWN-NEGATIVE on train, 0.6970; faster near-A3B MoE — prefer v16.2's 0.7140
-# for quality). The v21/v22 two-stage hybrid (~42-50 GB) lives on master/v22.
+# Build the v16.4 single-model image (~18 GB weights, one
+# nvidia/Gemma-4-26B-A4B-NVFP4 MoE weight embedded) on Google Cloud Build,
+# then push to the competition registry. Packaged exp77 variant (KNOWN-NEGATIVE
+# on train, 0.6982 — flat vs v16.3's FP8 0.6970; prefer v16.2's 0.7140 for
+# quality). Same base model as v16.3, only the NVFP4 publisher/format differs
+# (RedHatAI FP8 → nvidia/ModelOpt NVFP4). The v21/v22 two-stage hybrid
+# (~42-50 GB) lives on master/v22.
 # GitHub Actions can't do even this (runner disk ~14 GB); LANTA podman is
 # blocked (no /etc/subuid). GCB gives a configurable disk.
 #
 # PERSISTENT MODEL CACHE VIA GCS (same scheme as v22): the model weight is NOT
-# downloaded inside `docker build`. A GCS tar ($_HF_BUCKET/v16.3/hf-cache.tar)
+# downloaded inside `docker build`. A GCS tar ($_HF_BUCKET/v16.4/hf-cache.tar)
 # holds a HuggingFace cache; each build (1) restores it into the workspace,
 # (2) snapshot_download's the model only if missing, (3) re-uploads if changed,
 # then (4) bakes it into the image via `COPY hf-cache`. The heavy, flaky HF
 # pull happens at most ONCE, ever — warm rebuilds (e.g. a run.py edit) skip it.
-# This image uses its OWN tar (v16.3/ prefix), SEPARATE from v22's two-model
-# hf-cache.tar, so the lean single-model image never bakes v22's extra weights.
+# This image uses its OWN tar (v16.4/ prefix), SEPARATE from v16.3's FP8 tar
+# and v22's two-model hf-cache.tar — the NVFP4 weights differ from v16.3's FP8,
+# so a separate prefix avoids clobbering and never bakes the wrong checkpoint.
 #
 # Region: asia-southeast1 is the persistent default (gcloud config
 # builds/region + the regional default staging bucket) — submit with a bare
@@ -25,7 +28,7 @@ substitutions:
   _HF_BUCKET: 'gs://textsum-hf-cache-437476422274/hf'   # GCS path holding the HF cache (asia-southeast1)
 
 steps:
-  # 1. Restore the v16.3 HF cache from a single tar in GCS. Stored as a TAR
+  # 1. Restore the v16.4 HF cache from a single tar in GCS. Stored as a TAR
   #    (not an rsync'd tree) because the HF layout is blobs/ + snapshots/
   #    symlinks; GCS can't hold symlinks, so rsync would store every file twice.
   #    tar keeps the symlinks intact. First build: no tar yet → start empty.
@@ -36,12 +39,12 @@ steps:
       - |
         set -euo pipefail
         mkdir -p textsum/hf-cache
-        if gsutil -q stat "${_HF_BUCKET}/v16.3/hf-cache.tar"; then
-          gsutil -m cp "${_HF_BUCKET}/v16.3/hf-cache.tar" /workspace/hf-cache.tar
+        if gsutil -q stat "${_HF_BUCKET}/v16.4/hf-cache.tar"; then
+          gsutil -m cp "${_HF_BUCKET}/v16.4/hf-cache.tar" /workspace/hf-cache.tar
           tar -xf /workspace/hf-cache.tar -C textsum
-          echo "restored v16.3 HF cache from tar"
+          echo "restored v16.4 HF cache from tar"
         else
-          echo "no v16.3 cache tar yet (first build) — will download the model"
+          echo "no v16.4 cache tar yet (first build) — will download the model"
         fi
 
   # 2. Download the model only if not already present (restored by step 1).
@@ -56,7 +59,7 @@ steps:
         pip install --no-cache-dir --timeout 300 --retries 5 huggingface_hub hf_transfer
         export HF_HOME=/workspace/textsum/hf-cache HF_HUB_ENABLE_HF_TRANSFER=1
         python -c "from huggingface_hub import snapshot_download; \
-          snapshot_download('RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic')"
+          snapshot_download('nvidia/Gemma-4-26B-A4B-NVFP4')"
 
   # 3. Repack the cache as a single tar (symlinks preserved, no -h → ~26 GB not
   #    ~52) and upload, replacing the previous tar.
@@ -67,8 +70,8 @@ steps:
       - |
         set -euo pipefail
         tar -cf /workspace/hf-cache.tar -C textsum hf-cache
-        gsutil -m cp /workspace/hf-cache.tar "${_HF_BUCKET}/v16.3/hf-cache.tar"
-        echo "uploaded v16.3 cache tar: $(du -h /workspace/hf-cache.tar | cut -f1)"
+        gsutil -m cp /workspace/hf-cache.tar "${_HF_BUCKET}/v16.4/hf-cache.tar"
+        echo "uploaded v16.4 cache tar: $(du -h /workspace/hf-cache.tar | cut -f1)"
 
   # 4. Build the image (weights come from the context via COPY hf-cache) + push.
   - name: 'gcr.io/cloud-builders/docker'
@@ -85,11 +88,16 @@ steps:
         # Inline cache from the previous image reuses the apt/pip/torch base
         # layers; the COPY hf-cache layer is cache-hit when the weight is
         # unchanged, so a run.py edit busts only the tiny final COPY model layer.
+        # v16.3 is listed as a second cache source so the FIRST v16.4 build
+        # (no v16.4 tag yet) still reuses the identical apt/pip/torch layers
+        # from v16.3 (the NVFP4 hf-cache layer differs, so only that + COPY
+        # model rebuild). --cache-from on a missing tag is a no-op warning.
         DOCKER_BUILDKIT=1 docker build \
+          --cache-from $$IMG:v16.4 \
           --cache-from $$IMG:v16.3 \
           --build-arg BUILDKIT_INLINE_CACHE=1 \
-          -t $$IMG:v16.3 .
-        docker push $$IMG:v16.3
+          -t $$IMG:v16.4 .
+        docker push $$IMG:v16.4
 
 availableSecrets:
   secretManager:
