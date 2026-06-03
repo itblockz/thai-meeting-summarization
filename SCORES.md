@@ -1,6 +1,6 @@
 # Experiment scores
 
-Pulled from LANTA `eval_result/train_eval_score*.json` on 2026-06-03. Model column reconstructed from each `run.py` (exp01–66) and from git-log commit messages (exp67–86, whose run.py files were removed — only eval_result remains).
+Pulled from LANTA `eval_result/train_eval_score*.json` on 2026-06-03. Model column reconstructed from each `run.py` (exp01–66, plus exp87/88) and from git-log commit messages (exp67–86, whose run.py files were removed — only eval_result remains).
 
 Composite = **0.35 × RougeL + 0.45 × SS-score + 0.20 × IoU**.
 
@@ -51,6 +51,7 @@ Composite = **0.35 × RougeL + 0.45 × SS-score + 0.20 × IoU**.
 | exp58 | 27B-FP8 → A3B | hybrid | heldout | 0.4777 | 0.8442 | 0.8006 | 0.7072 | 0.5471 |
 | exp68 | A3B (full-doc few-shot) | single | heldout | 0.4818 | 0.8564 | 0.7637 | 0.7067 | 0.5540 |
 | exp64 | A3B → 32B-AWQ | hybrid | heldout | 0.4832 | 0.8471 | 0.7644 | 0.7032 | 0.5503 |
+| exp88 | A3B | single | heldout | 0.4711 | 0.8607 | 0.7512 | 0.7025 | 0.5522 |
 | exp61 | A3B | single | heldout | 0.4671 | 0.8513 | 0.7761 | 0.7018 | 0.5466 |
 | exp44 | 27B-FP8·3.5 | single | heldout | 0.4643 | 0.8581 | 0.7612 | 0.7009 | 0.5486 |
 | exp39 | 32B-AWQ | single | heldout | 0.4934 | 0.8618 | 0.6930 | 0.6991 | 0.5606 |
@@ -60,6 +61,7 @@ Composite = **0.35 × RougeL + 0.45 × SS-score + 0.20 × IoU**.
 | exp53 | 32B-AWQ + V15 | single | heldout | 0.4886 | 0.8522 | 0.7141 | 0.6973 | 0.5545 |
 | exp63 | 27B-FP8 (prefix-cache probe) | single | heldout | 0.4616 | 0.8480 | 0.7709 | 0.6973 | 0.5431 |
 | exp74 | gemma-26B-FP8 | single | heldout | 0.4528 | 0.8350 | 0.8139 | 0.6970 | 0.5343 |
+| exp87 | 27B-FP8 | single | heldout | 0.4558 | 0.8480 | 0.7771 | 0.6966 | 0.5411 |
 | exp67 | 32B-AWQ + V10 | single | heldout | 0.4892 | 0.8534 | 0.6980 | 0.6948 | 0.5552 |
 | exp37 | 32B-AWQ | single | heldout | 0.4939 | 0.8626 | 0.6669 | 0.6944 | 0.5611 |
 | exp35 | 32B-AWQ | single | heldout | 0.4853 | 0.8592 | 0.6820 | 0.6929 | 0.5565 |
@@ -136,6 +138,7 @@ Composite = **0.35 × RougeL + 0.45 × SS-score + 0.20 × IoU**.
 | 24 | exp69 | A3B | single | 0.4802 | 0.8574 | 0.5539 | 0.7087 |
 | 25 | exp83 | gemma-26B → A3B | hybrid | 0.4816 | 0.8539 | 0.5528 | 0.7133 |
 | 26 | exp73 | gemma-31B-NVFP4 | single | 0.4790 | 0.8546 | 0.5522 | 0.7140 |
+| 26 | exp88 | A3B | single | 0.4711 | 0.8607 | 0.5522 | 0.7025 |
 | 27 | exp64 | A3B → 32B-AWQ | hybrid | 0.4832 | 0.8471 | 0.5503 | 0.7032 |
 | 28 | exp44 | 27B-FP8·3.5 | single | 0.4643 | 0.8581 | 0.5486 | 0.7009 |
 | 29 | exp58 | 27B-FP8 → A3B | hybrid | 0.4777 | 0.8442 | 0.5471 | 0.7072 |
@@ -146,6 +149,7 @@ Composite = **0.35 × RougeL + 0.45 × SS-score + 0.20 × IoU**.
 | 34 | exp36 | 32B-AWQ | single | 0.4608 | 0.8468 | 0.5424 | 0.6819 |
 | 35 | exp30 | 32B-AWQ | single | 0.4584 | 0.8467 | 0.5414 | 0.6783 |
 | 36 | exp27 | 32B-AWQ | single | 0.4585 | 0.8460 | 0.5412 | 0.6777 |
+| 37 | exp87 | 27B-FP8 | single | 0.4558 | 0.8480 | 0.5411 | 0.6966 |
 | 37 | exp33 | 32B-AWQ | single | 0.4573 | 0.8466 | 0.5410 | 0.6780 |
 | 38 | exp34 | 32B-AWQ | single | 0.4586 | 0.8454 | 0.5409 | 0.6790 |
 | 39 | exp46 | 32B-AWQ | single | 0.4457 | 0.8550 | 0.5407 | 0.6597 |
@@ -194,3 +198,4 @@ Composite = **0.35 × RougeL + 0.45 × SS-score + 0.20 × IoU**.
 - **Stage assignment** (`A → B`): exp55/56/57 = 27B-FP8 → 32B-AWQ; exp58/59/60 = 27B-FP8 → A3B; exp64/65/66 = A3B → 32B-AWQ; exp80/81/82/83 = gemma-26B → A3B; exp86 = gemma-26B-NVFP4·nv → 32B-AWQ. exp86 confirmed the rule: gemma Stage-A refs only convert under a 32B-AWQ Stage-B (under A3B Stage-B they're a wash at ~0.719, exp80/81).
 - **No score JSON on LANTA** (omitted): exp21, 31, 43, 47, 49, 71, 72, 75, 78, 84, 85 — retrieval-only, OOM/infeasible (gemma FP8/NVFP4 that didn't fit A100), or scored but not under eval_result. exp21 (0.6574, 32B-AWQ) appears in CLAUDE.md but its JSON wasn't collected here.
 - exp80–83 Stage models reconstructed from commit messages; the exact answer-vs-ref split for exp82/83 (A3B answers / gemma cites) is per git log, run.py removed.
+- **exp37-recipe model sweep (exp37/87/88)**: same recipe (context-first, single-ref shots, 512 tok), model only. A3B (exp88, 0.7025) > 27B-FP8 (exp87, 0.6966) > 32B-AWQ (exp37, 0.6944). exp87 has the sharpest single-stage citation (IoU 0.7771) but the weakest answers (0.35RL+0.45SS = 0.5411) → reinforces 27B-FP8 as a ref-picker, not an answer-writer. exp88 < exp42 (0.7087) shows the exp38 recipe (1024 tok + multi-ref shot2) adds the remaining lift on A3B.
