@@ -38,16 +38,26 @@ Why this 26B MoE can use the FP8 checkpoint where the dense 31B could NOT
   context at ~7.7K → 89% truncated. For the dense 31B FP8 you need TP=2.
 - This 26B MoE keeps ALL 26B params resident but FP8-packed → ~26 GB, not
   ~30 GB. At gpu_memory_utilization 0.95 (~38 GB budget − 26 weights − ~2
-  activations) ≈ 10 GiB KV; gemma-4's attention layout needs 9.54 GiB for
-  the full 32768 context (exp73) → fits with thin headroom, so
-  MAX_MODEL_LEN=32768 with NO truncation (exp74-verified on A100). KV stays
-  bf16 — do NOT set kv_cache_dtype="fp8" (same sm80 e4m3 wall as exp71/72).
+  activations) ≈ 10 GiB KV pool; gemma-4's attention layout needs 9.54 GiB
+  for the full 32768 context (exp73) → fits with thin headroom, so
+  MAX_MODEL_LEN=32768 with NO truncation (exp74-verified at 0.95 on A100).
+  v16.3.1 cut MAX_NUM_BATCHED_TOKENS 16384→8192 after a 98% crash on the
+  H100-40GB backend (util stays 0.95 — see GPU_MEM_UTIL note for why
+  raising it was the wrong lever). KV stays bf16 — do NOT set
+  kv_cache_dtype="fp8" (same sm80 e4m3 wall as exp71/72).
 - On A100 (no native FP8 cores) vLLM reads compressed-tensors FP8 from
   config.json and picks fp8_marlin / fp8_w8a16 software dequant, but the
   MoE routes only ~4B active params/token → wall-time lands near the A3B
   line (~9 min generation, exp74-verified), not the dense 27B-FP8 line.
-- util 0.95 (not v16.2's 0.92): FP8 weights are ~4 GB heavier than NVFP4,
-  so the tighter util claws back the KV headroom — exp74's verified value.
+- MAX_NUM_BATCHED_TOKENS 8192 (v16.3.1; was 16384), util kept at 0.95.
+  v16.1 (A3B-FP8, weights 29.54 GiB but tiny KV ~3 GiB) and v16.2 (NVFP4,
+  weights 22 + KV 9.54) both PASSED on the H100-40GB backend with ~5–6 GiB
+  physical free. v16.3 carries gemma-4's big KV (9.54) AND heavier FP8
+  weights (26) → only ~2.5 GiB free at full context → the prefill scratch
+  spike overran it at 98%. Raising util would SHRINK that buffer (wrong
+  way); the fix is a smaller prefill chunk (8192 → halved spike). Drops
+  ZERO paragraphs → no score loss. If it still crashes the cause is the FP8
+  Hopper kernel path, not memory → fall back to v16.2 (0.7140).
 - Multimodal vision blocks load idle for text-only chat;
   limit_mm_per_prompt={"image":0,"video":0} stops vLLM reserving the
   encoder cache budget.
@@ -109,15 +119,39 @@ PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
 
 MAX_NEW_TOKENS         = 1024
 MAX_MODEL_LEN          = int(os.environ.get("MAX_MODEL_LEN", "32768"))
-# 16384 = sweet spot carried from the 32B-AWQ / A3B builds: the 14K-tok
-# median prompt is still single-chunk and the 28K-tok max prompt fits 2
-# chunks. gemma-4-26B-A4B FP8 MoE keeps it — the fp8_marlin dequant makes
-# prefill heavier, but the per-step batched-token budget is unchanged.
-MAX_NUM_BATCHED_TOKENS = int(os.environ.get("MAX_NUM_BATCHED_TOKENS", "16384"))
-# 0.95 (not v16.2's 0.92): FP8 weights ~26 GB are ~4 GB heavier than
-# NVFP4's ~22 GB, so the tighter util claws back the KV headroom — leaves
-# ~10 GiB for KV vs the 9.54 GiB the full 32768 context needs. exp74's
-# verified value on A100-40GB (no truncation).
+# 8192 (v16.3.1; was 16384): the chunked-prefill budget = peak activation /
+# fp8_marlin dequant *scratch* per step, which lives OUTSIDE vLLM's
+# pre-allocated KV pool and eats the ~2.5 GiB physical buffer (see
+# GPU_MEM_UTIL note: weights 26 + KV 9.54 leave only ~2.5 GiB free on
+# H100-40GB at full context). The 98% crash hits on the largest doc (sorted
+# last) whose ~28-32K-token prompt prefills in 2 chunks of ~15K at 16384 →
+# activation/scratch peak overruns that buffer. Halving to 8192 → ~4 chunks
+# of ~7.5K → peak ~halved, fits the buffer, and NO paragraph is dropped
+# (chunking is transparent) → zero score loss vs truncation. Costs only
+# slightly slower prefill. Was 16384 = the 32B-AWQ / A3B sweet spot (median
+# 14K prompt single-chunk; those models had a fatter buffer to absorb it);
+# gemma-4 FP8's big KV + heavy weights is exactly why the smaller chunk is
+# now needed. Drop to 4096 if 8192 still spikes.
+MAX_NUM_BATCHED_TOKENS = int(os.environ.get("MAX_NUM_BATCHED_TOKENS", "8192"))
+# 0.95 (kept; NOT raised). The benchmark backend is H100-*40GB* (confirmed).
+# Cross-checking the two single-model images that PASSED on it:
+#   v16.1 A3B-FP8: weights 29.54 GiB, KV 6.75 GiB (73,744 tok → ~3.0 GiB at
+#                  32768), peak ~36 → ~5.5 GiB physical free. PASS.
+#   v16.2 NVFP4:   weights 22, KV 9.54, peak ~33.5 → ~6.5 GiB free. PASS.
+#   v16.3 FP8:     weights 26 + gemma-4's big KV 9.54 = 35.5 occupied → only
+#                  ~2.5 GiB physical free at full context. CRASH at 98%.
+# Lesson from v16.1: the crash is a PHYSICAL-BUFFER / prefill-scratch spike,
+# not KV-pool exhaustion (a short pool only makes vLLM preempt, never crash).
+# physical_buffer = (1-util)*40: at 0.95 = 2.0 GiB, at 0.97 = only 1.2 GiB —
+# so RAISING util shrinks the very buffer the spike needs (an earlier 0.97
+# bump here was backwards and was reverted). 0.95 keeps KV-pool ~10 ≥ 9.54
+# (full 32768, no truncation) AND preserves the 2.0 GiB buffer. Structural
+# ceiling: weights 26 + KV 9.54 means v16.3 can never get the 5–6 GiB buffer
+# v16.1/v16.2 enjoyed — so the spike MUST be shrunk instead, via
+# MAX_NUM_BATCHED_TOKENS=8192 above (drop to 4096 if it still spikes). That
+# lever, not util, is the real fix and drops ZERO paragraphs (no score loss).
+# If it still crashes, the residual cause is the FP8 Hopper kernel path
+# (docstring OPEN RISK), not memory — fall back to v16.2 (NVFP4, 0.7140).
 GPU_MEM_UTIL           = float(os.environ.get("GPU_MEM_UTIL", "0.95"))
 MODEL_NAME             = os.environ.get("LLM_MODEL", "RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic")
 
