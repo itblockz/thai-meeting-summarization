@@ -19,9 +19,11 @@ RUN pip3 install --no-cache-dir --timeout 300 --retries 5 \
     torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 RUN pip3 install --no-cache-dir --timeout 300 --retries 5 -r requirements.txt
 
-RUN python3 -c "\
-from huggingface_hub import snapshot_download; \
-snapshot_download('Qwen/Qwen3-32B-AWQ')"
+# Bake the Qwen3-32B-AWQ HF cache, seeded from GCS by cloudbuild.yaml (NOT
+# downloaded here). This is the ~18 GB layer; it only changes when the model
+# changes, so a run.py edit leaves it cache-hit. COPY hf-cache BEFORE COPY
+# model so a prompt/shot edit invalidates only the tiny final layer.
+COPY hf-cache /root/.cache/huggingface
 
 ENV HF_HOME=/root/.cache/huggingface \
     HF_HUB_OFFLINE=1 \

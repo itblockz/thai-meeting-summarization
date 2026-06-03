@@ -1,0 +1,13 @@
+# Controls the docker build context for `docker build .` (context = textsum/).
+# The Dockerfile does `COPY model /model`, which would otherwise pull in the
+# 100+ test.json.zipN splits and the baked test.json — none of which belong in
+# the image (the benchmark bind-mounts the real test data over /model/test).
+
+model/test/
+*.json.zip*
+
+# safety: nothing else from textsum/ is COPYed except model/, requirements.txt
+# and hf-cache/ (the GCS-restored weights)
+__pycache__/
+*.pyc
+*.log
