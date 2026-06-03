@@ -1,20 +1,25 @@
 """
-exp83 — answer-FIRST attribution, answer+cite Stage 2.
+exp83 — both answer + ref from gemma, gemma hinted by A3B's answer.
 
-Same as exp82 (A3B answers first → gemma produces the refs; A3B's answer is
-the final abstractive) EXCEPT Stage 2's gemma prompt: instead of cite-only,
-gemma does its FAMILIAR V10 answer+cite task with A3B's answer injected as a
-"คำตอบเบื้องต้น" (preliminary answer). gemma re-writes an answer (DISCARDED)
-and cites — we keep ONLY its citation as refs.
+Shared pipeline with exp82 (they differ ONLY in which model's answer becomes
+the final abstractive):
 
-WHY two variants: cite-only (exp82) is the truest "attribution" framing but an
-UNFAMILIAR output format for gemma. answer+cite (this) keeps gemma in the exact
-V10 groove where it hit the record IoU 0.8139 (exp74) — the citation rides on
-generating an answer, which is gemma's proven behavior. A/B tests whether the
-unfamiliar cite-only prompt degrades gemma's citation vs the proven format.
+Stage 1: A3B-Instruct-2507-FP8 does NORMAL V10 (answer + cite) on the full doc.
+         Its answer is used ONLY as a hint to Stage 2 (discarded from output).
+Stage 2: gemma-4-26B-A4B-it-FP8-Dynamic does NORMAL V10 (answer + cite) on the
+         full doc, with A3B's answer added as a "คำตอบเบื้องต้น" hint.
 
-Final abstractive = A3B's answer in BOTH variants; only gemma's refs differ.
-See exp82 header for the full answer→refs rationale.
+exp82: final abstractive = A3B's answer, final refs = gemma's cite.
+exp83 (this): final abstractive = gemma's answer, final refs = gemma's cite —
+              BOTH taken from gemma's Stage 2 output (A3B's answer is just the
+              hint that anchors gemma's rewrite).
+
+WHY the A/B: gemma's free answers are weak (exp74, ~4B-active ceiling), but
+here gemma rewrites while ANCHORED to A3B's strong answer via the hint — so
+gemma's answer may inherit A3B's quality while its citation rides its own
+proven V10 groove (IoU 0.8139). exp82 vs exp83 measures whether keeping A3B's
+original answer (exp82) beats gemma's hinted rewrite (exp83). See exp82 header
+for the full rationale.
 """
 from pathlib import Path
 import os
@@ -84,7 +89,7 @@ def filter_valid_paragraphs(paragraphs):
 
 
 def build_prompt_v10(query, paras):
-    """V10_factual — Stage 1 (A3B answer) prompt."""
+    """V10_factual — normal answer+cite prompt (Stage 1 A3B)."""
     context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
     return (
         f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
@@ -96,8 +101,8 @@ def build_prompt_v10(query, paras):
     )
 
 
-def build_prompt_refine(query, paras, prelim):
-    """Stage 2 (gemma) answer+cite: V10 with A3B's answer as preliminary."""
+def build_prompt_v10_hinted(query, paras, prelim):
+    """Normal V10 + A3B's answer added as a 'คำตอบเบื้องต้น' hint (Stage 2 gemma)."""
     context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
     return (
         f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
@@ -105,6 +110,7 @@ def build_prompt_refine(query, paras, prelim):
         f"คำตอบเบื้องต้น: {prelim}\n\n"
         f"คำสั่ง: ตอบคำถามเป็นภาษาไทย**สั้นและตรงประเด็น** "
         f"โดยยึดตามคำตอบเบื้องต้นข้างต้น ระบุข้อเท็จจริงที่ปรากฏในย่อหน้าเท่านั้น "
+        f"ห้ามตีความหรือสรุปเกินขอบเขต "
         f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y]\n"
         f"คำตอบ:"
     )
@@ -121,14 +127,14 @@ def build_messages_answer(query, paras):
     ]
 
 
-def build_messages_refine(query, paras, prelim):
+def build_messages_hinted(query, paras, prelim):
     return [
         {"role": "system", "content": SYSTEM_MSG},
-        {"role": "user",      "content": build_prompt_refine(_SHOT1_QUERY, _SHOT1_PARAS, _SHOT1_ANSWER_TEXT)},
+        {"role": "user",      "content": build_prompt_v10_hinted(_SHOT1_QUERY, _SHOT1_PARAS, _SHOT1_ANSWER_TEXT)},
         {"role": "assistant", "content": _SHOT1_ANSWER},
-        {"role": "user",      "content": build_prompt_refine(_SHOT2_QUERY, _SHOT2_PARAS, _SHOT2_ANSWER_TEXT)},
+        {"role": "user",      "content": build_prompt_v10_hinted(_SHOT2_QUERY, _SHOT2_PARAS, _SHOT2_ANSWER_TEXT)},
         {"role": "assistant", "content": _SHOT2_ANSWER},
-        {"role": "user",      "content": build_prompt_refine(query, paras, prelim)},
+        {"role": "user",      "content": build_prompt_v10_hinted(query, paras, prelim)},
     ]
 
 
@@ -171,15 +177,15 @@ def main():
     doc_index = {doc["doc_id"]: doc["paragraphs"] for doc in data["docs"]}
     queries = data["queries"]
     n = len(queries)
-    print(f"exp83 (answer-first, answer+cite attribution): {n} queries, "
-          f"{len(doc_index)} docs", flush=True)
+    print(f"exp83 (both answer+ref from gemma, gemma hinted by A3B answer): "
+          f"{n} queries, {len(doc_index)} docs", flush=True)
 
     doc_paras = {}
     for doc_id, paragraphs in doc_index.items():
         doc_paras[doc_id] = filter_valid_paragraphs(paragraphs)
 
-    # ----- Stage 1: A3B writes the answer FIRST (no hint) -----
-    print(f"\n=== Stage 1: {MODEL_ANSWER} → answer (final abstractive) ===", flush=True)
+    # ----- Stage 1: A3B normal V10 (answer used as hint only) -----
+    print(f"\n=== Stage 1: {MODEL_ANSWER} → answer (hint for Stage 2) ===", flush=True)
     items = []
     for i, query in enumerate(queries):
         benchmark_lib(i)
@@ -205,35 +211,41 @@ def main():
             answer = gen_texts[0] if gen_texts else q_text
             empty_answers += 1
         answers[qid] = answer
-    print(f"Stage 1 wrote {len(answers)} answers; empty_answers={empty_answers}",
+    print(f"Stage 1 wrote {len(answers)} hint-answers; empty_answers={empty_answers}",
           flush=True)
     del raws_answer
 
-    # ----- Stage 2: gemma re-answers (discarded) + cites → refs -----
-    print(f"\n=== Stage 2: {MODEL_REFS} → refs via answer+cite (answer discarded) ===", flush=True)
-    msgs_refine = []
+    # ----- Stage 2: gemma normal V10, hinted by A3B answer (keep BOTH) -----
+    print(f"\n=== Stage 2: {MODEL_REFS} → answer+cite hinted by A3B answer (keep both) ===", flush=True)
+    msgs_hinted = []
     for it in items:
         qid, gen_pids, gen_texts, _, q_text = it
         if gen_pids:
-            msgs_refine.append(build_messages_refine(q_text, gen_texts, answers[qid]))
+            msgs_hinted.append(build_messages_hinted(q_text, gen_texts, answers[qid]))
         else:
-            msgs_refine.append([{"role": "user", "content": q_text}])
+            msgs_hinted.append([{"role": "user", "content": q_text}])
 
     gemma_kwargs = dict(dtype="bfloat16", trust_remote_code=True,
                         enable_prefix_caching=True,
                         limit_mm_per_prompt={"image": 0, "video": 0})
-    raws_refs = run_stage(MODEL_REFS, gemma_kwargs, msgs_refine, gpu_mem_util=0.95)
+    raws_refs = run_stage(MODEL_REFS, gemma_kwargs, msgs_hinted, gpu_mem_util=0.95)
 
-    # FIRST-RUN SANITY: dump a few raw gemma outputs (answer+cite; answer discarded).
+    # FIRST-RUN SANITY: dump a few raw gemma outputs (answer+cite; both kept).
     for it, raw in list(zip(items, raws_refs))[:3]:
-        print(f"[refine {it[0]}] {raw[:200]!r}", flush=True)
+        print(f"[gemma {it[0]}] {raw[:200]!r}", flush=True)
 
     cite_re = re.compile(r'\[อ้างอิง[:\s]+[0-9,\s]+\]')
     results = []
     n_explicit = 0
     ref_counts = []
+    empty_gemma = 0
     for it, raw in zip(items, raws_refs):
         qid, gen_pids, gen_texts, _, q_text = it
+        # abstractive AND refs both from gemma's Stage 2 output
+        answer = split_answer(raw)
+        if not answer:
+            answer = answers[qid]  # fall back to A3B's answer if gemma emitted none
+            empty_gemma += 1
         cited_idx = parse_citation(raw, len(gen_pids))
         if gen_pids:
             ref_ids = [gen_pids[j] for j in cited_idx if j < len(gen_pids)]
@@ -244,9 +256,10 @@ def main():
         if cite_re.search(raw):
             n_explicit += 1
         ref_counts.append(len(ref_ids))
-        results.append({"ID": qid, "abstractive": answers[qid],
+        results.append({"ID": qid, "abstractive": answer,
                         "refs": ",".join(ref_ids)})
-    print(f"attribution: {n_explicit}/{len(results)} emitted tag, "
+    print(f"gemma cite: {n_explicit}/{len(results)} emitted tag, "
+          f"empty_gemma_answers={empty_gemma} (fell back to A3B), "
           f"avg refs/query={sum(ref_counts)/len(ref_counts):.2f}", flush=True)
 
     out_path = Path(RESULT_DIR) / "submission.csv"

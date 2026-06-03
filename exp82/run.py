@@ -1,30 +1,29 @@
 """
-exp82 — answer-FIRST attribution, cite-only Stage 2.
+exp82 — A3B answer + gemma ref, gemma hinted by A3B's answer.
 
-Reverses the exp80/81 hybrid ORDER: instead of refs→answer (a ref-picker
-hints the answer-writer), do answer→refs.
+Shared pipeline with exp83 (they differ ONLY in which model's answer becomes
+the final abstractive):
 
-Stage 1 (answer): A3B-Instruct-2507-FP8 writes the answer FIRST on the full
-    doc (V10_factual + exp38 2-shot), UNCONSTRAINED by any hint. Its emitted
-    citation is discarded; this answer IS the final abstractive.
-Stage 2 (attribution): gemma-4-26B-A4B-it-FP8-Dynamic reads the full doc +
-    query + A3B's answer and outputs ONLY the paragraph numbers that support
-    that answer → refs. Pure attribution: gemma writes no answer here.
+Stage 1: A3B-Instruct-2507-FP8 does NORMAL V10 (answer + cite) on the full doc.
+         Keep its answer (refs discarded).
+Stage 2: gemma-4-26B-A4B-it-FP8-Dynamic does NORMAL V10 (answer + cite) on the
+         full doc, with A3B's answer added as a "คำตอบเบื้องต้น" hint. Both
+         models stay in the exact V10 groove they were measured in.
+
+exp82 (this): final abstractive = A3B's answer, final refs = gemma's cite.
+exp83:        final abstractive = gemma's answer, final refs = gemma's cite
+              (both taken from gemma).
 
 WHY: gemma has the record single-model citation (exp74 IoU 0.8139) but weak
-~4B-active answers; A3B writes strong answers (exp51 V10 0.7110) but cites
-weakly. exp80/81 used gemma's refs to HINT A3B and landed flat (0.7191/0.7188)
-because gemma picked refs cold from the query (Stage-A role, IoU 0.8074) and
-the hint constrained A3B's answer. Here A3B answers freely (better answer)
-and gemma cites with the ANSWER in hand (the answer disambiguates which paras
-to cite → IoU may exceed 0.8074, even single-stage 0.8139). Both models stay
-in their strength; the order gives gemma the easier, better-grounded job.
+~4B-active answers; A3B writes strong answers (exp51 V10 0.7110). This pairs
+A3B's answer with gemma's cite, gemma hinted by A3B's answer so its citation
+aligns to the same content (may push IoU past exp80's cold-pick 0.8074). The
+exp82-vs-exp83 A/B isolates one question: is A3B's original answer better than
+gemma's hinted rewrite? (Expected yes — gemma's active-param ceiling — but the
+hint anchors gemma to A3B's good answer, so it's worth measuring.)
 
-exp82 (this) = cite-only Stage 2; exp83 = answer+cite Stage 2 (keeps gemma in
-its proven V10 groove). A/B on the attribution prompt format.
-
-Decision rule: accept if leak-free composite >= exp59 (0.7196); the prize is
-beating exp56 (0.7215) if gemma's answer-conditioned IoU > 27B-FP8's 0.8006.
+Decision rule: accept if leak-free composite >= exp59 (0.7196); prize is
+beating exp56 (0.7215) if gemma's hinted IoU > 27B-FP8's 0.8006.
 """
 from pathlib import Path
 import os
@@ -59,8 +58,7 @@ _SHOT1_PARAS = [
     "กรรมาธิการผู้มาประชุม",
 ]
 _SHOT1_ANSWER_TEXT = "การประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้น ณ ห้องประชุมกรรมาธิการ N 406 ชั้น ๔ อาคารรัฐสภา"
-_SHOT1_CITE = "[อ้างอิง: 3]"
-_SHOT1_ANSWER = f"{_SHOT1_ANSWER_TEXT} {_SHOT1_CITE}"
+_SHOT1_ANSWER = f"{_SHOT1_ANSWER_TEXT} [อ้างอิง: 3]"
 
 _SHOT2_QUERY = "ในการประชุมคณะกรรมาธิการการเงิน การคลัง สถาบันการเงินและตลาดการเงิน ครั้งที่ 49 มีกรรมการผู้ที่ไม่มาประชุมมีจำนวนกี่คน"
 _SHOT2_PARAS = [
@@ -71,8 +69,7 @@ _SHOT2_PARAS = [
     "๓. นายอัคร ทองใจสด (ลาการประชุม)",
 ]
 _SHOT2_ANSWER_TEXT = "ในการประชุมคณะกรรมาธิการการเงิน การคลัง สถาบันการเงินและตลาดการเงิน ครั้งที่ 49 มีกรรมการผู้ที่ไม่มาประชุมจำนวน 3 คน"
-_SHOT2_CITE = "[อ้างอิง: 2, 3, 4, 5]"
-_SHOT2_ANSWER = f"{_SHOT2_ANSWER_TEXT} {_SHOT2_CITE}"
+_SHOT2_ANSWER = f"{_SHOT2_ANSWER_TEXT} [อ้างอิง: 2, 3, 4, 5]"
 
 
 def benchmark_lib(i):
@@ -96,7 +93,7 @@ def filter_valid_paragraphs(paragraphs):
 
 
 def build_prompt_v10(query, paras):
-    """V10_factual — Stage 1 (A3B answer) prompt."""
+    """V10_factual — normal answer+cite prompt (Stage 1 A3B)."""
     context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
     return (
         f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
@@ -108,16 +105,18 @@ def build_prompt_v10(query, paras):
     )
 
 
-def build_prompt_attribution(query, paras, answer):
-    """Stage 2 (gemma) cite-only: given the answer, return supporting paras."""
+def build_prompt_v10_hinted(query, paras, prelim):
+    """Normal V10 + A3B's answer added as a 'คำตอบเบื้องต้น' hint (Stage 2 gemma)."""
     context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
     return (
         f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
         f"คำถาม: {query}\n\n"
-        f"คำตอบ: {answer}\n\n"
-        f"คำสั่ง: จากคำตอบข้างต้น ระบุ**เฉพาะ**เลขย่อหน้าที่เป็นแหล่งข้อมูลสนับสนุนคำตอบ "
-        f"ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y] เท่านั้น ไม่ต้องเขียนคำตอบซ้ำ\n"
-        f"อ้างอิง:"
+        f"คำตอบเบื้องต้น: {prelim}\n\n"
+        f"คำสั่ง: ตอบคำถามเป็นภาษาไทย**สั้นและตรงประเด็น** "
+        f"โดยยึดตามคำตอบเบื้องต้นข้างต้น ระบุข้อเท็จจริงที่ปรากฏในย่อหน้าเท่านั้น "
+        f"ห้ามตีความหรือสรุปเกินขอบเขต "
+        f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y]\n"
+        f"คำตอบ:"
     )
 
 
@@ -132,14 +131,14 @@ def build_messages_answer(query, paras):
     ]
 
 
-def build_messages_attribution(query, paras, answer):
+def build_messages_hinted(query, paras, prelim):
     return [
         {"role": "system", "content": SYSTEM_MSG},
-        {"role": "user",      "content": build_prompt_attribution(_SHOT1_QUERY, _SHOT1_PARAS, _SHOT1_ANSWER_TEXT)},
-        {"role": "assistant", "content": _SHOT1_CITE},
-        {"role": "user",      "content": build_prompt_attribution(_SHOT2_QUERY, _SHOT2_PARAS, _SHOT2_ANSWER_TEXT)},
-        {"role": "assistant", "content": _SHOT2_CITE},
-        {"role": "user",      "content": build_prompt_attribution(query, paras, answer)},
+        {"role": "user",      "content": build_prompt_v10_hinted(_SHOT1_QUERY, _SHOT1_PARAS, _SHOT1_ANSWER_TEXT)},
+        {"role": "assistant", "content": _SHOT1_ANSWER},
+        {"role": "user",      "content": build_prompt_v10_hinted(_SHOT2_QUERY, _SHOT2_PARAS, _SHOT2_ANSWER_TEXT)},
+        {"role": "assistant", "content": _SHOT2_ANSWER},
+        {"role": "user",      "content": build_prompt_v10_hinted(query, paras, prelim)},
     ]
 
 
@@ -182,14 +181,14 @@ def main():
     doc_index = {doc["doc_id"]: doc["paragraphs"] for doc in data["docs"]}
     queries = data["queries"]
     n = len(queries)
-    print(f"exp82 (answer-first, cite-only attribution): {n} queries, "
-          f"{len(doc_index)} docs", flush=True)
+    print(f"exp82 (A3B answer + gemma ref, gemma hinted by A3B answer): "
+          f"{n} queries, {len(doc_index)} docs", flush=True)
 
     doc_paras = {}
     for doc_id, paragraphs in doc_index.items():
         doc_paras[doc_id] = filter_valid_paragraphs(paragraphs)
 
-    # ----- Stage 1: A3B writes the answer FIRST (no hint) -----
+    # ----- Stage 1: A3B normal V10 (keep its answer) -----
     print(f"\n=== Stage 1: {MODEL_ANSWER} → answer (final abstractive) ===", flush=True)
     items = []
     for i, query in enumerate(queries):
@@ -220,24 +219,24 @@ def main():
           flush=True)
     del raws_answer
 
-    # ----- Stage 2: gemma attributes refs to A3B's answer (cite only) -----
-    print(f"\n=== Stage 2: {MODEL_REFS} → refs via attribution (cite only) ===", flush=True)
-    msgs_attr = []
+    # ----- Stage 2: gemma normal V10, hinted by A3B's answer (keep its cite) -----
+    print(f"\n=== Stage 2: {MODEL_REFS} → answer+cite hinted by A3B answer (keep cite) ===", flush=True)
+    msgs_hinted = []
     for it in items:
         qid, gen_pids, gen_texts, _, q_text = it
         if gen_pids:
-            msgs_attr.append(build_messages_attribution(q_text, gen_texts, answers[qid]))
+            msgs_hinted.append(build_messages_hinted(q_text, gen_texts, answers[qid]))
         else:
-            msgs_attr.append([{"role": "user", "content": q_text}])
+            msgs_hinted.append([{"role": "user", "content": q_text}])
 
     gemma_kwargs = dict(dtype="bfloat16", trust_remote_code=True,
                         enable_prefix_caching=True,
                         limit_mm_per_prompt={"image": 0, "video": 0})
-    raws_refs = run_stage(MODEL_REFS, gemma_kwargs, msgs_attr, gpu_mem_util=0.95)
+    raws_refs = run_stage(MODEL_REFS, gemma_kwargs, msgs_hinted, gpu_mem_util=0.95)
 
-    # FIRST-RUN SANITY: dump a few raw attribution outputs.
+    # FIRST-RUN SANITY: dump a few raw gemma outputs (answer+cite; answer discarded here).
     for it, raw in list(zip(items, raws_refs))[:3]:
-        print(f"[attr {it[0]}] {raw[:200]!r}", flush=True)
+        print(f"[gemma {it[0]}] {raw[:200]!r}", flush=True)
 
     cite_re = re.compile(r'\[อ้างอิง[:\s]+[0-9,\s]+\]')
     results = []
@@ -255,9 +254,10 @@ def main():
         if cite_re.search(raw):
             n_explicit += 1
         ref_counts.append(len(ref_ids))
+        # abstractive from A3B (Stage 1); refs from gemma (Stage 2)
         results.append({"ID": qid, "abstractive": answers[qid],
                         "refs": ",".join(ref_ids)})
-    print(f"attribution: {n_explicit}/{len(results)} emitted tag, "
+    print(f"gemma cite: {n_explicit}/{len(results)} emitted tag, "
           f"avg refs/query={sum(ref_counts)/len(ref_counts):.2f}", flush=True)
 
     out_path = Path(RESULT_DIR) / "submission.csv"

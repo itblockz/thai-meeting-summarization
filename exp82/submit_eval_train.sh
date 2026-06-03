@@ -31,7 +31,7 @@ export VLLM_WORKER_MULTIPROC_METHOD=spawn
 
 mkdir -p "$RESULT_DIR" "$PROJECT/logs"
 
-echo "=== exp82: answer-first — A3B writes answer, gemma attributes refs (cite only) ==="
+echo "=== exp82: A3B answer + gemma ref (gemma V10 hinted by A3B answer; answer=A3B) ==="
 cd "$PROJECT/exp82"
 python3 run.py
 
