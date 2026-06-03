@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=v17_test
+#SBATCH --job-name=v17_1_test
 #SBATCH --partition=gpu
 #SBATCH --account=zz991021
 #SBATCH --nodes=1
@@ -8,34 +8,28 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=03:00:00
-#SBATCH --output=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047/logs/v17_test_%j.out
-#SBATCH --error=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047/logs/v17_test_%j.err
+#SBATCH --output=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047/logs/v17_1_test_%j.out
+#SBATCH --error=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047/logs/v17_1_test_%j.err
 
 PROJECT=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047
 
 module purge
 module load Apptainer/1.1.6
 
-RESULT="$PROJECT/textsum_v17_test_result"
+RESULT="$PROJECT/textsum_v17_1_test_result"
 mkdir -p "$RESULT" "$PROJECT/logs"
 
-# v17 = exp56 port (two-stage hybrid). Stage A: Qwen3.6-27B-FP8 (~30 GB
-# FP8) with V10_factual prompt + exp38 shots → fresh refs. Stage B:
-# Qwen3-32B-AWQ (~18 GB INT4) with exp38 E5 prompt + "เน้นย่อหน้า"
-# hint pointing at Stage A's refs → fresh abstractive (refs FIXED to
-# Stage A). Leak-free A100 venv composite: 0.7215 (+0.0128 vs v16).
+# v17.1 = exp81 s2ans_s2ref port (two-stage). Stage 1: gemma-4-26B-A4B-it-FP8-
+# Dynamic (~26 GB FP8) V10_factual + exp38 shots → ref-index hint. Stage 2:
+# Qwen3-30B-A3B-Instruct-2507-FP8 (~29 GB FP8) SAME V10 + the hint → BOTH the
+# abstractive answer AND the refs. Leak-free A100 venv composite: 0.7207
+# (ties exp56's 0.7215). NO H100-specific config — both stages are FP8 and run
+# the precompiled CUTLASS/Marlin path (VLLM_USE_DEEP_GEMM=0 in run.py, no nvcc).
 #
-# Optimised for H100 40 GB single GPU (auto-detected at runtime):
-#   - native FP8 GEMM on Stage A (no Marlin software dequant)
-#   - FlashAttention-3 attention backend
-#   - FP8 KV cache (halves KV memory → ~2× concurrent prompts)
-#   - max_num_batched_tokens=16384 for long-context throughput
-# Falls back gracefully on A100 (kv_cache_dtype="auto" + MarlinFP8).
-#
-# Bind-mounts run.py over the container's /model/run.py for iteration
-# without rebuilding the ~50 GB SIF. --containall mirrors what the
-# benchmark backend gives at submission time.
-echo "=== v17 exp56 port (two-stage hybrid, H100 40GB optimised) container test ==="
+# Bind-mounts run.py over the container's /model/run.py for iteration without
+# rebuilding the ~55 GB-weights SIF. --containall mirrors what the benchmark
+# backend gives at submission time.
+echo "=== v17.1 exp81 s2ans_s2ref port (two-stage) container test ==="
 nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv 2>&1 || true
 apptainer exec --nv --containall --pwd /model \
     --bind "$PROJECT/textsum/model/run.py:/model/run.py:ro" \
@@ -44,9 +38,7 @@ apptainer exec --nv --containall --pwd /model \
     --bind "$RESULT:/result" \
     --env VLLM_WORKER_MULTIPROC_METHOD=spawn \
     --env MAX_MODEL_LEN=32768 \
-    --env LLM_MODEL_STAGE_A=Qwen/Qwen3.6-27B-FP8 \
-    --env LLM_MODEL_STAGE_B=Qwen/Qwen3-32B-AWQ \
-    "$PROJECT/textsum_v17_local.sif" python3 /model/run.py
+    "$PROJECT/textsum_v17_1_local.sif" python3 /model/run.py
 
 echo "=== exit code: $? ==="
 ls -la "$RESULT"

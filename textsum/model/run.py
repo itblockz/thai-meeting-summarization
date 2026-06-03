@@ -1,115 +1,71 @@
 """
-v16.3 — exp74 port (single-model gemma-4-26B-A4B-FP8 MoE + V10_factual).
+v17.1 — exp81 `s2ans_s2ref` port (two-stage, A3B writes the final answer).
 
-NO RETRIEVAL: the full list of *valid* paragraphs from `doc_id` is fed to
-RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic (26B MoE, ~4B active, FP8 weights
-~26 GB) in document order. The model is shown the paragraphs as a numbered
-[1..N] context, answers in Thai, then cites which paragraphs it used as
-[อ้างอิง: X]; the cited paragraphs become `refs` (E5 self-citation,
-adaptive count). Two worked few-shot examples are prepended as multi-turn
-chat turns.
+Container port of exp81's grid winner. The exp ran 6 combos; v17.1 ships the
+single best cell the user picked: **s2ans + s2ref** (Stage-2 answer AND Stage-2
+refs — A3B's own hinted pass supplies both columns). Leak-free train composite
+**0.7207** (RougeL 0.4879 / SS 0.8607 / IoU 0.8132), ties exp56's 0.7215 line.
 
-v16.3 = exp74 port. SINGLE-VARIABLE change from v16.2 (exp73, 0.7140):
-the LLM is swapped from gemma-4-31B-it-NVFP4 (dense, 4-bit) to gemma-4-
-26B-A4B-it-FP8-Dynamic (MoE, FP8). SAME V10_factual prompt, SAME exp38
-shots, SAME greedy decoding (temp 0, rep-pen 1.05).
+NO RETRIEVAL: the full list of *valid* paragraphs from `doc_id` is fed to both
+stages in document order. Two FP8 models share one 40 GB GPU loaded one at a
+time (del + gc + empty_cache between — they cannot coexist):
 
-⚠️ KNOWN-NEGATIVE on the train set: leak-free composite **0.6970** (venv
-run, exp74 — RougeL 0.4528 / SS 0.8350 / IoU 0.8139), −0.0170 vs v16.2's
-0.7140 and −0.0140 vs v16.1's 0.7110. The MoE *citation* is the best
-single-model number on record (99.9% tag rate, 1/1239 fallback, IoU
-0.8139 even beats dense gemma-4-31B's 0.8091), but the ~4B-active answers
-lose RougeL −0.0262 and SS −0.0196 vs the dense 31B, and that
-0.45+0.35-weighted answer-quality loss swamps the +0.0048 IoU gain. Same
-lesson as the A3B ref-picker and the <10B self-cite: active-param count
-caps abstractive quality even when citation is flawless. This image is
-kept as a packaged variant (faster than the dense 31B, near-A3B speed),
-NOT as a train-score improvement — prefer v16.2 (0.7140) for quality.
+  Stage 1 — RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic (26B MoE, ~4B active, FP8
+            ~26 GB). NORMAL V10_factual prompt + exp38 shots → answer + cite.
+            gemma's citation is the record single-model IoU (exp74 0.8139), so
+            its [อ้างอิง: …] picks become the REF-INDEX hint for Stage 2.
+            (Its answer text is discarded — see finding (1) below.)
+  --- free weights, gc.collect(), torch.cuda.empty_cache() ---
+  Stage 2 — Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 (the v16/exp42 model). SAME
+            V10 prompt + a "ย่อหน้าที่เกี่ยวข้องเบื้องต้น: [X, Y]" line carrying
+            ONLY Stage 1's ref *indices* → answer + cite. BOTH the abstractive
+            answer (s2ans) AND the refs (s2ref) come from this pass.
 
-This is the SINGLE-MODEL v16 lineage (one ~26 GB image — between v16.2's
-~22 GB NVFP4 and v16.1's ~30 GB A3B), kept as a proven-buildable
-alternative to the v17–v21 two-stage hybrid (~50 GB) on `master`.
+Why this exact plumbing (exp80–85 grid findings):
+ (1) hint as REF INDICES helps, hint as ANSWER TEXT contaminates — feeding
+     gemma's weak ~4B-active answer to A3B drags A3B's strong answer down
+     (−0.018 RougeL/SS); passing only the ref numbers leaves it intact.
+ (2) direction gemma→A3B beats A3B→gemma — the 0.80-weighted answer quality
+     dominates and A3B must write the final answer.
 
-Why this 26B MoE can use the FP8 checkpoint where the dense 31B could NOT
-(exp71/72 — infeasible on a single A100-40GB):
-- gemma-4-31B *dense* FP8 weights load ~30.4 GB → only ~6.49 GiB for KV,
-  and FP8 KV cache is impossible on A100 with an FP8 checkpoint (e4m3 has
-  no sm80 reshape_and_cache Triton kernel; e5m2 rejected). vLLM then caps
-  context at ~7.7K → 89% truncated. For the dense 31B FP8 you need TP=2.
-- This 26B MoE keeps ALL 26B params resident but FP8-packed → ~26 GB, not
-  ~30 GB. At gpu_memory_utilization 0.95 (~38 GB budget − 26 weights − ~2
-  activations) ≈ 10 GiB KV pool; gemma-4's attention layout needs 9.54 GiB
-  for the full 32768 context (exp73) → fits with thin headroom, so
-  MAX_MODEL_LEN=32768 with NO truncation (exp74-verified at 0.95 on A100).
-  v16.3.1 cut MAX_NUM_BATCHED_TOKENS 16384→8192 after a 98% crash on the
-  H100-40GB backend (util stays 0.95 — see GPU_MEM_UTIL note for why
-  raising it was the wrong lever). KV stays bf16 — do NOT set
-  kv_cache_dtype="fp8" (same sm80 e4m3 wall as exp71/72).
-- On A100 (no native FP8 cores) vLLM reads compressed-tensors FP8 from
-  config.json and picks fp8_marlin / fp8_w8a16 software dequant, but the
-  MoE routes only ~4B active params/token → wall-time lands near the A3B
-  line (~9 min generation, exp74-verified), not the dense 27B-FP8 line.
-- MAX_NUM_BATCHED_TOKENS 8192 (v16.3.1; was 16384), util kept at 0.95.
-  v16.1 (A3B-FP8, weights 29.54 GiB but tiny KV ~3 GiB) and v16.2 (NVFP4,
-  weights 22 + KV 9.54) both PASSED on the H100-40GB backend with ~5–6 GiB
-  physical free. v16.3 carries gemma-4's big KV (9.54) AND heavier FP8
-  weights (26) → only ~2.5 GiB free at full context → the prefill scratch
-  spike overran it at 98%. Raising util would SHRINK that buffer (wrong
-  way); the fix is a smaller prefill chunk (8192 → halved spike). Drops
-  ZERO paragraphs → no score loss. If it still crashes the cause is the FP8
-  Hopper kernel path, not memory → fall back to v16.2 (0.7140).
-- Multimodal vision blocks load idle for text-only chat;
-  limit_mm_per_prompt={"image":0,"video":0} stops vLLM reserving the
-  encoder cache budget.
-- enable_prefix_caching is honored for this MoE arch (exp74-verified — NOT
-  auto-disabled like the 27B-FP8 multimodal arch; see the engine log line).
+Container changes vs exp81/run.py (everything else is byte-identical: prompts,
+shots, models, greedy decode temp 0 / rep-pen 1.05, ref-index hint):
+ - Emit ONE submission.csv (s2ans + s2ref), not the 6-combo grid.
+ - LLMEngine.step() streaming instead of llm.generate(): the benchmark
+   `progress` binary fires per finished request, so the backend sees a real
+   heartbeat through the long generation (Stage 1 → 0..n/2, Stage 2 → n/2..n).
+ - Queries sorted by doc_id before submission so vLLM's prefix cache reuses
+   the ~14K-token full-doc prefilled KV across same-doc queries (CSV is written
+   back in ORIGINAL order). Keeps both stages inside the benchmark time budget.
+ - VLLM_USE_DEEP_GEMM=0 (set before any torch/vllm import): both stages are FP8
+   checkpoints; on the benchmark H100 vLLM's Hopper DeepGEMM block-FP8 path
+   JIT-compiles with nvcc, absent from this runtime image (`nvcc: not found` →
+   EngineCore dies). Disabling it forces the precompiled CUTLASS/Marlin FP8
+   path, identical to what the A100 local test exercises. kv_cache_dtype stays
+   at vLLM's default "auto" (→ bf16 KV) — no FP8-KV, no FlashInfer JIT, NO
+   H100-specific tuning (per the brief).
 
-H100-safe (carry over the v20 fix), with one OPEN RISK: the benchmark
-backend runs on H100 (SM 9.0); LANTA is A100-only so no local test
-exercises the Hopper path. This is an FP8 checkpoint, so H100 has a native
-fast path — VLLM_USE_DEEP_GEMM=0 (set below before any torch/vllm import)
-disables the DeepGEMM block-FP8 GEMM that JIT-compiles with nvcc (absent
-here), forcing the precompiled CUTLASS/Marlin FP8 path; kv_cache_dtype
-defaults to "auto" → bf16 (this RedHatAI checkpoint carries no
-kv_cache_quant_algo directive, so nothing resolves to fp8-KV / FlashInfer
-JIT). Whether sm90 takes the precompiled path with no other JIT is
-UNVERIFIED (A100-only locally). The first-run raw-output dump below guards
-against silent gibberish. This image needs NO nvcc — keeps the SIF lean.
+The two-stage handoff DEPENDS on V1 multiprocessing being ON
+(VLLM_ENABLE_V1_MULTIPROCESSING=1, pinned in the Dockerfile): each stage's
+EngineCore is a child process, so `del engine` tears it down and the OS
+reclaims its GPU memory before Stage 2 loads. In-process mode leaves Stage 1's
+weights resident → Stage 2 OOMs.
 
-v14→v16 infra (carry over):
-- Sort queries by doc_id before submission so the ~14K-token full-doc
-  prefix hits vLLM's prefix cache across all queries from the same
-  doc (cache-hit ceiling ~90%).
-- LLMEngine.step() streaming instead of llm.generate() — the benchmark
-  `progress` binary fires per finished request, so the backend sees a
-  real heartbeat.
-- enforce_eager=True keeps the V1-engine torch.compile path off
-  (Apptainer-incompatible) and costs ~0 latency at this batch size.
-- MAX_NEW_TOKENS 1024 (matches exp51 venv config; long multi-ref
-  answers from shot 2 sometimes truncate at 512).
-
-Output: submission.csv with columns ID, abstractive, refs — written in
-the *original* queries order (sort is internal only).
+Output: submission.csv with columns ID, abstractive, refs.
 """
 from pathlib import Path
 import os
 import re
 import json
 import csv
+import gc
 import time
 
-# --- Hopper/H100: force the precompiled FP8 path (no runtime nvcc) -----------
-# The base image is a CUDA *runtime* (no nvcc / no CUDA toolkit). On the
-# benchmark's H100, vLLM's Hopper-only FP8 fast path — DeepGEMM (block-FP8
-# GEMM) — JIT-compiles CUDA kernels with nvcc+ninja at first use, which dies
-# with `nvcc: not found` / `ninja: build stopped` and the EngineCore exits.
-# The A100 backend-sim never hits this: SM 8.0 has no native FP8, so vLLM uses
-# the precompiled Marlin/Triton FP8 path. Disabling DeepGEMM here (env read at
-# engine init) + keeping kv_cache_dtype="auto" forces that same precompiled
-# path on H100, so the shared SIF runs identically on A100 and H100. Must be
-# set BEFORE the first torch/vllm import. (Mirrors the v20 fix, 085e314.)
+# --- H100/no-nvcc: force the precompiled FP8 path (see docstring) ------------
+# Must be set BEFORE the first torch/vllm import.
 os.environ.setdefault("VLLM_USE_DEEP_GEMM", "0")
 
+import torch
 from transformers import AutoTokenizer
 from vllm import LLMEngine, EngineArgs, SamplingParams
 
@@ -117,62 +73,37 @@ TEST_DIR     = os.environ.get("TEST_DIR",     "/model/test")
 RESULT_DIR   = os.environ.get("RESULT_DIR",   "/result/")
 PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
 
-MAX_NEW_TOKENS         = 1024
-MAX_MODEL_LEN          = int(os.environ.get("MAX_MODEL_LEN", "32768"))
-# 8192 (v16.3.1; was 16384): the chunked-prefill budget = peak activation /
-# fp8_marlin dequant *scratch* per step, which lives OUTSIDE vLLM's
-# pre-allocated KV pool and eats the ~2.5 GiB physical buffer (see
-# GPU_MEM_UTIL note: weights 26 + KV 9.54 leave only ~2.5 GiB free on
-# H100-40GB at full context). The 98% crash hits on the largest doc (sorted
-# last) whose ~28-32K-token prompt prefills in 2 chunks of ~15K at 16384 →
-# activation/scratch peak overruns that buffer. Halving to 8192 → ~4 chunks
-# of ~7.5K → peak ~halved, fits the buffer, and NO paragraph is dropped
-# (chunking is transparent) → zero score loss vs truncation. Costs only
-# slightly slower prefill. Was 16384 = the 32B-AWQ / A3B sweet spot (median
-# 14K prompt single-chunk; those models had a fatter buffer to absorb it);
-# gemma-4 FP8's big KV + heavy weights is exactly why the smaller chunk is
-# now needed. Drop to 4096 if 8192 still spikes.
-MAX_NUM_BATCHED_TOKENS = int(os.environ.get("MAX_NUM_BATCHED_TOKENS", "8192"))
-# 0.95 (kept; NOT raised). The benchmark backend is H100-*40GB* (confirmed).
-# Cross-checking the two single-model images that PASSED on it:
-#   v16.1 A3B-FP8: weights 29.54 GiB, KV 6.75 GiB (73,744 tok → ~3.0 GiB at
-#                  32768), peak ~36 → ~5.5 GiB physical free. PASS.
-#   v16.2 NVFP4:   weights 22, KV 9.54, peak ~33.5 → ~6.5 GiB free. PASS.
-#   v16.3 FP8:     weights 26 + gemma-4's big KV 9.54 = 35.5 occupied → only
-#                  ~2.5 GiB physical free at full context. CRASH at 98%.
-# Lesson from v16.1: the crash is a PHYSICAL-BUFFER / prefill-scratch spike,
-# not KV-pool exhaustion (a short pool only makes vLLM preempt, never crash).
-# physical_buffer = (1-util)*40: at 0.95 = 2.0 GiB, at 0.97 = only 1.2 GiB —
-# so RAISING util shrinks the very buffer the spike needs (an earlier 0.97
-# bump here was backwards and was reverted). 0.95 keeps KV-pool ~10 ≥ 9.54
-# (full 32768, no truncation) AND preserves the 2.0 GiB buffer. Structural
-# ceiling: weights 26 + KV 9.54 means v16.3 can never get the 5–6 GiB buffer
-# v16.1/v16.2 enjoyed — so the spike MUST be shrunk instead, via
-# MAX_NUM_BATCHED_TOKENS=8192 above (drop to 4096 if it still spikes). That
-# lever, not util, is the real fix and drops ZERO paragraphs (no score loss).
-# If it still crashes, the residual cause is the FP8 Hopper kernel path
-# (docstring OPEN RISK), not memory — fall back to v16.2 (NVFP4, 0.7140).
-GPU_MEM_UTIL           = float(os.environ.get("GPU_MEM_UTIL", "0.95"))
-MODEL_NAME             = os.environ.get("LLM_MODEL", "RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic")
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "1024"))
+MAX_MODEL_LEN  = int(os.environ.get("MAX_MODEL_LEN",  "32768"))
+# exp81 model pairing. Per-stage util + max_num_batched_tokens are the
+# PROVEN-in-container values from the single-model v16 lineage (each stage
+# loads alone after the prior stage's teardown, so each sees a fresh 40 GB
+# GPU = the single-model situation those images validated):
+#   Stage 1 gemma — v16.3: util 0.95 + MNBT 8192. The default 16384 caused a
+#     98% OOM on the H100-40GB backend (gemma's ~26 GB FP8 weights + ~9.54 GiB
+#     KV leave only ~2.5 GiB physical buffer; the prefill-scratch spike at
+#     16384 overran it). 8192 halves the spike, drops zero paragraphs.
+#   Stage 2 A3B   — v16.1: util 0.95 + MNBT 16384 passed on the backend; A3B's
+#     small per-expert MLP makes activations cheap. We keep exp81's slightly
+#     more conservative util 0.90 here (this is the SECOND load after a gemma
+#     teardown, so a touch more headroom for any residual fragmentation).
+# These knobs are memory/throughput only — greedy decode output is unchanged,
+# so the 0.7207 score is preserved. All env-overridable.
+MODEL_STAGE1 = os.environ.get("LLM_MODEL_STAGE_1", "RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic")
+MODEL_STAGE2 = os.environ.get("LLM_MODEL_STAGE_2", "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8")
+STAGE1_UTIL  = float(os.environ.get("STAGE1_UTIL", "0.95"))  # gemma (v16.3)
+STAGE2_UTIL  = float(os.environ.get("STAGE2_UTIL", "0.90"))  # A3B   (exp81; v16.1 used 0.95)
+STAGE1_MNBT  = int(os.environ.get("STAGE1_MNBT", "8192"))    # gemma (v16.3 crash fix)
+STAGE2_MNBT  = int(os.environ.get("STAGE2_MNBT", "16384"))   # A3B   (v16.1)
 
 SYSTEM_MSG = (
     "คุณเป็นผู้ช่วยสรุปเอกสารภาษาไทย "
     "ตอบคำถามโดยอ้างอิงจากย่อหน้าที่ให้มาเท่านั้น ห้ามแต่งเติม"
 )
 
-# Two worked few-shot examples (both from held-out doc_050), rendered in
-# E5 form: a 5-paragraph numbered context and an answer ending with the
-# [อ้างอิง: N] tag.
-#
-# Shot 1 (exp08 carry-over): single-ref — matches the 71.8% single-ref
-# dataset prior, teaches "cite exactly the source paragraph."
-# Shot 2 (v15-K new): multi-ref subset — replaces exp08's single-ref
-# shot2 because the 153 missed-tag queries in the v15 train eval were
-# overwhelmingly multi-ref gold (model emits a comprehensive answer but
-# forgets to cite anything). Q0746 from doc_050: 4 of 5 context paragraphs
-# are gold (P21-P24, absentee list); P20 is a same-section distractor
-# (attendee #12). Teaches "structured answer covers several paragraphs
-# → cite them all" + "don't cite paragraphs the answer didn't use."
+# Few-shot pair — both from held-out doc_050. Shot 1 = exp08 single-ref,
+# Shot 2 = exp38 multi-ref (Q0746). Stage 1 (cold) and Stage 2 (hinted) reuse
+# the same QUERY/PARA triples; the wrapping prompt differs (hint line on S2).
 _SHOT1_QUERY = "ในการประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้นที่ใด"
 _SHOT1_PARAS = [
     "ครั้งที่ ๔๙",
@@ -181,7 +112,9 @@ _SHOT1_PARAS = [
     "_________________________",
     "กรรมาธิการผู้มาประชุม",
 ]
-_SHOT1_ANSWER = "การประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้น ณ ห้องประชุมกรรมาธิการ N 406 ชั้น ๔ อาคารรัฐสภา [อ้างอิง: 3]"
+_SHOT1_ANSWER_TEXT = "การประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้น ณ ห้องประชุมกรรมาธิการ N 406 ชั้น ๔ อาคารรัฐสภา"
+_SHOT1_HINT_IDX = [3]
+_SHOT1_ANSWER = f"{_SHOT1_ANSWER_TEXT} [อ้างอิง: 3]"
 
 _SHOT2_QUERY = "ในการประชุมคณะกรรมาธิการการเงิน การคลัง สถาบันการเงินและตลาดการเงิน ครั้งที่ 49 มีกรรมการผู้ที่ไม่มาประชุมมีจำนวนกี่คน"
 _SHOT2_PARAS = [
@@ -191,7 +124,9 @@ _SHOT2_PARAS = [
     "๒. นายธนยศ ทิมสุวรรณ (ลาการประชุม)",
     "๓. นายอัคร ทองใจสด (ลาการประชุม)",
 ]
-_SHOT2_ANSWER = "ในการประชุมคณะกรรมาธิการการเงิน การคลัง สถาบันการเงินและตลาดการเงิน ครั้งที่ 49 มีกรรมการผู้ที่ไม่มาประชุมจำนวน 3 คน [อ้างอิง: 2, 3, 4, 5]"
+_SHOT2_ANSWER_TEXT = "ในการประชุมคณะกรรมาธิการการเงิน การคลัง สถาบันการเงินและตลาดการเงิน ครั้งที่ 49 มีกรรมการผู้ที่ไม่มาประชุมจำนวน 3 คน"
+_SHOT2_HINT_IDX = [2, 3, 4, 5]
+_SHOT2_ANSWER = f"{_SHOT2_ANSWER_TEXT} [อ้างอิง: 2, 3, 4, 5]"
 
 
 def benchmark_lib(i):
@@ -214,19 +149,8 @@ def filter_valid_paragraphs(paragraphs):
     return [p for p in paragraphs if is_valid(p)]
 
 
-def build_prompt(query, paras):
-    """V10_factual prompt — CONTEXT FIRST, then query, then instruction.
-
-    The exp51 wording: answer "สั้นและตรงประเด็น" (short, to the point),
-    "ระบุข้อเท็จจริงที่ปรากฏในย่อหน้าเท่านั้น ห้ามตีความ" (state only facts
-    present in the paragraphs, no interpretation). Sharper than v16's
-    exp38 "กระชับและครอบคลุม" — lifts IoU by trimming over-cited refs.
-
-    Context-first lets vLLM's prefix cache match the full ~14K-token doc
-    block across all queries from the same doc (the query is the
-    divergence point, not the cache-killer at the start). Instruction
-    stays at the end for recency bias on the citation directive.
-    """
+def build_prompt_v10(query, paras):
+    """V10_factual — normal answer+cite prompt (Stage 1)."""
     context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
     return (
         f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
@@ -238,28 +162,46 @@ def build_prompt(query, paras):
     )
 
 
-def build_messages(query, paras):
-    """System + 2 few-shot turns + the final user turn.
+def build_prompt_v10_hinted(query, paras, hint_idx):
+    """Normal V10 + Stage 1's REF INDICES only as the hint (Stage 2)."""
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    hint_str = ", ".join(str(i) for i in hint_idx) if hint_idx else "—"
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"ย่อหน้าที่เกี่ยวข้องเบื้องต้น: [{hint_str}]\n\n"
+        f"คำสั่ง: ตอบคำถามเป็นภาษาไทย**สั้นและตรงประเด็น** "
+        f"โดยใช้ย่อหน้าที่เกี่ยวข้องข้างต้นเป็นแนวทาง "
+        f"ระบุข้อเท็จจริงที่ปรากฏในย่อหน้าเท่านั้น ห้ามตีความหรือสรุปเกินขอบเขต "
+        f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y]\n"
+        f"คำตอบ:"
+    )
 
-    Every user turn uses the same build_prompt; the few-shot assistant
-    turns carry the worked [อ้างอิง: N] answer.
-    """
+
+def build_messages_stage1(query, paras):
     return [
-        {"role": "system", "content": SYSTEM_MSG},
-        {"role": "user", "content": build_prompt(_SHOT1_QUERY, _SHOT1_PARAS)},
+        {"role": "system",    "content": SYSTEM_MSG},
+        {"role": "user",      "content": build_prompt_v10(_SHOT1_QUERY, _SHOT1_PARAS)},
         {"role": "assistant", "content": _SHOT1_ANSWER},
-        {"role": "user", "content": build_prompt(_SHOT2_QUERY, _SHOT2_PARAS)},
+        {"role": "user",      "content": build_prompt_v10(_SHOT2_QUERY, _SHOT2_PARAS)},
         {"role": "assistant", "content": _SHOT2_ANSWER},
-        {"role": "user", "content": build_prompt(query, paras)},
+        {"role": "user",      "content": build_prompt_v10(query, paras)},
+    ]
+
+
+def build_messages_stage2(query, paras, hint_idx):
+    return [
+        {"role": "system",    "content": SYSTEM_MSG},
+        {"role": "user",      "content": build_prompt_v10_hinted(_SHOT1_QUERY, _SHOT1_PARAS, _SHOT1_HINT_IDX)},
+        {"role": "assistant", "content": _SHOT1_ANSWER},
+        {"role": "user",      "content": build_prompt_v10_hinted(_SHOT2_QUERY, _SHOT2_PARAS, _SHOT2_HINT_IDX)},
+        {"role": "assistant", "content": _SHOT2_ANSWER},
+        {"role": "user",      "content": build_prompt_v10_hinted(query, paras, hint_idx)},
     ]
 
 
 def parse_citation(text, n_paras):
-    """0-indexed paragraph indices from ALL [อ้างอิง...] tags.
-
-    The model emits one tag per item in a multi-part answer; re.search
-    (first tag only) under-counts refs, so collect every tag's numbers.
-    """
+    """Collect 0-indexed paragraph indices from ALL [อ้างอิง...] tags."""
     nums = []
     for grp in re.findall(r'\[อ้างอิง[:\s]+([0-9,\s]+)\]', text):
         nums += [int(x) for x in re.findall(r'\d+', grp)]
@@ -268,21 +210,79 @@ def parse_citation(text, n_paras):
         if 1 <= num <= n_paras and num not in seen:
             seen.add(num)
             valid.append(num - 1)
-    return valid or [0]  # fallback: first paragraph
+    return valid or [0]
 
 
-def split_answer_citation(text):
-    """Return (answer, raw_citation_tag).
+def split_answer(text):
+    """Strip every [อ้างอิง...] tag inline."""
+    return re.sub(r'\s*\[อ้างอิง[^\]]*\]', '', text).strip()
 
-    answer = text with EVERY [อ้างอิง...] tag removed. The model emits a
-    tag inline after each item in multi-part answers, not only at the
-    end, so stripping from the last tag alone (rfind) leaks the earlier
-    tags into abstractive — gold answers carry no such tag.
+
+def make_engine_args(model_name, gpu_mem_util, max_num_batched_tokens):
+    """exp81's loader (LLM(...) kwargs) expressed as EngineArgs.
+
+    dtype bfloat16 + enable_prefix_caching + enforce_eager + the
+    limit_mm_per_prompt cap (gemma-4 is multimodal, text-only here) are
+    byte-identical to exp81. kv_cache_dtype is left at vLLM's default "auto"
+    (bf16 KV) — no FP8-KV, no H100 tuning. max_num_batched_tokens is the
+    PROVEN-in-container per-stage value (see the STAGE*_MNBT notes above).
     """
-    idx = text.rfind('[อ้างอิง')
-    raw_tag = text[idx:] if idx != -1 else ""
-    answer = re.sub(r'\s*\[อ้างอิง[^\]]*\]', '', text).strip()
-    return answer, raw_tag
+    return EngineArgs(
+        model=model_name,
+        max_model_len=MAX_MODEL_LEN,
+        gpu_memory_utilization=gpu_mem_util,
+        max_num_batched_tokens=max_num_batched_tokens,
+        dtype="bfloat16",
+        enforce_eager=True,
+        enable_prefix_caching=True,
+        trust_remote_code=True,
+        limit_mm_per_prompt={"image": 0, "video": 0},
+    )
+
+
+def run_stage(stage_label, model_name, gpu_mem_util, max_num_batched_tokens,
+              items, progress_fn):
+    """Load model, stream all `items` through engine.step(), free the GPU.
+
+    items: list of (key, messages) — key maps the raw output back to the
+    caller's structures. progress_fn(n_done_in_stage) fires per finished
+    request so the benchmark `progress` binary keeps a heartbeat.
+    """
+    print(f"\n=== {stage_label}: {model_name} "
+          f"(util {gpu_mem_util}, mnbt {max_num_batched_tokens}) ===", flush=True)
+    engine = LLMEngine.from_engine_args(
+        make_engine_args(model_name, gpu_mem_util, max_num_batched_tokens))
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS,
+                              repetition_penalty=1.05)
+
+    n = len(items)
+    for key, msgs in items:
+        prompt = tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        engine.add_request(request_id=str(key), prompt=prompt, params=sampling)
+
+    raw_by_key = {}
+    n_done = 0
+    t0 = time.time()
+    while engine.has_unfinished_requests():
+        for o in engine.step():
+            if o.finished:
+                raw_by_key[int(o.request_id)] = o.outputs[0].text.strip()
+                n_done += 1
+                progress_fn(n_done)
+                if n_done == 1 or n_done % 50 == 0 or n_done == n:
+                    elapsed = time.time() - t0
+                    rate = n_done / max(elapsed, 1e-6)
+                    eta = (n - n_done) / max(rate, 1e-6)
+                    print(f"  [{stage_label} {n_done}/{n}] {rate:.2f} q/s, eta {eta:.0f}s",
+                          flush=True)
+
+    # Free GPU before the next stage's weights land (V1 child-process teardown).
+    del engine, tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
+    return raw_by_key
 
 
 def main():
@@ -290,27 +290,26 @@ def main():
     doc_index = {doc["doc_id"]: doc["paragraphs"] for doc in data["docs"]}
     queries = data["queries"]
     n = len(queries)
-    print(f"v16.3 (exp74: gemma-4-26B-A4B-FP8 MoE + V10_factual) — {n} queries, "
-          f"{len(doc_index)} docs (NO RETRIEVAL — full doc, model={MODEL_NAME}, "
-          f"max_model_len={MAX_MODEL_LEN}, gpu_mem_util={GPU_MEM_UTIL}, "
-          f"max_num_batched_tokens={MAX_NUM_BATCHED_TOKENS})",
+    half = n // 2
+    print(f"v17.1 (exp81 s2ans_s2ref): {n} queries, {len(doc_index)} docs | "
+          f"S1={MODEL_STAGE1} → S2={MODEL_STAGE2} | max_model_len={MAX_MODEL_LEN}",
           flush=True)
     benchmark_lib(0)
 
-    # Pre-build full-doc paragraph lists (in document order) once per doc.
     doc_paras = {}
     for doc_id, paragraphs in doc_index.items():
         doc_paras[doc_id] = filter_valid_paragraphs(paragraphs)
 
-    # Sort indices by doc_id so queries from the same doc are submitted
-    # contiguously — vLLM's prefix cache then reuses the full-doc prefilled
-    # KV blocks across them. CSV is written in original queries order at
-    # the end (sort is internal only).
+    # Sort indices by doc_id so same-doc queries submit contiguously to BOTH
+    # stages (prefix-cache reuse). CSV is written in ORIGINAL order at the end.
     order = sorted(range(n), key=lambda i: queries[i]["doc_id"])
 
-    items = []  # one tuple per query, in sorted submission order
+    # ----- Stage 1 items (key = position in sorted order) -----
     pool_sizes = []
-    for idx in order:
+    gen_pids_by_k = {}
+    gen_texts_by_k = {}
+    stage1_items = []
+    for k, idx in enumerate(order):
         query = queries[idx]
         valid = doc_paras.get(query["doc_id"], [])
         q_text = query["query"]
@@ -318,82 +317,70 @@ def main():
             gen_pids  = [p["para_id"] for p in valid]
             gen_texts = [p["text"]    for p in valid]
             pool_sizes.append(len(valid))
-            messages = build_messages(q_text, gen_texts)
+            msgs = build_messages_stage1(q_text, gen_texts)
         else:
-            gen_pids, gen_texts, messages = [], [], None
-        items.append((idx, query["ID"], gen_pids, gen_texts, messages, q_text))
-
+            gen_pids, gen_texts = [], []
+            msgs = [{"role": "user", "content": q_text}]
+        gen_pids_by_k[k] = gen_pids
+        gen_texts_by_k[k] = gen_texts
+        stage1_items.append((k, msgs))
     if pool_sizes:
         print(f"pool sizes — mean={sum(pool_sizes)/len(pool_sizes):.2f}, "
               f"min={min(pool_sizes)}, max={max(pool_sizes)}", flush=True)
 
-    # FP8 quantization auto-detected from the model's config.json
-    # (compressed-tensors FP8-Dynamic, llm-compressor scheme); on A100 (no
-    # native FP8 cores) vLLM's CompressedTensors backend picks the
-    # fp8_marlin / fp8_w8a16 software-dequant path, and (with
-    # VLLM_USE_DEEP_GEMM=0) the precompiled CUTLASS/Marlin path on H100 — see
-    # the OPEN RISK in the module docstring. The MoE (A4B) routes only ~4B
-    # active params/token → near-A3B latency despite the marlin tax.
-    # kv_cache_dtype defaults to "auto" → bf16 KV: this RedHatAI checkpoint
-    # carries no kv_cache_quant_algo directive, so nothing resolves to fp8-KV
-    # / FlashInfer JIT, and gemma-4 has no A100 FP8-KV kernel anyway (bf16 KV
-    # is mandatory; do NOT set kv_cache_dtype="fp8").
-    # limit_mm_per_prompt={"image":0,"video":0} stops vLLM from reserving the
-    # multimodal encoder cache budget (gemma-4 is multimodal, text-only here).
-    engine_args = EngineArgs(
-        model=MODEL_NAME,
-        max_model_len=MAX_MODEL_LEN,
-        gpu_memory_utilization=GPU_MEM_UTIL,
-        dtype="bfloat16", enforce_eager=True,
-        max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
-        enable_prefix_caching=True,
-        trust_remote_code=True,
-        limit_mm_per_prompt={"image": 0, "video": 0},
-    )
-    # Load tokenizer separately via AutoTokenizer — vllm 0.19.1's
-    # engine.get_tokenizer() exists but AutoTokenizer keeps init order
-    # identical between container (0.19.1) and venv (0.19.1).
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-    engine = LLMEngine.from_engine_args(engine_args)
-    sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS,
-                              repetition_penalty=1.05)
+    # Stage 1 occupies the 0..n/2 half of the heartbeat range.
+    raws1 = run_stage("Stage 1 (gemma refs)", MODEL_STAGE1, STAGE1_UTIL, STAGE1_MNBT,
+                      stage1_items, progress_fn=lambda i: benchmark_lib(i // 2))
 
-    # Add all requests up-front; request_id encodes the submission position
-    # so we can map outputs back to items[].
-    for k, it in enumerate(items):
-        msgs = it[4] if it[4] is not None else [{"role": "user", "content": it[5]}]
-        prompt = tokenizer.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-        engine.add_request(request_id=str(k), prompt=prompt, params=sampling)
+    # Parse Stage 1 → ref-index hint (1-based positions within the full doc).
+    s1_hint = {}
+    avg_refs1 = 0
+    for k in range(n):
+        raw = raws1.get(k, "")
+        gen_pids = gen_pids_by_k[k]
+        cited_idx = parse_citation(raw, len(gen_pids))
+        valid_idx = [j for j in cited_idx if j < len(gen_pids)]
+        if not valid_idx and gen_pids:
+            valid_idx = [0]
+        s1_hint[k] = [j + 1 for j in valid_idx]
+        avg_refs1 += len(s1_hint[k])
+    print(f"Stage 1: avg hint refs/query = {avg_refs1/max(n,1):.2f}", flush=True)
+    del stage1_items, raws1
 
-    # Stream completions: call benchmark_lib on each finished request so the
-    # benchmark backend sees a real heartbeat (was: one batch ping at the
-    # very end after llm.generate() returned, ~30-60min of silence).
-    raw_by_k = {}
-    n_done = 0
-    t0 = time.time()
-    while engine.has_unfinished_requests():
-        for o in engine.step():
-            if o.finished:
-                raw_by_k[int(o.request_id)] = o.outputs[0].text.strip()
-                n_done += 1
-                benchmark_lib(n_done)
-                if n_done == 1 or n_done % 50 == 0 or n_done == n:
-                    elapsed = time.time() - t0
-                    rate = n_done / max(elapsed, 1e-6)
-                    eta = (n - n_done) / max(rate, 1e-6)
-                    print(f"  [{n_done}/{n}] done — {rate:.2f} q/s, eta {eta:.0f}s",
-                          flush=True)
+    # ----- Stage 2 items (same submission order; carries the ref-index hint) -----
+    stage2_items = []
+    for k, idx in enumerate(order):
+        query = queries[idx]
+        valid = doc_paras.get(query["doc_id"], [])
+        q_text = query["query"]
+        gen_texts = gen_texts_by_k[k]
+        if valid:
+            msgs = build_messages_stage2(q_text, gen_texts, s1_hint[k])
+        else:
+            msgs = [{"role": "user", "content": q_text}]
+        stage2_items.append((k, msgs))
 
-    # Parse outputs (still in sorted item order)
-    cite_re = re.compile(r'\[อ้างอิง[:\s]+[0-9,\s]+\]')
+    # Stage 2 occupies the n/2..n half of the heartbeat range.
+    raws2 = run_stage("Stage 2 (A3B answer+refs)", MODEL_STAGE2, STAGE2_UTIL, STAGE2_MNBT,
+                      stage2_items, progress_fn=lambda i: benchmark_lib(half + i // 2))
+
+    # ----- Assemble final results: s2ans (A3B answer) + s2ref (A3B refs) -----
+    empty_answers = 0
     n_explicit = 0
     ref_counts = []
+    cite_re = re.compile(r'\[อ้างอิง[:\s]+[0-9,\s]+\]')
     results_by_qid = {}
-    for k, it in enumerate(items):
-        _idx, qid, gen_pids, gen_texts, _, q_text = it
-        raw = raw_by_k[k]
-        answer, _ = split_answer_citation(raw)
+    for k, idx in enumerate(order):
+        query = queries[idx]
+        qid = query["ID"]
+        q_text = query["query"]
+        gen_pids = gen_pids_by_k[k]
+        gen_texts = gen_texts_by_k[k]
+        raw = raws2.get(k, "")
+        answer = split_answer(raw)
+        if not answer:
+            answer = gen_texts[0] if gen_texts else q_text
+            empty_answers += 1
         cited_idx = parse_citation(raw, len(gen_pids))
         if gen_pids:
             ref_ids = [gen_pids[j] for j in cited_idx if j < len(gen_pids)]
@@ -403,18 +390,16 @@ def main():
             ref_ids = []
         if cite_re.search(raw):
             n_explicit += 1
-        if not answer:
-            answer = gen_texts[0] if gen_texts else q_text
         ref_counts.append(len(ref_ids))
         results_by_qid[qid] = {"ID": qid, "abstractive": answer,
                                "refs": ",".join(ref_ids)}
-
-    print(f"citations: {n_explicit}/{len(items)} emitted an [อ้างอิง: …] tag, "
-          f"{len(items) - n_explicit} fell back to top-1", flush=True)
+    print(f"Stage 2 citations: {n_explicit}/{n} emitted an [อ้างอิง: …] tag, "
+          f"{n - n_explicit} fell back to top-1 | empty_answers={empty_answers}",
+          flush=True)
     if ref_counts:
-        print(f"avg refs/query: {sum(ref_counts) / len(ref_counts):.2f}", flush=True)
+        print(f"avg refs/query: {sum(ref_counts)/len(ref_counts):.2f}", flush=True)
 
-    # Write CSV in ORIGINAL queries order (not sorted submission order)
+    # Write CSV in ORIGINAL queries order (not sorted submission order).
     results = [results_by_qid[q["ID"]] for q in queries]
     out_path = Path(RESULT_DIR) / "submission.csv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -422,7 +407,6 @@ def main():
         writer = csv.DictWriter(f, fieldnames=["ID", "abstractive", "refs"])
         writer.writeheader()
         writer.writerows(results)
-
     print(f"Written {len(results)} rows to {out_path}", flush=True)
     return n
 

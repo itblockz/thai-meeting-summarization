@@ -1,11 +1,15 @@
 # syntax=docker/dockerfile:1
 #
-# MODEL WEIGHT IS NOT DOWNLOADED HERE. cloudbuild.yaml seeds it from a
+# MODEL WEIGHTS ARE NOT DOWNLOADED HERE. cloudbuild.yaml seeds them from a
 # persistent GCS tar (a HuggingFace cache), so a rebuild never re-fetches from
 # HF. The build context carries `hf-cache/` (restored from GCS by the earlier
 # Cloud Build steps) and we just COPY it in. Order matters: COPY hf-cache
 # BEFORE COPY model so a run.py edit invalidates only the tiny final layer,
-# never the ~26 GB weights.
+# never the ~55 GB weights.
+#
+# v17.1 = exp81 s2ans_s2ref two-stage port. The hf-cache holds BOTH FP8
+# models (gemma-4-26B-A4B-it-FP8-Dynamic Stage 1 + Qwen3-30B-A3B-FP8 Stage 2,
+# ~26 + ~29 GB); cloudbuild downloads both into the cache tar.
 FROM docker.io/nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -21,10 +25,11 @@ RUN apt-get update && apt-get install -y python3.11 python3.11-dev python3.11-di
     rm -rf /var/lib/apt/lists/*
 RUN ln -sf /usr/bin/python3.11 /usr/bin/python3
 
-# v16.3 needs NO nvcc: run.py sets VLLM_USE_DEEP_GEMM=0 and keeps
+# v17.1 needs NO nvcc: run.py sets VLLM_USE_DEEP_GEMM=0 and keeps
 # kv_cache_dtype="auto", forcing the precompiled CUTLASS/Marlin FP8 path on
 # both A100 and H100 (no runtime JIT). The v21 hybrid's cuda-minimal-build/nvcc
-# bake + CUDA_HOME env are dropped here — keeps this single-model image lean.
+# bake + CUDA_HOME env are dropped here — keeps the image lean. Both stages
+# are FP8 checkpoints, so the same no-nvcc path covers them.
 
 COPY requirements.txt ./
 # torch 2.10.0 wheels on cu128 index (matches CUDA 12.8.1 base)
@@ -32,27 +37,32 @@ RUN pip3 install --no-cache-dir --timeout 300 --retries 5 \
     torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 RUN pip3 install --no-cache-dir --timeout 300 --retries 5 -r requirements.txt
 
-# v16.3: single-model exp74 port. One model —
-# RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic (26B MoE, ~4B active, FP8 weights
-# ~26 GB) — with the same V10_factual prompt + exp38 shots as v16.2; only the
-# LLM changes. ⚠️ KNOWN-NEGATIVE on train (exp74 leak-free 0.6970, −0.0170 vs
-# v16.2's 0.7140): the ~4B-active answers lose RougeL/SS more than the
-# best-on-record IoU (0.8139) recovers. Kept as a packaged faster variant
-# (near-A3B speed), NOT a quality win — prefer v16.2 for score.
+# v17.1: exp81 s2ans_s2ref two-stage port (leak-free train 0.7207, ties exp56).
+# Stage 1 = RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic (cold V10 → ref-index hint),
+# Stage 2 = Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 (V10 hinted → answer + refs;
+# BOTH final columns come from Stage 2). The two models load sequentially with
+# del+empty_cache between (V1 child-process teardown frees the GPU).
 #
-# Bake the model's HF cache, seeded from the GCS tar by cloudbuild.yaml (NOT
-# downloaded here — see the header). This is the ~26 GB layer; it only changes
+# Bake both models' HF cache, seeded from the GCS tar by cloudbuild.yaml (NOT
+# downloaded here — see the header). This is the ~55 GB layer; it only changes
 # when the model set changes, so a run.py edit leaves it cache-hit (COPY model
 # below is the only busted layer).
 COPY hf-cache /root/.cache/huggingface
 
 RUN mkdir -p /scratch && chmod 1777 /scratch
 
+# vllm 0.19.1 is V1-ONLY (V0 removed; `VLLM_USE_V1` is no longer a recognised
+# env var — setting it just warns). The two-stage handoff RELIES on V1
+# multiprocessing: each stage's EngineCore runs in a child process, so
+# `del engine` tears that process down and the OS reclaims ALL its GPU memory
+# before the next stage loads. In-process mode leaves Stage 1's ~26 GB resident
+# after del+empty_cache → Stage 2 OOMs on init. Pin it ON so a future default
+# flip can't break us.
 ENV HF_HOME=/root/.cache/huggingface \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     TEXTSUM_SCRATCH_DIR=/scratch \
-    VLLM_USE_V1=0
+    VLLM_ENABLE_V1_MULTIPROCESSING=1
 
 COPY model /model
 WORKDIR /model
