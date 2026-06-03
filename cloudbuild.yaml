@@ -54,7 +54,17 @@ steps:
       - |
         set -euo pipefail
         pip install --no-cache-dir --timeout 300 --retries 5 huggingface_hub hf_transfer
-        export HF_HOME=/workspace/textsum/hf-cache HF_HUB_ENABLE_HF_TRANSFER=1
+        # huggingface_hub >=1.x defaults to the Xet download backend and IGNORES
+        # HF_HUB_ENABLE_HF_TRANSFER (it prints a deprecation warning, then routes
+        # downloads through Xet CAS). On Cloud Build (asia-southeast1) the Xet CAS
+        # endpoint stalls — the first build hung at "Fetching 14 files 0%" for
+        # 45+ min with not one shard finished (build 5c0671ce, cancelled). Force
+        # the classic, proven path: HF_HUB_DISABLE_XET=1 falls back to the Rust
+        # hf_transfer downloader (installed above), which is fast and prints
+        # real per-shard byte progress.
+        export HF_HOME=/workspace/textsum/hf-cache \
+               HF_HUB_ENABLE_HF_TRANSFER=1 \
+               HF_HUB_DISABLE_XET=1
         python -c "from huggingface_hub import snapshot_download; \
           snapshot_download('Qwen/Qwen3-32B-AWQ')"
 
