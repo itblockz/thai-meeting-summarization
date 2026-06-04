@@ -123,25 +123,32 @@ def build_messages(query, paras):
 # Thinking-channel strip — delimiters VERIFIED from gemma-4's own
 # chat_template.jinja (RedHatAI/gemma-4-31B-it-NVFP4 snapshot c490598):
 # the model wraps reasoning as  <|channel>thought\n …reasoning… <channel|>
-# then emits the visible answer (note the mirrored brackets: <|channel>
-# opens, <channel|> closes — same convention as <|turn>/<turn|>). The
-# template's own strip_thinking macro splits on <channel|> and drops the
-# text after each <|channel>; we mirror that with a regex. enable_thinking
-# was always False before (exp71's "<|channel>…<turn|>" guess was wrong),
-# so this is the first run that actually exercises the channel.
+# then emits the visible answer (mirrored brackets: <|channel> opens,
+# <channel|> closes — same convention as <|turn>/<turn|>).
 #
-# Runs BEFORE parse_citation so any [อ้างอิง] the model writes mid-reasoning
-# can't pollute refs. The second sub handles a thinking block truncated by
-# MAX_NEW_TOKENS (no closing <channel|> ever emitted → no final answer):
-# drop the dangling reasoning so we fall back to the top paragraph rather
-# than dumping raw chain-of-thought into `abstractive`.
+# ⚠️ CRITICAL (exp91 run-1 bug, fixed): <|channel>/<channel|>/<|turn> etc.
+# are SPECIAL TOKENS. vLLM's default skip_special_tokens=True deletes them
+# from output.text BEFORE we see it — run 1 (job 5830849) got
+# 'thought\n…reasoning' with NO markers, so this regex matched nothing and
+# the whole English chain-of-thought leaked into `abstractive`
+# (RougeL 0.1297, leak-free score 0.5437). The SamplingParams below now
+# sets skip_special_tokens=False so the markers survive and the strip
+# works; the final sub then removes any OTHER leftover special tokens
+# (trailing <turn|>/<eos>/<|think|>) the flag now exposes.
+#
+# Runs BEFORE parse_citation so any [อ้างอิง] written mid-reasoning can't
+# pollute refs. The unclosed-channel sub handles thinking truncated by
+# MAX_NEW_TOKENS (no closing <channel|> → no answer) → fall back to top
+# para instead of dumping raw reasoning into `abstractive`.
 _THINK_CLOSED = re.compile(r"<\|channel>.*?<channel\|>", re.DOTALL)
 _THINK_OPEN   = re.compile(r"<\|channel>.*$", re.DOTALL)
+_SPECIAL_TOK  = re.compile(r"<\|?[a-zA-Z_]+\|?>")  # <turn|>, <|think|>, <eos>…
 
 
 def strip_thinking(text):
     text = _THINK_CLOSED.sub("", text)
-    text = _THINK_OPEN.sub("", text)   # unclosed (truncated) thought block
+    text = _THINK_OPEN.sub("", text)    # unclosed (truncated) thought block
+    text = _SPECIAL_TOK.sub("", text)   # leftover special tokens (skip=False)
     return text.strip()
 
 
@@ -211,8 +218,13 @@ def main():
               trust_remote_code=True,
               limit_mm_per_prompt={"image": 0, "video": 0})
     tokenizer = llm.get_tokenizer()
+    # skip_special_tokens=False so the <|channel>…<channel|> thinking markers
+    # SURVIVE into output.text — the default True deletes them and the raw
+    # chain-of-thought leaks into the answer (exp91 run-1, score 0.5437).
+    # strip_thinking() removes the markers + reasoning afterwards.
     sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS,
-                              repetition_penalty=1.05)
+                              repetition_penalty=1.05,
+                              skip_special_tokens=False)
 
     prompts = []
     for it in items:
