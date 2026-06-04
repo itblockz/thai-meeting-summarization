@@ -95,15 +95,17 @@ MAX_MODEL_LEN  = int(os.environ.get("MAX_MODEL_LEN",  "32768"))
 #     to fill 0.95 → only ~246 MiB physically free → the sampling frequency-
 #     penalty buffer (rep-pen 1.05, batched) OOM'd at first decode (exp77 job
 #     5824692). 0.90 keeps full-32768 KV and leaves ~4 GiB truly-free.
-#   Stage 2 A3B — v16.1 used util 0.95; we keep 0.90 here (SECOND load after a
-#     gemma teardown → a touch more headroom for residual fragmentation, as in
-#     v17.1). MNBT 16384 (v16.1) — A3B's small per-expert MLP makes activations
-#     cheap.
-# Memory/throughput knobs only — greedy decode output is unchanged.
+#   Stage 2 A3B — v16.1: util 0.95 + MNBT 16384. We match BOTH exactly so the
+#     A3B engine config is byte-identical to v16.1 (Stage 1 gemma is fully torn
+#     down via V1 child-process exit before this loads → A3B sees a near-fresh
+#     40 GB card, the same situation v16.1 standalone validated; the parent's
+#     ~0.4 GiB CUDA context is well within v16.1's ~3.6 GiB headroom at 0.95).
+# Memory/throughput knobs only — greedy decode output is unchanged; matched to
+# v16.4 (Stage 1) and v16.1 (Stage 2) so each column reproduces its source.
 MODEL_STAGE1 = os.environ.get("LLM_MODEL_STAGE_1", "nvidia/Gemma-4-26B-A4B-NVFP4")          # refs  (v16.4)
 MODEL_STAGE2 = os.environ.get("LLM_MODEL_STAGE_2", "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8")  # answer(v16.1)
 STAGE1_UTIL  = float(os.environ.get("STAGE1_UTIL", "0.90"))  # gemma NVFP4 (v16.4)
-STAGE2_UTIL  = float(os.environ.get("STAGE2_UTIL", "0.90"))  # A3B (v16.1 used 0.95; 0.90 = 2nd-load headroom)
+STAGE2_UTIL  = float(os.environ.get("STAGE2_UTIL", "0.95"))  # A3B (v16.1, byte-match)
 STAGE1_MNBT  = int(os.environ.get("STAGE1_MNBT", "8192"))    # gemma NVFP4 (v16.4)
 STAGE2_MNBT  = int(os.environ.get("STAGE2_MNBT", "16384"))   # A3B (v16.1)
 
