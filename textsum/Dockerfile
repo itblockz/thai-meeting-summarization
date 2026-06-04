@@ -5,11 +5,13 @@
 # HF. The build context carries `hf-cache/` (restored from GCS by the earlier
 # Cloud Build steps) and we just COPY it in. Order matters: COPY hf-cache
 # BEFORE COPY model so a run.py edit invalidates only the tiny final layer,
-# never the ~55 GB weights.
+# never the ~47 GB weights.
 #
-# v17.1 = exp81 s2ans_s2ref two-stage port. The hf-cache holds BOTH FP8
-# models (gemma-4-26B-A4B-it-FP8-Dynamic Stage 1 + Qwen3-30B-A3B-FP8 Stage 2,
-# ~26 + ~29 GB); cloudbuild downloads both into the cache tar.
+# v17.2 = independent column-merge (NOT v17.1's coupled hint pipe). Two single-
+# model images run independently; the final CSV takes the ANSWER from v16.1 and
+# the REFS from v16.4. The hf-cache holds BOTH models: nvidia/Gemma-4-26B-A4B-
+# NVFP4 (refs, Stage 1, ~18 GB) + Qwen3-30B-A3B-Instruct-2507-FP8 (answer,
+# Stage 2, ~29 GB); cloudbuild downloads both into the cache tar.
 FROM docker.io/nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -25,11 +27,12 @@ RUN apt-get update && apt-get install -y python3.11 python3.11-dev python3.11-di
     rm -rf /var/lib/apt/lists/*
 RUN ln -sf /usr/bin/python3.11 /usr/bin/python3
 
-# v17.1 needs NO nvcc: run.py sets VLLM_USE_DEEP_GEMM=0 and keeps
-# kv_cache_dtype="auto", forcing the precompiled CUTLASS/Marlin FP8 path on
-# both A100 and H100 (no runtime JIT). The v21 hybrid's cuda-minimal-build/nvcc
-# bake + CUDA_HOME env are dropped here — keeps the image lean. Both stages
-# are FP8 checkpoints, so the same no-nvcc path covers them.
+# v17.2 needs NO nvcc: run.py sets VLLM_USE_DEEP_GEMM=0 and keeps
+# kv_cache_dtype="auto" (Stage 1's NVFP4 gemma has its baked fp8-KV directive
+# stripped at runtime by build_kv_neutralized_model so "auto" → bf16), forcing
+# the precompiled CUTLASS/Marlin/NVFP4 path on both A100 and H100 (no runtime
+# JIT). The v21 hybrid's cuda-minimal-build/nvcc bake + CUDA_HOME env are
+# dropped here — keeps the image lean.
 
 COPY requirements.txt ./
 # torch 2.10.0 wheels on cu128 index (matches CUDA 12.8.1 base)
@@ -37,14 +40,15 @@ RUN pip3 install --no-cache-dir --timeout 300 --retries 5 \
     torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 RUN pip3 install --no-cache-dir --timeout 300 --retries 5 -r requirements.txt
 
-# v17.1: exp81 s2ans_s2ref two-stage port (leak-free train 0.7207, ties exp56).
-# Stage 1 = RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic (cold V10 → ref-index hint),
-# Stage 2 = Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 (V10 hinted → answer + refs;
-# BOTH final columns come from Stage 2). The two models load sequentially with
-# del+empty_cache between (V1 child-process teardown frees the GPU).
+# v17.2: independent column-merge (A3B answer + gemma-NVFP4 refs; exp80-85
+# "best of both" cell). Stage 1 = nvidia/Gemma-4-26B-A4B-NVFP4 (cold V10 → REFS
+# only), Stage 2 = Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 (cold V10 → ANSWER
+# only). NO hint between them — each runs as its single-model image (v16.4 /
+# v16.1). The two models load sequentially with del+empty_cache between (V1
+# child-process teardown frees the GPU).
 #
 # Bake both models' HF cache, seeded from the GCS tar by cloudbuild.yaml (NOT
-# downloaded here — see the header). This is the ~55 GB layer; it only changes
+# downloaded here — see the header). This is the ~47 GB layer; it only changes
 # when the model set changes, so a run.py edit leaves it cache-hit (COPY model
 # below is the only busted layer).
 COPY hf-cache /root/.cache/huggingface
@@ -55,7 +59,7 @@ RUN mkdir -p /scratch && chmod 1777 /scratch
 # env var — setting it just warns). The two-stage handoff RELIES on V1
 # multiprocessing: each stage's EngineCore runs in a child process, so
 # `del engine` tears that process down and the OS reclaims ALL its GPU memory
-# before the next stage loads. In-process mode leaves Stage 1's ~26 GB resident
+# before the next stage loads. In-process mode leaves Stage 1's ~18 GB resident
 # after del+empty_cache → Stage 2 OOMs on init. Pin it ON so a future default
 # flip can't break us.
 ENV HF_HOME=/root/.cache/huggingface \

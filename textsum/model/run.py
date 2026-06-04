@@ -1,55 +1,63 @@
 """
-v17.1 — exp81 `s2ans_s2ref` port (two-stage, A3B writes the final answer).
+v17.2 — independent column-merge: ANSWER from v16.1, REFS from v16.4.
 
-Container port of exp81's grid winner. The exp ran 6 combos; v17.1 ships the
-single best cell the user picked: **s2ans + s2ref** (Stage-2 answer AND Stage-2
-refs — A3B's own hinted pass supplies both columns). Leak-free train composite
-**0.7207** (RougeL 0.4879 / SS 0.8607 / IoU 0.8132), ties exp56's 0.7215 line.
+NOT v17.1. v17.1 was a *coupled* two-stage pipe — Stage 1's refs were fed to
+Stage 2 as a `ย่อหน้าที่เกี่ยวข้องเบื้องต้น: [X, Y]` hint line. v17.2 runs the
+two single-model images **independently** (no hint, no handoff): each stage
+sees the IDENTICAL cold V10_factual prompt, neither knows the other ran. We
+then merge the two CSVs column-wise — abstractive from one model, refs from the
+other. This is the score-decomposes-linearly trick done at inference time:
+RougeL/SS come entirely from the answer model, IoU entirely from the ref model,
+so the merged composite = answerModel(RougeL,SS) + refModel(IoU).
+
+  Stage 1 — REFS source = v16.4 = nvidia/Gemma-4-26B-A4B-NVFP4 (26B MoE,
+            ~4B active, NVFP4 experts ~18 GB load, attention bf16). Cold
+            V10_factual + exp38 shots, full doc. Its [อ้างอิง: …] picks become
+            the FINAL refs (its answer text is discarded). gemma's citation is
+            the record single-model IoU (exp77 0.8155 leak-free).
+  --- free weights, gc.collect(), torch.cuda.empty_cache() ---
+  Stage 2 — ANSWER source = v16.1 = Qwen/Qwen3-30B-A3B-Instruct-2507-FP8
+            (the v16/exp42 model). SAME cold V10_factual + exp38 shots, full
+            doc. Its abstractive answer becomes the FINAL answer (its refs are
+            discarded). A3B is the strongest ~4B-active answer-writer here
+            (exp51 0.7110 single-model).
+
+Why this beats either single model: gemma's answers are weak (~4B-active
+ceiling, exp77 0.6982) but its refs are sharp (IoU 0.8155); A3B's answers are
+strong (exp51) but its refs are softer (single-stage A3B IoU ~0.75). Take the
+best column from each. Leak-free expectation = A3B's RougeL/SS (exp51 line)
++ gemma's IoU 0.8155 — the exp80–85 "best of both" cell (A3B cold answer +
+gemma cold refs, ~0.715–0.7205). This is the A3B-answer variant of exp86's
+recipe (exp86 used a 32B-AWQ answer → 0.7235; here the answer model is A3B per
+the brief "answer from v16.1").
 
 NO RETRIEVAL: the full list of *valid* paragraphs from `doc_id` is fed to both
-stages in document order. Two FP8 models share one 40 GB GPU loaded one at a
-time (del + gc + empty_cache between — they cannot coexist):
+stages in document order. The two models share one 40 GB GPU loaded one at a
+time (del + gc + empty_cache between — V1 child-process teardown frees the GPU;
+they cannot coexist).
 
-  Stage 1 — RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic (26B MoE, ~4B active, FP8
-            ~26 GB). NORMAL V10_factual prompt + exp38 shots → answer + cite.
-            gemma's citation is the record single-model IoU (exp74 0.8139), so
-            its [อ้างอิง: …] picks become the REF-INDEX hint for Stage 2.
-            (Its answer text is discarded — see finding (1) below.)
-  --- free weights, gc.collect(), torch.cuda.empty_cache() ---
-  Stage 2 — Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 (the v16/exp42 model). SAME
-            V10 prompt + a "ย่อหน้าที่เกี่ยวข้องเบื้องต้น: [X, Y]" line carrying
-            ONLY Stage 1's ref *indices* → answer + cite. BOTH the abstractive
-            answer (s2ans) AND the refs (s2ref) come from this pass.
-
-Why this exact plumbing (exp80–85 grid findings):
- (1) hint as REF INDICES helps, hint as ANSWER TEXT contaminates — feeding
-     gemma's weak ~4B-active answer to A3B drags A3B's strong answer down
-     (−0.018 RougeL/SS); passing only the ref numbers leaves it intact.
- (2) direction gemma→A3B beats A3B→gemma — the 0.80-weighted answer quality
-     dominates and A3B must write the final answer.
-
-Container changes vs exp81/run.py (everything else is byte-identical: prompts,
-shots, models, greedy decode temp 0 / rep-pen 1.05, ref-index hint):
- - Emit ONE submission.csv (s2ans + s2ref), not the 6-combo grid.
- - LLMEngine.step() streaming instead of llm.generate(): the benchmark
-   `progress` binary fires per finished request, so the backend sees a real
-   heartbeat through the long generation (Stage 1 → 0..n/2, Stage 2 → n/2..n).
+Container infra (carried from v16.1/v16.4/v17.1):
+ - Emit ONE submission.csv (A3B answer + gemma refs).
+ - LLMEngine.step() streaming so the benchmark `progress` binary keeps a
+   heartbeat (Stage 1 → 0..n/2, Stage 2 → n/2..n of the range).
  - Queries sorted by doc_id before submission so vLLM's prefix cache reuses
-   the ~14K-token full-doc prefilled KV across same-doc queries (CSV is written
-   back in ORIGINAL order). Keeps both stages inside the benchmark time budget.
- - VLLM_USE_DEEP_GEMM=0 (set before any torch/vllm import): both stages are FP8
-   checkpoints; on the benchmark H100 vLLM's Hopper DeepGEMM block-FP8 path
-   JIT-compiles with nvcc, absent from this runtime image (`nvcc: not found` →
-   EngineCore dies). Disabling it forces the precompiled CUTLASS/Marlin FP8
-   path, identical to what the A100 local test exercises. kv_cache_dtype stays
-   at vLLM's default "auto" (→ bf16 KV) — no FP8-KV, no FlashInfer JIT, NO
-   H100-specific tuning (per the brief).
+   the ~14K-token full-doc prefilled KV across same-doc queries (CSV written
+   back in ORIGINAL order).
+ - VLLM_USE_DEEP_GEMM=0 (before any torch/vllm import): on the benchmark H100,
+   vLLM's Hopper DeepGEMM block-FP8 path JIT-compiles with nvcc, absent from
+   this runtime image. Disabling it forces the precompiled CUTLASS/Marlin path,
+   identical to the A100 local test.
+ - Stage 1 (gemma NVFP4) needs a KV-directive strip: the nvidia/ModelOpt
+   checkpoint bakes "kv_cache_quant_algo": "FP8" → kv_cache_dtype="auto" would
+   promote KV to fp8 (no sm80 kernel on A100; nvcc-JIT FlashInfer on H100).
+   build_kv_neutralized_model symlinks the snapshot with that directive
+   stripped so "auto" → bf16 on both platforms. A no-op for the A3B FP8
+   checkpoint (carries no kv directive).
 
-The two-stage handoff DEPENDS on V1 multiprocessing being ON
-(VLLM_ENABLE_V1_MULTIPROCESSING=1, pinned in the Dockerfile): each stage's
-EngineCore is a child process, so `del engine` tears it down and the OS
-reclaims its GPU memory before Stage 2 loads. In-process mode leaves Stage 1's
-weights resident → Stage 2 OOMs.
+The handoff DEPENDS on V1 multiprocessing (VLLM_ENABLE_V1_MULTIPROCESSING=1,
+pinned in the Dockerfile): each stage's EngineCore is a child process, so
+`del engine` tears it down and the OS reclaims its GPU memory before Stage 2
+loads. In-process mode leaves Stage 1's weights resident → Stage 2 OOMs.
 
 Output: submission.csv with columns ID, abstractive, refs.
 """
@@ -58,10 +66,12 @@ import os
 import re
 import json
 import csv
+import glob
+import shutil
 import gc
 import time
 
-# --- H100/no-nvcc: force the precompiled FP8 path (see docstring) ------------
+# --- H100/no-nvcc: force the precompiled FP8/NVFP4 path (see docstring) ------
 # Must be set BEFORE the first torch/vllm import.
 os.environ.setdefault("VLLM_USE_DEEP_GEMM", "0")
 
@@ -75,26 +85,27 @@ PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
 
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "1024"))
 MAX_MODEL_LEN  = int(os.environ.get("MAX_MODEL_LEN",  "32768"))
-# exp81 model pairing. Per-stage util + max_num_batched_tokens are the
-# PROVEN-in-container values from the single-model v16 lineage (each stage
-# loads alone after the prior stage's teardown, so each sees a fresh 40 GB
-# GPU = the single-model situation those images validated):
-#   Stage 1 gemma — v16.3: util 0.95 + MNBT 8192. The default 16384 caused a
-#     98% OOM on the H100-40GB backend (gemma's ~26 GB FP8 weights + ~9.54 GiB
-#     KV leave only ~2.5 GiB physical buffer; the prefill-scratch spike at
-#     16384 overran it). 8192 halves the spike, drops zero paragraphs.
-#   Stage 2 A3B   — v16.1: util 0.95 + MNBT 16384 passed on the backend; A3B's
-#     small per-expert MLP makes activations cheap. We keep exp81's slightly
-#     more conservative util 0.90 here (this is the SECOND load after a gemma
-#     teardown, so a touch more headroom for any residual fragmentation).
-# These knobs are memory/throughput only — greedy decode output is unchanged,
-# so the 0.7207 score is preserved. All env-overridable.
-MODEL_STAGE1 = os.environ.get("LLM_MODEL_STAGE_1", "RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic")
-MODEL_STAGE2 = os.environ.get("LLM_MODEL_STAGE_2", "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8")
-STAGE1_UTIL  = float(os.environ.get("STAGE1_UTIL", "0.95"))  # gemma (v16.3)
-STAGE2_UTIL  = float(os.environ.get("STAGE2_UTIL", "0.90"))  # A3B   (exp81; v16.1 used 0.95)
-STAGE1_MNBT  = int(os.environ.get("STAGE1_MNBT", "8192"))    # gemma (v16.3 crash fix)
-STAGE2_MNBT  = int(os.environ.get("STAGE2_MNBT", "16384"))   # A3B   (v16.1)
+
+# Stage 1 = REFS model (v16.4 NVFP4 gemma); Stage 2 = ANSWER model (v16.1 A3B).
+# Per-stage util/MNBT are the PROVEN-in-container single-model values — each
+# stage loads alone after the prior stage's teardown, i.e. the single-model
+# situation v16.1/v16.4 validated:
+#   Stage 1 gemma NVFP4 — v16.4: util 0.90 + MNBT 8192. 0.90 (NOT 0.95) is
+#     deliberate: with the lighter ~18 GiB NVFP4 weights vLLM grows the KV pool
+#     to fill 0.95 → only ~246 MiB physically free → the sampling frequency-
+#     penalty buffer (rep-pen 1.05, batched) OOM'd at first decode (exp77 job
+#     5824692). 0.90 keeps full-32768 KV and leaves ~4 GiB truly-free.
+#   Stage 2 A3B — v16.1 used util 0.95; we keep 0.90 here (SECOND load after a
+#     gemma teardown → a touch more headroom for residual fragmentation, as in
+#     v17.1). MNBT 16384 (v16.1) — A3B's small per-expert MLP makes activations
+#     cheap.
+# Memory/throughput knobs only — greedy decode output is unchanged.
+MODEL_STAGE1 = os.environ.get("LLM_MODEL_STAGE_1", "nvidia/Gemma-4-26B-A4B-NVFP4")          # refs  (v16.4)
+MODEL_STAGE2 = os.environ.get("LLM_MODEL_STAGE_2", "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8")  # answer(v16.1)
+STAGE1_UTIL  = float(os.environ.get("STAGE1_UTIL", "0.90"))  # gemma NVFP4 (v16.4)
+STAGE2_UTIL  = float(os.environ.get("STAGE2_UTIL", "0.90"))  # A3B (v16.1 used 0.95; 0.90 = 2nd-load headroom)
+STAGE1_MNBT  = int(os.environ.get("STAGE1_MNBT", "8192"))    # gemma NVFP4 (v16.4)
+STAGE2_MNBT  = int(os.environ.get("STAGE2_MNBT", "16384"))   # A3B (v16.1)
 
 SYSTEM_MSG = (
     "คุณเป็นผู้ช่วยสรุปเอกสารภาษาไทย "
@@ -102,8 +113,8 @@ SYSTEM_MSG = (
 )
 
 # Few-shot pair — both from held-out doc_050. Shot 1 = exp08 single-ref,
-# Shot 2 = exp38 multi-ref (Q0746). Stage 1 (cold) and Stage 2 (hinted) reuse
-# the same QUERY/PARA triples; the wrapping prompt differs (hint line on S2).
+# Shot 2 = exp38 multi-ref (Q0746). IDENTICAL to v16.1 and v16.4 (both stages
+# run the SAME cold prompt — no hint variant, that is the whole point of v17.2).
 _SHOT1_QUERY = "ในการประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้นที่ใด"
 _SHOT1_PARAS = [
     "ครั้งที่ ๔๙",
@@ -112,9 +123,7 @@ _SHOT1_PARAS = [
     "_________________________",
     "กรรมาธิการผู้มาประชุม",
 ]
-_SHOT1_ANSWER_TEXT = "การประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้น ณ ห้องประชุมกรรมาธิการ N 406 ชั้น ๔ อาคารรัฐสภา"
-_SHOT1_HINT_IDX = [3]
-_SHOT1_ANSWER = f"{_SHOT1_ANSWER_TEXT} [อ้างอิง: 3]"
+_SHOT1_ANSWER = "การประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้น ณ ห้องประชุมกรรมาธิการ N 406 ชั้น ๔ อาคารรัฐสภา [อ้างอิง: 3]"
 
 _SHOT2_QUERY = "ในการประชุมคณะกรรมาธิการการเงิน การคลัง สถาบันการเงินและตลาดการเงิน ครั้งที่ 49 มีกรรมการผู้ที่ไม่มาประชุมมีจำนวนกี่คน"
 _SHOT2_PARAS = [
@@ -124,9 +133,7 @@ _SHOT2_PARAS = [
     "๒. นายธนยศ ทิมสุวรรณ (ลาการประชุม)",
     "๓. นายอัคร ทองใจสด (ลาการประชุม)",
 ]
-_SHOT2_ANSWER_TEXT = "ในการประชุมคณะกรรมาธิการการเงิน การคลัง สถาบันการเงินและตลาดการเงิน ครั้งที่ 49 มีกรรมการผู้ที่ไม่มาประชุมจำนวน 3 คน"
-_SHOT2_HINT_IDX = [2, 3, 4, 5]
-_SHOT2_ANSWER = f"{_SHOT2_ANSWER_TEXT} [อ้างอิง: 2, 3, 4, 5]"
+_SHOT2_ANSWER = "ในการประชุมคณะกรรมาธิการการเงิน การคลัง สถาบันการเงินและตลาดการเงิน ครั้งที่ 49 มีกรรมการผู้ที่ไม่มาประชุมจำนวน 3 คน [อ้างอิง: 2, 3, 4, 5]"
 
 
 def benchmark_lib(i):
@@ -149,8 +156,78 @@ def filter_valid_paragraphs(paragraphs):
     return [p for p in paragraphs if is_valid(p)]
 
 
-def build_prompt_v10(query, paras):
-    """V10_factual — normal answer+cite prompt (Stage 1)."""
+def build_kv_neutralized_model(model_name):
+    """Return a model path whose configs carry NO fp8-KV directive.
+
+    nvidia/Gemma-4-26B-A4B-NVFP4 bakes "kv_cache_quant_algo": "FP8" into
+    hf_quant_config.json. With it present, vLLM's kv_cache_dtype="auto" promotes
+    KV to fp8_e4m3 → on A100 (sm80) there is no fp8e4nv reshape_and_cache
+    kernel, and on the H100 backend fp8-KV pulls the FlashInfer/DeepGEMM JIT
+    that needs nvcc (absent from this runtime image). The exp75 dense fix
+    (kv_cache_dtype="bfloat16") is rejected too — this MoE selects TRITON_ATTN,
+    whose kernel asserts kv_cache_dtype ∈ {"auto","fp8*"}. The only universal,
+    JIT-free path is to make "auto" resolve to bf16 by STRIPPING the directive.
+    Idempotent. A no-op for checkpoints with no kv directive (e.g. the A3B FP8
+    Stage-2 model) → returns the snapshot/repo path unchanged.
+    """
+    if os.path.isdir(model_name):
+        return model_name
+
+    hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    repo_dir = "models--" + model_name.replace("/", "--")
+    snap_glob = os.path.join(hf_home, "hub", repo_dir, "snapshots", "*")
+    snaps = sorted(glob.glob(snap_glob))
+    if not snaps:
+        return model_name
+    snap = snaps[-1]
+
+    quant_cfg = os.path.join(snap, "hf_quant_config.json")
+    has_kv_directive = False
+    if os.path.isfile(quant_cfg):
+        try:
+            qj = json.load(open(quant_cfg, encoding="utf-8"))
+            has_kv_directive = "kv_cache_quant_algo" in qj.get("quantization", {})
+        except (ValueError, OSError):
+            has_kv_directive = False
+    if not has_kv_directive:
+        return snap
+
+    # Build a scratch override unique per model (both stages may call this).
+    scratch = os.environ.get("TEXTSUM_SCRATCH_DIR", "/scratch")
+    ovr = os.path.join(scratch, "model_override_" + model_name.replace("/", "--"))
+    shutil.rmtree(ovr, ignore_errors=True)
+    os.makedirs(ovr, exist_ok=True)
+    rewrite = {"config.json", "hf_quant_config.json"}
+    for name in os.listdir(snap):
+        if name in rewrite:
+            continue
+        os.symlink(os.path.join(snap, name), os.path.join(ovr, name))
+
+    qj = json.load(open(quant_cfg, encoding="utf-8"))
+    qj.get("quantization", {}).pop("kv_cache_quant_algo", None)
+    json.dump(qj, open(os.path.join(ovr, "hf_quant_config.json"), "w",
+                       encoding="utf-8"), indent=2)
+
+    cfg_path = os.path.join(snap, "config.json")
+    cj = json.load(open(cfg_path, encoding="utf-8"))
+    qc = cj.get("quantization_config", {})
+    qc.pop("kv_cache_scheme", None)
+    qc.pop("kv_cache_quant_algo", None)
+    json.dump(cj, open(os.path.join(ovr, "config.json"), "w",
+                       encoding="utf-8"), indent=2)
+
+    print(f"KV override: stripped fp8-KV directive → {ovr} (symlinked {snap})",
+          flush=True)
+    return ovr
+
+
+def build_prompt(query, paras):
+    """V10_factual — CONTEXT FIRST, then query, then instruction. Cold (no hint).
+
+    IDENTICAL to v16.1 and v16.4: answer "สั้นและตรงประเด็น", state only facts
+    present, then cite [อ้างอิง: X]. Both stages use this exact prompt — v17.2's
+    whole premise is two INDEPENDENT cold runs.
+    """
     context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
     return (
         f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
@@ -162,41 +239,15 @@ def build_prompt_v10(query, paras):
     )
 
 
-def build_prompt_v10_hinted(query, paras, hint_idx):
-    """Normal V10 + Stage 1's REF INDICES only as the hint (Stage 2)."""
-    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
-    hint_str = ", ".join(str(i) for i in hint_idx) if hint_idx else "—"
-    return (
-        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
-        f"คำถาม: {query}\n\n"
-        f"ย่อหน้าที่เกี่ยวข้องเบื้องต้น: [{hint_str}]\n\n"
-        f"คำสั่ง: ตอบคำถามเป็นภาษาไทย**สั้นและตรงประเด็น** "
-        f"โดยใช้ย่อหน้าที่เกี่ยวข้องข้างต้นเป็นแนวทาง "
-        f"ระบุข้อเท็จจริงที่ปรากฏในย่อหน้าเท่านั้น ห้ามตีความหรือสรุปเกินขอบเขต "
-        f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y]\n"
-        f"คำตอบ:"
-    )
-
-
-def build_messages_stage1(query, paras):
+def build_messages(query, paras):
+    """System + 2 few-shot turns + the final user turn (cold)."""
     return [
         {"role": "system",    "content": SYSTEM_MSG},
-        {"role": "user",      "content": build_prompt_v10(_SHOT1_QUERY, _SHOT1_PARAS)},
+        {"role": "user",      "content": build_prompt(_SHOT1_QUERY, _SHOT1_PARAS)},
         {"role": "assistant", "content": _SHOT1_ANSWER},
-        {"role": "user",      "content": build_prompt_v10(_SHOT2_QUERY, _SHOT2_PARAS)},
+        {"role": "user",      "content": build_prompt(_SHOT2_QUERY, _SHOT2_PARAS)},
         {"role": "assistant", "content": _SHOT2_ANSWER},
-        {"role": "user",      "content": build_prompt_v10(query, paras)},
-    ]
-
-
-def build_messages_stage2(query, paras, hint_idx):
-    return [
-        {"role": "system",    "content": SYSTEM_MSG},
-        {"role": "user",      "content": build_prompt_v10_hinted(_SHOT1_QUERY, _SHOT1_PARAS, _SHOT1_HINT_IDX)},
-        {"role": "assistant", "content": _SHOT1_ANSWER},
-        {"role": "user",      "content": build_prompt_v10_hinted(_SHOT2_QUERY, _SHOT2_PARAS, _SHOT2_HINT_IDX)},
-        {"role": "assistant", "content": _SHOT2_ANSWER},
-        {"role": "user",      "content": build_prompt_v10_hinted(query, paras, hint_idx)},
+        {"role": "user",      "content": build_prompt(query, paras)},
     ]
 
 
@@ -218,17 +269,16 @@ def split_answer(text):
     return re.sub(r'\s*\[อ้างอิง[^\]]*\]', '', text).strip()
 
 
-def make_engine_args(model_name, gpu_mem_util, max_num_batched_tokens):
-    """exp81's loader (LLM(...) kwargs) expressed as EngineArgs.
+def make_engine_args(model_path, gpu_mem_util, max_num_batched_tokens):
+    """Single-model loader (v16.1/v16.4 kwargs) as EngineArgs.
 
-    dtype bfloat16 + enable_prefix_caching + enforce_eager + the
-    limit_mm_per_prompt cap (gemma-4 is multimodal, text-only here) are
-    byte-identical to exp81. kv_cache_dtype is left at vLLM's default "auto"
-    (bf16 KV) — no FP8-KV, no H100 tuning. max_num_batched_tokens is the
-    PROVEN-in-container per-stage value (see the STAGE*_MNBT notes above).
+    dtype bf16 + enable_prefix_caching + enforce_eager + limit_mm_per_prompt
+    (gemma-4 is multimodal, text-only here) — byte-identical to v16.x.
+    kv_cache_dtype left at "auto" → bf16 (the gemma override dir has its fp8-KV
+    directive stripped; A3B carries none).
     """
     return EngineArgs(
-        model=model_name,
+        model=model_path,
         max_model_len=MAX_MODEL_LEN,
         gpu_memory_utilization=gpu_mem_util,
         max_num_batched_tokens=max_num_batched_tokens,
@@ -244,15 +294,15 @@ def run_stage(stage_label, model_name, gpu_mem_util, max_num_batched_tokens,
               items, progress_fn):
     """Load model, stream all `items` through engine.step(), free the GPU.
 
-    items: list of (key, messages) — key maps the raw output back to the
-    caller's structures. progress_fn(n_done_in_stage) fires per finished
-    request so the benchmark `progress` binary keeps a heartbeat.
+    items: list of (key, messages). progress_fn(n_done_in_stage) fires per
+    finished request so the benchmark `progress` binary keeps a heartbeat.
     """
+    model_path = build_kv_neutralized_model(model_name)
     print(f"\n=== {stage_label}: {model_name} "
           f"(util {gpu_mem_util}, mnbt {max_num_batched_tokens}) ===", flush=True)
     engine = LLMEngine.from_engine_args(
-        make_engine_args(model_name, gpu_mem_util, max_num_batched_tokens))
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        make_engine_args(model_path, gpu_mem_util, max_num_batched_tokens))
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS,
                               repetition_penalty=1.05)
 
@@ -291,9 +341,9 @@ def main():
     queries = data["queries"]
     n = len(queries)
     half = n // 2
-    print(f"v17.1 (exp81 s2ans_s2ref): {n} queries, {len(doc_index)} docs | "
-          f"S1={MODEL_STAGE1} → S2={MODEL_STAGE2} | max_model_len={MAX_MODEL_LEN}",
-          flush=True)
+    print(f"v17.2 (independent merge: A3B answer + gemma-NVFP4 refs): {n} queries, "
+          f"{len(doc_index)} docs | REFS={MODEL_STAGE1} → ANSWER={MODEL_STAGE2} | "
+          f"max_model_len={MAX_MODEL_LEN}", flush=True)
     benchmark_lib(0)
 
     doc_paras = {}
@@ -304,11 +354,11 @@ def main():
     # stages (prefix-cache reuse). CSV is written in ORIGINAL order at the end.
     order = sorted(range(n), key=lambda i: queries[i]["doc_id"])
 
-    # ----- Stage 1 items (key = position in sorted order) -----
+    # Both stages run the SAME cold prompt → build the items ONCE and reuse.
     pool_sizes = []
     gen_pids_by_k = {}
     gen_texts_by_k = {}
-    stage1_items = []
+    items = []
     for k, idx in enumerate(order):
         query = queries[idx]
         valid = doc_paras.get(query["doc_id"], [])
@@ -317,70 +367,29 @@ def main():
             gen_pids  = [p["para_id"] for p in valid]
             gen_texts = [p["text"]    for p in valid]
             pool_sizes.append(len(valid))
-            msgs = build_messages_stage1(q_text, gen_texts)
+            msgs = build_messages(q_text, gen_texts)
         else:
             gen_pids, gen_texts = [], []
             msgs = [{"role": "user", "content": q_text}]
         gen_pids_by_k[k] = gen_pids
         gen_texts_by_k[k] = gen_texts
-        stage1_items.append((k, msgs))
+        items.append((k, msgs))
     if pool_sizes:
         print(f"pool sizes — mean={sum(pool_sizes)/len(pool_sizes):.2f}, "
               f"min={min(pool_sizes)}, max={max(pool_sizes)}", flush=True)
 
-    # Stage 1 occupies the 0..n/2 half of the heartbeat range.
-    raws1 = run_stage("Stage 1 (gemma refs)", MODEL_STAGE1, STAGE1_UTIL, STAGE1_MNBT,
-                      stage1_items, progress_fn=lambda i: benchmark_lib(i // 2))
+    # ----- Stage 1 = REFS (gemma NVFP4, v16.4). Occupies 0..n/2 of heartbeat. -----
+    raws_ref = run_stage("Stage 1 (gemma NVFP4 refs)", MODEL_STAGE1,
+                         STAGE1_UTIL, STAGE1_MNBT, items,
+                         progress_fn=lambda i: benchmark_lib(i // 2))
 
-    # Parse Stage 1 → ref-index hint (1-based positions within the full doc).
-    s1_hint = {}
-    avg_refs1 = 0
-    for k in range(n):
-        raw = raws1.get(k, "")
-        gen_pids = gen_pids_by_k[k]
-        cited_idx = parse_citation(raw, len(gen_pids))
-        valid_idx = [j for j in cited_idx if j < len(gen_pids)]
-        if not valid_idx and gen_pids:
-            valid_idx = [0]
-        s1_hint[k] = [j + 1 for j in valid_idx]
-        avg_refs1 += len(s1_hint[k])
-    print(f"Stage 1: avg hint refs/query = {avg_refs1/max(n,1):.2f}", flush=True)
-    del stage1_items, raws1
-
-    # ----- Stage 2 items (same submission order; carries the ref-index hint) -----
-    stage2_items = []
-    for k, idx in enumerate(order):
-        query = queries[idx]
-        valid = doc_paras.get(query["doc_id"], [])
-        q_text = query["query"]
-        gen_texts = gen_texts_by_k[k]
-        if valid:
-            msgs = build_messages_stage2(q_text, gen_texts, s1_hint[k])
-        else:
-            msgs = [{"role": "user", "content": q_text}]
-        stage2_items.append((k, msgs))
-
-    # Stage 2 occupies the n/2..n half of the heartbeat range.
-    raws2 = run_stage("Stage 2 (A3B answer+refs)", MODEL_STAGE2, STAGE2_UTIL, STAGE2_MNBT,
-                      stage2_items, progress_fn=lambda i: benchmark_lib(half + i // 2))
-
-    # ----- Assemble final results: s2ans (A3B answer) + s2ref (A3B refs) -----
-    empty_answers = 0
-    n_explicit = 0
+    ref_ids_by_k = {}
+    n_explicit_ref = 0
     ref_counts = []
     cite_re = re.compile(r'\[อ้างอิง[:\s]+[0-9,\s]+\]')
-    results_by_qid = {}
-    for k, idx in enumerate(order):
-        query = queries[idx]
-        qid = query["ID"]
-        q_text = query["query"]
+    for k in range(n):
+        raw = raws_ref.get(k, "")
         gen_pids = gen_pids_by_k[k]
-        gen_texts = gen_texts_by_k[k]
-        raw = raws2.get(k, "")
-        answer = split_answer(raw)
-        if not answer:
-            answer = gen_texts[0] if gen_texts else q_text
-            empty_answers += 1
         cited_idx = parse_citation(raw, len(gen_pids))
         if gen_pids:
             ref_ids = [gen_pids[j] for j in cited_idx if j < len(gen_pids)]
@@ -389,15 +398,36 @@ def main():
         else:
             ref_ids = []
         if cite_re.search(raw):
-            n_explicit += 1
+            n_explicit_ref += 1
+        ref_ids_by_k[k] = ref_ids
         ref_counts.append(len(ref_ids))
+    print(f"Stage 1 (refs): {n_explicit_ref}/{n} emitted an [อ้างอิง: …] tag, "
+          f"{n - n_explicit_ref} fell back to top-1 | "
+          f"avg refs/query = {sum(ref_counts)/max(n,1):.2f}", flush=True)
+    del raws_ref
+
+    # ----- Stage 2 = ANSWER (A3B, v16.1). Occupies n/2..n of heartbeat. -----
+    raws_ans = run_stage("Stage 2 (A3B answer)", MODEL_STAGE2,
+                         STAGE2_UTIL, STAGE2_MNBT, items,
+                         progress_fn=lambda i: benchmark_lib(half + i // 2))
+
+    # ----- Merge: abstractive from A3B (Stage 2), refs from gemma (Stage 1) -----
+    empty_answers = 0
+    results_by_qid = {}
+    for k, idx in enumerate(order):
+        query = queries[idx]
+        qid = query["ID"]
+        q_text = query["query"]
+        gen_texts = gen_texts_by_k[k]
+        raw = raws_ans.get(k, "")
+        answer = split_answer(raw)
+        if not answer:
+            answer = gen_texts[0] if gen_texts else q_text
+            empty_answers += 1
+        ref_ids = ref_ids_by_k[k]
         results_by_qid[qid] = {"ID": qid, "abstractive": answer,
                                "refs": ",".join(ref_ids)}
-    print(f"Stage 2 citations: {n_explicit}/{n} emitted an [อ้างอิง: …] tag, "
-          f"{n - n_explicit} fell back to top-1 | empty_answers={empty_answers}",
-          flush=True)
-    if ref_counts:
-        print(f"avg refs/query: {sum(ref_counts)/len(ref_counts):.2f}", flush=True)
+    print(f"Stage 2 (answer): empty_answers={empty_answers}", flush=True)
 
     # Write CSV in ORIGINAL queries order (not sorted submission order).
     results = [results_by_qid[q["ID"]] for q in queries]
