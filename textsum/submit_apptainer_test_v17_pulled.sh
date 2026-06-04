@@ -17,7 +17,12 @@ module purge
 module load Apptainer/1.1.6
 
 RESULT="$PROJECT/textsum_v17_2_pulled_test_result"
-mkdir -p "$RESULT" "$PROJECT/logs"
+# /scratch bind + compile-cache envs: ONLY because this LOCAL apptainer
+# --containall sim has a read-only rootfs + tiny /tmp tmpfs → vLLM/Triton JIT
+# would ENOSPC (the v22 trap). The REAL backend runs the image with a writable
+# rootfs, so these are unnecessary there (the baked /scratch + ~/.triton work).
+SCRATCHDIR="$PROJECT/textsum_v17_2_pulled_scratch"
+mkdir -p "$RESULT" "$PROJECT/logs" "$SCRATCHDIR/triton" "$SCRATCHDIR/xdg"
 
 # Production verification for the GCB-built v17.2 image. Pull as the benchmark
 # backend would (apptainer pull docker://...:v17.2), then run with ONLY the
@@ -38,8 +43,13 @@ apptainer exec --nv --containall --pwd /model \
     --bind "$PROJECT/textsum/model/test:/model/test:ro" \
     --bind "$PROJECT/textsum/benchmark_lib:/benchmark_lib:ro" \
     --bind "$RESULT:/result" \
+    --bind "$SCRATCHDIR:/scratch" \
     --env VLLM_WORKER_MULTIPROC_METHOD=spawn \
     --env MAX_MODEL_LEN=32768 \
+    --env TEXTSUM_SCRATCH_DIR=/scratch \
+    --env TRITON_CACHE_DIR=/scratch/triton \
+    --env XDG_CACHE_HOME=/scratch/xdg \
+    --env HOME=/scratch \
     "$PROJECT/textsum_v17_2_pulled.sif" python3 /model/run.py
 
 echo "=== exit code: $? ==="

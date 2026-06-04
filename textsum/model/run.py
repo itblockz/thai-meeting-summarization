@@ -79,7 +79,40 @@ os.environ.setdefault("VLLM_USE_DEEP_GEMM", "0")
 TEST_DIR     = os.environ.get("TEST_DIR",     "/model/test")
 RESULT_DIR   = os.environ.get("RESULT_DIR",   "/result/")
 PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
-SCRATCH      = os.environ.get("TEXTSUM_SCRATCH_DIR", "/scratch")
+
+
+def _pick_writable_dir(candidates):
+    """First candidate we can actually create+write a file in.
+
+    Under apptainer --containall the image rootfs is read-only, so the baked
+    /scratch is NOT writable unless the host binds a dir over it; on the real
+    (docker) backend it IS. RESULT_DIR is the one location guaranteed writable
+    everywhere (the benchmark mounts it for submission.csv). Probe in
+    preference order and fall back to it so the gemma KV override never fails
+    for lack of a writable scratch."""
+    for d in candidates:
+        if not d:
+            continue
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".w_probe")
+            with open(probe, "w") as f:
+                f.write("x")
+            os.remove(probe)
+            return d
+        except OSError:
+            continue
+    return candidates[-1]
+
+
+# SCRATCH is ONLY for the gemma KV-override dir (tiny: symlinks + 2 small JSON).
+# stage CSVs go to RESULT_DIR directly (see stage_csv_path).
+SCRATCH = _pick_writable_dir([
+    os.environ.get("TEXTSUM_SCRATCH_DIR"),
+    "/scratch",
+    os.path.join(RESULT_DIR, "_scratch"),
+    "/tmp",
+])
 
 MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "1024"))
 MAX_MODEL_LEN  = int(os.environ.get("MAX_MODEL_LEN",  "32768"))
@@ -265,7 +298,10 @@ def split_answer(text):
 
 
 def stage_csv_path(stage):
-    return os.path.join(SCRATCH, f"v17_2_stage{stage}.csv")
+    # In RESULT_DIR (guaranteed writable on every backend), not SCRATCH. Each
+    # is a full single-model submission — score _v17_2_stage1.csv against v16.4
+    # and _v17_2_stage2.csv against v16.1 to confirm per-column bit-identity.
+    return os.path.join(RESULT_DIR, f"_v17_2_stage{stage}.csv")
 
 
 # ============================================================================
@@ -314,7 +350,12 @@ def run_worker(stage):
         print(f"  pool sizes — mean={sum(pool_sizes)/len(pool_sizes):.2f}, "
               f"min={min(pool_sizes)}, max={max(pool_sizes)}", flush=True)
 
-    model_path = build_kv_neutralized_model(model_name)
+    # Stage 1 (gemma NVFP4) needs the fp8-KV directive stripped → override dir
+    # (exactly v16.4). Stage 2 (A3B) carries no kv directive and v16.1 passed
+    # the bare repo id to EngineArgs/AutoTokenizer → do the SAME here (don't
+    # route it through the override resolver) so the answer stage is the v16.1
+    # process verbatim.
+    model_path = build_kv_neutralized_model(model_name) if stage == 1 else model_name
     engine = LLMEngine.from_engine_args(EngineArgs(
         model=model_path,
         max_model_len=MAX_MODEL_LEN,
@@ -383,7 +424,7 @@ def run_worker(stage):
           f"avg refs/query {sum(ref_counts)/max(n,1):.2f}", flush=True)
 
     # Write this stage's full submission in ORIGINAL query order.
-    os.makedirs(SCRATCH, exist_ok=True)
+    os.makedirs(RESULT_DIR, exist_ok=True)
     out = stage_csv_path(stage)
     with open(out, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["ID", "abstractive", "refs"])

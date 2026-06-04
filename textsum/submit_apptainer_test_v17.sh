@@ -17,7 +17,13 @@ module purge
 module load Apptainer/1.1.6
 
 RESULT="$PROJECT/textsum_v17_2_test_result"
-mkdir -p "$RESULT" "$PROJECT/logs"
+# Under --containall the image rootfs is read-only and /tmp is a tiny tmpfs, so
+# vLLM/Triton kernel JIT compile hits ENOSPC (the v22 local-test trap). Bind an
+# ample Lustre dir over /scratch and point the compile caches at it. (run.py
+# already falls back to RESULT_DIR for its own scratch, but vLLM's internal
+# Triton cache is NOT under run.py's control → must be a writable env.)
+SCRATCHDIR="$PROJECT/textsum_v17_2_scratch"
+mkdir -p "$RESULT" "$PROJECT/logs" "$SCRATCHDIR/triton" "$SCRATCHDIR/xdg"
 
 # v17.2 = independent column-merge (NOT v17.1's coupled hint pipe). Stage 1:
 # nvidia/Gemma-4-26B-A4B-NVFP4 (~18 GB) V10_factual + exp38 shots → REFS only.
@@ -39,8 +45,13 @@ apptainer exec --nv --containall --pwd /model \
     --bind "$PROJECT/textsum/model/test:/model/test:ro" \
     --bind "$PROJECT/textsum/benchmark_lib:/benchmark_lib:ro" \
     --bind "$RESULT:/result" \
+    --bind "$SCRATCHDIR:/scratch" \
     --env VLLM_WORKER_MULTIPROC_METHOD=spawn \
     --env MAX_MODEL_LEN=32768 \
+    --env TEXTSUM_SCRATCH_DIR=/scratch \
+    --env TRITON_CACHE_DIR=/scratch/triton \
+    --env XDG_CACHE_HOME=/scratch/xdg \
+    --env HOME=/scratch \
     "$PROJECT/textsum_v17_2_local.sif" python3 /model/run.py
 
 echo "=== exit code: $? ==="
