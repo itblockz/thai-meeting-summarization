@@ -54,11 +54,12 @@ PY
 
 export LLM_MODEL="$OVR"
 export GPU_MEM_UTIL="0.90"     # 0.95 OOMs the sampling buffer on the ~18 GiB gemma MoE
-export RESULT_SUFFIX="iou"
-export RANK_BY="iou"
-# baseline (= exp77 recipe) + Round 8 fixes
-export VARIANTS="V10_factual,C2_cite_direct_all,C4_cite_no_heading,G1_factual_block,G2_factual_outcome,G3_factual_block_outcome,G4_cite_block,G5_cite_outcome,G6_cite_block_outcome"
+export RESULT_SUFFIX="complete"
+export RANK_BY="iou"           # gemma = exp86 Stage-A ref-picker; refs IoU is the objective
+# Round 9: completeness as a citation-recall scaffold (all answer+cite, keep the summary).
+# baseline V10 (=exp77) + V16 complete + G1 block (Round 8 best) + H-series completeness.
+export VARIANTS="V10_factual,V16_factual_complete,G1_factual_block,H1_complete_citeall,H2_complete_block,H3_exhaustive_list,H4_complete_entities"
 
-echo "=== prompt_lab Round 8: gemma NVFP4 IoU fixes (util=$GPU_MEM_UTIL) ==="
+echo "=== prompt_lab Round 9: gemma NVFP4 completeness→IoU (util=$GPU_MEM_UTIL, rank=IoU) ==="
 cd "$PROJECT/prompt_lab"
 python3 runner.py

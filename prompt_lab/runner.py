@@ -682,6 +682,63 @@ def _build_prompt_g6_cite_block_outcome(query, paras):
         "(2) หากคำตอบเป็นรายการ รายชื่อ หรือหลายข้อย่อยที่เรียงต่อเนื่องกัน ให้รวมย่อหน้าทุกย่อหน้าในช่วงนั้นให้ครบ",
         "(3) " + _CLAUSE_DEDUP])
 
+# ---- Round 9: completeness as a citation-recall scaffold (answer+cite, rank IoU) ----
+# Round 8 lesson: refs-only maxes nothing (no answer to reason from); the answer
+# is a *scaffold* — answer completely ⇒ touch every relevant paragraph ⇒ cite
+# them ⇒ IoU up. Attacks the dominant IoU error (missing gold 684 ≫ extra 405).
+# All answer+cite (keep the summary), but we rank by IoU since gemma's answer is
+# discarded in exp86 (Stage-A ref-picker) — the summary only exists to lift refs.
+def _build_prompt_h1_complete_citeall(query, paras):
+    """Complete answer (all points) + cite every paragraph used."""
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: ตอบคำถามเป็นภาษาไทย**ให้ครบถ้วน ครอบคลุมทุกประเด็นและทุกรายการที่เกี่ยวข้อง** "
+        f"ระบุข้อเท็จจริงที่ปรากฏในย่อหน้าเท่านั้น ห้ามตีความหรือสรุปเกินขอบเขต "
+        f"จากนั้น**ระบุเลขย่อหน้าที่ใช้เป็นข้อมูลให้ครบทุกย่อหน้า**ในรูปแบบ [อ้างอิง: X, Y, Z, …]\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_h2_complete_block(query, paras):
+    """V16 completeness + G1 contiguous-block clause."""
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: ตอบคำถามเป็นภาษาไทย**ให้ครบถ้วน ครอบคลุมทุกประเด็นที่เกี่ยวข้อง** "
+        f"ระบุข้อเท็จจริงที่ปรากฏในย่อหน้าเท่านั้น "
+        f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X, Y] {_CLAUSE_BLOCK}\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_h3_exhaustive_list(query, paras):
+    """Strongest completeness: enumerate every sub-item, omit none, cite all."""
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: ตอบคำถามเป็นภาษาไทยให้**ครบถ้วนสมบูรณ์** "
+        f"หากคำตอบมีหลายข้อหรือเป็นรายการ ให้**ระบุทุกข้อย่อยให้ครบ ไม่ละข้อใด** "
+        f"ใช้ข้อเท็จจริงจากย่อหน้าเท่านั้น "
+        f"จากนั้นระบุเลขย่อหน้าที่ใช้**ทุกย่อหน้า**ในรูปแบบ [อ้างอิง: X, Y, Z, …]\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_h4_complete_entities(query, paras):
+    """Complete answer that must surface every name/number/date/item → forces
+    citing each list paragraph that carries one (entity coverage ⇒ block recall)."""
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: ตอบคำถามเป็นภาษาไทย**ให้ครบถ้วน** "
+        f"โดยต้องระบุ**ชื่อ ตัวเลข วันที่ และรายการทุกข้อที่เกี่ยวข้องให้ครบ** "
+        f"ใช้ข้อเท็จจริงจากย่อหน้าเท่านั้น "
+        f"จากนั้นระบุเลขย่อหน้าที่ใช้**ทุกย่อหน้า**ในรูปแบบ [อ้างอิง: X, Y, Z, …]\n"
+        f"คำตอบ:"
+    )
+
 # variants registry
 PROMPT_VARIANTS = [
     ('V1_brevity', SYSTEM_BASELINE, _build_prompt_brevity),               # winner baseline
@@ -734,6 +791,11 @@ PROMPT_VARIANTS = [
     ('G4_cite_block', SYSTEM_CITATION_ONLY, _build_prompt_g4_cite_block, _CITE_SHOTS),
     ('G5_cite_outcome', SYSTEM_CITATION_ONLY, _build_prompt_g5_cite_outcome, _CITE_SHOTS),
     ('G6_cite_block_outcome', SYSTEM_CITATION_RECALL, _build_prompt_g6_cite_block_outcome, _CITE_SHOTS),
+    # Round 9 — completeness as citation-recall scaffold (answer+cite, rank by IoU)
+    ('H1_complete_citeall', SYSTEM_BASELINE, _build_prompt_h1_complete_citeall, _DEFAULT_SHOTS),
+    ('H2_complete_block', SYSTEM_BASELINE, _build_prompt_h2_complete_block, _DEFAULT_SHOTS),
+    ('H3_exhaustive_list', SYSTEM_BASELINE, _build_prompt_h3_exhaustive_list, _DEFAULT_SHOTS),
+    ('H4_complete_entities', SYSTEM_BASELINE, _build_prompt_h4_complete_entities, _DEFAULT_SHOTS),
 ]
 
 # Filter via env var (e.g. VARIANTS=V10_factual,V6_brevity_minimal)
