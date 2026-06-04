@@ -16,9 +16,11 @@
 # merge: ANSWER from v16.1 (A3B) + REFS from v16.4 (gemma NVFP4), each model run
 # as its single-model image with NO hint between them. Expectation = A3B's
 # RougeL/SS (exp51 line) + gemma's IoU (exp77 0.8155) — the exp80-85 "best of
-# both" cell, ~0.715-0.7205 leak-free. NOTE: this needs ~18 GB (gemma NVFP4) +
-# ~29 GB (A3B) loaded SEQUENTIALLY on ONE A100-40GB; the del+gc+empty_cache
-# teardown between stages must free Stage 1 before Stage 2 loads.
+# both" cell, ~0.715-0.7205 leak-free. NOTE: run.py runs each stage in its OWN
+# subprocess on ONE A100-40GB — gemma NVFP4 (~18 GB) exits fully before A3B
+# (~29 GB) loads, so the GPU is fresh for the second model (no shared CUDA
+# state; each stage CSV == v16.4 / v16.1 standalone). Side outputs:
+# $TEXTSUM_SCRATCH_DIR/v17_2_stage{1,2}.csv (scoreable vs v16.4 / v16.1).
 
 PROJECT=/lustrefs/disk/project/zz991000-zdeva/zz991021/ua047
 SHARED=/lustrefs/disk/project/zz991000-zdeva/zz991021

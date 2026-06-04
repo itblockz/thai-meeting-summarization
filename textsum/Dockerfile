@@ -44,8 +44,10 @@ RUN pip3 install --no-cache-dir --timeout 300 --retries 5 -r requirements.txt
 # "best of both" cell). Stage 1 = nvidia/Gemma-4-26B-A4B-NVFP4 (cold V10 → REFS
 # only), Stage 2 = Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 (cold V10 → ANSWER
 # only). NO hint between them — each runs as its single-model image (v16.4 /
-# v16.1). The two models load sequentially with del+empty_cache between (V1
-# child-process teardown frees the GPU).
+# v16.1). run.py runs each stage in its OWN subprocess (the orchestrator never
+# touches CUDA); the worker process exits between stages so the GPU is genuinely
+# fresh for the second model → each stage CSV is byte-identical to v16.4 / v16.1
+# standalone, then the orchestrator merges columns.
 #
 # Bake both models' HF cache, seeded from the GCS tar by cloudbuild.yaml (NOT
 # downloaded here — see the header). This is the ~47 GB layer; it only changes
@@ -55,13 +57,12 @@ COPY hf-cache /root/.cache/huggingface
 
 RUN mkdir -p /scratch && chmod 1777 /scratch
 
-# vllm 0.19.1 is V1-ONLY (V0 removed; `VLLM_USE_V1` is no longer a recognised
-# env var — setting it just warns). The two-stage handoff RELIES on V1
-# multiprocessing: each stage's EngineCore runs in a child process, so
-# `del engine` tears that process down and the OS reclaims ALL its GPU memory
-# before the next stage loads. In-process mode leaves Stage 1's ~18 GB resident
-# after del+empty_cache → Stage 2 OOMs on init. Pin it ON so a future default
-# flip can't break us.
+# GPU teardown between stages is handled by the OS: run.py spawns one process
+# per stage, and a worker's full exit reclaims ALL its VRAM before the next
+# worker spawns (no in-process `del engine` / empty_cache needed). vllm 0.19.1
+# is V1-ONLY (`VLLM_USE_V1` is a dead env var). VLLM_ENABLE_V1_MULTIPROCESSING=1
+# is kept (harmless; each worker still spawns its EngineCore child) but is no
+# longer load-bearing for the handoff — the subprocess boundary is.
 ENV HF_HOME=/root/.cache/huggingface \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \

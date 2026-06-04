@@ -29,8 +29,9 @@ mkdir -p "$RESULT" "$PROJECT/logs"
 #
 # Bind-mounts run.py over the container's /model/run.py for iteration without
 # rebuilding the ~47 GB-weights SIF. --containall mirrors what the benchmark
-# backend gives at submission time. Watch the Stage 1→2 handoff: gemma's ~18 GB
-# must be fully freed before A3B's ~29 GB loads on the 40 GB card.
+# backend gives at submission time. run.py runs each stage in its OWN
+# subprocess: gemma's worker (~18 GB) fully exits before A3B's worker (~29 GB)
+# spawns, so the 40 GB card is fresh for the second model.
 echo "=== v17.2 (A3B answer + gemma-NVFP4 refs, independent) container test ==="
 nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv 2>&1 || true
 apptainer exec --nv --containall --pwd /model \

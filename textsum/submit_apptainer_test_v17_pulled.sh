@@ -28,10 +28,10 @@ mkdir -p "$RESULT" "$PROJECT/logs"
 # v17.2 = independent column-merge. Stage 1: nvidia/Gemma-4-26B-A4B-NVFP4
 # (~18 GB) + V10_factual → REFS only. Stage 2: Qwen3-30B-A3B-Instruct-2507-FP8
 # (~29 GB) + same cold V10 → ANSWER only. No hint between them; final CSV = A3B
-# answer + gemma refs. The two models share one 40 GB GPU sequentially — run.py
-# does `del + gc.collect() + torch.cuda.empty_cache()` between them (V1 child-
-# process teardown). Watch the Stage 1→2 handoff: gemma's ~18 GB must be fully
-# freed before A3B's ~29 GB loads, else the second engine OOMs on the 40 GB card.
+# answer + gemma refs. run.py runs each stage in its OWN subprocess on one
+# 40 GB GPU: gemma's worker exits fully (OS reclaims its VRAM) before A3B's
+# worker spawns, so the second model loads on a fresh card — no in-process
+# teardown, no OOM risk from residual Stage-1 weights.
 echo "=== v17.2 pulled image test (GCB build) — production-equivalent two-stage run ==="
 nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv 2>&1 || true
 apptainer exec --nv --containall --pwd /model \
