@@ -1,19 +1,21 @@
-# Build the v17.2 two-stage image (~47 GB of weights embedded: nvidia/Gemma-4-
-# 26B-A4B-NVFP4 Stage 1 refs + Qwen3-30B-A3B-Instruct-2507-FP8 Stage 2 answer)
-# on Google Cloud Build, then push to the competition registry. This is the
-# independent column-merge (A3B answer + gemma-NVFP4 refs; exp80-85 "best of
-# both" cell), built on the v16.3 lean NO-nvcc base. GitHub Actions can't do
-# this (runner disk ~14 GB); LANTA podman is blocked (no /etc/subuid). GCB gives
-# a configurable disk.
+# Build the v17.3 two-stage image (~36 GB of weights embedded: nvidia/Gemma-4-
+# 26B-A4B-NVFP4 Stage 1 refs + Qwen/Qwen3-32B-AWQ Stage 2 answer) on Google
+# Cloud Build, then push to the competition registry. This is the independent
+# column-merge (32B-AWQ answer + gemma-NVFP4 refs = exp86's recipe, NEW BEST
+# 0.7235); v17.3 = v17.2 with Stage 2 swapped from v16.1's A3B to v15.2's
+# Qwen3-32B-AWQ answer-writer. Built on the v16.3 lean NO-nvcc base. GitHub
+# Actions can't do this (runner disk ~14 GB); LANTA podman is blocked (no
+# /etc/subuid). GCB gives a configurable disk.
 #
 # PERSISTENT MODEL CACHE VIA GCS (same scheme as v16.3/v22): the weights are NOT
-# downloaded inside `docker build`. A GCS tar ($_HF_BUCKET/v17.2/hf-cache.tar)
+# downloaded inside `docker build`. A GCS tar ($_HF_BUCKET/v17.3/hf-cache.tar)
 # holds a HuggingFace cache; each build (1) restores it into the workspace,
 # (2) snapshot_download's only the models still missing, (3) re-uploads if
 # changed, then (4) bakes it into the image via `COPY hf-cache`. The heavy,
 # flaky HF pull happens at most ONCE, ever — warm rebuilds (e.g. a run.py edit)
-# skip it. This image uses its OWN tar (v17.2/ prefix), SEPARATE from v17.1's
-# and v16.x's tars.
+# skip it. This image uses its OWN tar (v17.3/ prefix — a FRESH cache so the
+# baked image carries the 32B-AWQ weights and no stale A3B), SEPARATE from
+# v17.2's, v17.1's and v16.x's tars.
 #
 # Region: asia-southeast1 is the persistent default (gcloud config
 # builds/region + the regional default staging bucket) — submit with a bare
@@ -25,7 +27,7 @@ substitutions:
   _HF_BUCKET: 'gs://textsum-hf-cache-437476422274/hf'   # GCS path holding the HF cache (asia-southeast1)
 
 steps:
-  # 1. Restore the v17.2 HF cache from a single tar in GCS. Stored as a TAR
+  # 1. Restore the v17.3 HF cache from a single tar in GCS. Stored as a TAR
   #    (not an rsync'd tree) because the HF layout is blobs/ + snapshots/
   #    symlinks; GCS can't hold symlinks, so rsync would store every file twice.
   #    tar keeps the symlinks intact. First build: no tar yet → start empty.
@@ -36,12 +38,12 @@ steps:
       - |
         set -euo pipefail
         mkdir -p textsum/hf-cache
-        if gsutil -q stat "${_HF_BUCKET}/v17.2/hf-cache.tar"; then
-          gsutil -m cp "${_HF_BUCKET}/v17.2/hf-cache.tar" /workspace/hf-cache.tar
+        if gsutil -q stat "${_HF_BUCKET}/v17.3/hf-cache.tar"; then
+          gsutil -m cp "${_HF_BUCKET}/v17.3/hf-cache.tar" /workspace/hf-cache.tar
           tar -xf /workspace/hf-cache.tar -C textsum
-          echo "restored v17.2 HF cache from tar"
+          echo "restored v17.3 HF cache from tar"
         else
-          echo "no v17.2 cache tar yet (first build) — will download both models"
+          echo "no v17.3 cache tar yet (first build) — will download both models"
         fi
 
   # 2. Download both models only if not already present (restored by step 1).
@@ -57,7 +59,7 @@ steps:
         export HF_HOME=/workspace/textsum/hf-cache HF_HUB_ENABLE_HF_TRANSFER=1
         python -c "from huggingface_hub import snapshot_download; \
           snapshot_download('nvidia/Gemma-4-26B-A4B-NVFP4'); \
-          snapshot_download('Qwen/Qwen3-30B-A3B-Instruct-2507-FP8')"
+          snapshot_download('Qwen/Qwen3-32B-AWQ')"
 
   # 3. Repack the cache as a single tar (symlinks preserved, no -h → ~47 GB not
   #    ~94) and upload, replacing the previous tar.
@@ -68,8 +70,8 @@ steps:
       - |
         set -euo pipefail
         tar -cf /workspace/hf-cache.tar -C textsum hf-cache
-        gsutil -m cp /workspace/hf-cache.tar "${_HF_BUCKET}/v17.2/hf-cache.tar"
-        echo "uploaded v17.2 cache tar: $(du -h /workspace/hf-cache.tar | cut -f1)"
+        gsutil -m cp /workspace/hf-cache.tar "${_HF_BUCKET}/v17.3/hf-cache.tar"
+        echo "uploaded v17.3 cache tar: $(du -h /workspace/hf-cache.tar | cut -f1)"
 
   # 4. Build the image (weights come from the context via COPY hf-cache) + push.
   - name: 'gcr.io/cloud-builders/docker'
@@ -87,10 +89,10 @@ steps:
         # layers; the COPY hf-cache layer is cache-hit when the weights are
         # unchanged, so a run.py edit busts only the tiny final COPY model layer.
         DOCKER_BUILDKIT=1 docker build \
-          --cache-from $$IMG:v17.2 \
+          --cache-from $$IMG:v17.3 \
           --build-arg BUILDKIT_INLINE_CACHE=1 \
-          -t $$IMG:v17.2 .
-        docker push $$IMG:v17.2
+          -t $$IMG:v17.3 .
+        docker push $$IMG:v17.3
 
 availableSecrets:
   secretManager:

@@ -1,8 +1,8 @@
 """
-v17.2 — independent column-merge: ANSWER from v16.1, REFS from v16.4.
+v17.3 — independent column-merge: ANSWER from v15.2, REFS from v16.4.
 
 NOT v17.1. v17.1 was a *coupled* two-stage pipe — Stage 1's refs were fed to
-Stage 2 as a hint line. v17.2 runs the two single-model images **independently**
+Stage 2 as a hint line. v17.3 runs the two single-model images **independently**
 (no hint, no handoff) and merges their CSVs column-wise: abstractive from one
 model, refs from the other. Score decomposes linearly under greedy decode, so
 the merged composite = answerModel(RougeL,SS) + refModel(IoU).
@@ -10,13 +10,21 @@ the merged composite = answerModel(RougeL,SS) + refModel(IoU).
   Stage 1 — REFS source = v16.4 = nvidia/Gemma-4-26B-A4B-NVFP4 (26B MoE,
             ~4B active, NVFP4 experts ~18 GB load). Cold V10_factual + exp38
             shots, full doc. Record single-model citation IoU (exp77 0.8155).
-  Stage 2 — ANSWER source = v16.1 = Qwen/Qwen3-30B-A3B-Instruct-2507-FP8
-            (the v16/exp42 model). SAME cold V10_factual + exp38 shots, full
-            doc. Strongest ~4B-active answer-writer here (exp51 0.7110).
+  Stage 2 — ANSWER source = v15.2 = Qwen/Qwen3-32B-AWQ (awq_marlin, dense).
+            exp37/exp38 E5 prompt + exp08 shot1 + exp38 multi-ref shot2,
+            full doc, max_new 512, util 0.90. The strong dense answer-writer
+            (v15.2 = exp38 single-model 0.6987 leak-free).
 
-Each stage's CSV column we keep is its strength; the other column is discarded.
-Final = A3B answer + gemma refs (the exp80-85 "best of both" cell, A3B-answer
-variant of exp86's recipe).
+This makes the merged image **exp86's recipe** (NEW BEST 0.7235): NVFP4 gemma
+Stage-A refs (IoU 0.8155) + Qwen3-32B-AWQ E5 Stage-B answer (RougeL/SS near
+exp37/exp38), the answer column from the 32B-AWQ dense model rather than
+v16.1's ~4B-active A3B. Each stage's CSV column we keep is its strength; the
+other column is discarded. Final = 32B-AWQ answer + gemma refs.
+
+The two stages NO LONGER share a prompt: Stage 1 (gemma) keeps V10_factual,
+Stage 2 (32B-AWQ) uses v15.2's E5 prompt. The shots (shot1 single-ref + shot2
+multi-ref Q0746) are byte-identical between v16.4 and v15.2, so only the
+instruction wording, model, and engine config diverge by stage.
 
 PROCESS MODEL — one OS process PER STAGE (the bit-identical fix)
 ---------------------------------------------------------------
@@ -26,7 +34,7 @@ This file runs in two modes:
     `--stage 2`, then merges the two stage CSVs into submission.csv.
   * WORKER (`python3 run.py --stage N`): loads exactly ONE model and writes a
     FULL single-model submission (answer + refs) — byte-for-byte the v16.4
-    (stage 1) / v16.1 (stage 2) image. vLLM/torch/transformers are imported
+    (stage 1) / v15.2 (stage 2) image. vLLM/torch/transformers are imported
     ONLY here, so the orchestrator never creates a CUDA context.
 
 Why a subprocess per stage instead of `del engine; empty_cache()` in one
@@ -34,24 +42,25 @@ process: in V1 multiprocessing the EngineCore already runs in a child, so the
 model's VRAM is reclaimed when that child exits — NOT by the parent's
 `torch.cuda.empty_cache()`, which only ever created a ~0.4 GiB context in the
 parent and left it resident. That residual context made Stage 2 measure
-slightly less free VRAM than a standalone v16.1 run → a marginally smaller KV
+slightly less free VRAM than a standalone v15.2 run → a marginally smaller KV
 pool → different scheduler batching → rare greedy token flips. Running each
 stage as its own process means the GPU is genuinely fresh for the second
 model: the worker is born, loads one model on a clean card, writes its CSV, and
-dies — identical to v16.1/v16.4 standalone BY CONSTRUCTION (no shared
+dies — identical to v15.2/v16.4 standalone BY CONSTRUCTION (no shared
 process/CUDA state, independent of vLLM teardown timing). Each stage CSV is
-therefore an independently scoreable v16.x submission: stage1 ↔ v16.4, stage2
-↔ v16.1.
+therefore an independently scoreable submission: stage1 ↔ v16.4, stage2 ↔
+v15.2.
 
 NO RETRIEVAL: the full list of *valid* paragraphs from `doc_id` is fed in
-document order. Both stages use the IDENTICAL cold V10_factual prompt.
+document order. Stage 1 (gemma) uses the cold V10_factual prompt; Stage 2
+(32B-AWQ) uses v15.2's E5 prompt.
 
-Container infra (carried from v16.1/v16.4):
+Container infra (carried from v15.2/v16.4):
  - VLLM_USE_DEEP_GEMM=0 (before any torch/vllm import): forces the precompiled
    CUTLASS/Marlin/NVFP4 path on the benchmark H100 (no nvcc JIT).
  - Stage 1 (gemma NVFP4) strips the baked fp8-KV directive via
    build_kv_neutralized_model so kv_cache_dtype="auto" → bf16 on A100 + H100.
-   A no-op for the A3B FP8 checkpoint.
+   A no-op for the 32B-AWQ checkpoint.
  - Each worker streams via LLMEngine.step() and pings the benchmark `progress`
    binary per finished query (Stage 1 → 0..n/2, Stage 2 → n/2..n). The
    orchestrator pings 0 at the start and n at the very end.
@@ -114,27 +123,32 @@ SCRATCH = _pick_writable_dir([
     "/tmp",
 ])
 
-MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "1024"))
 MAX_MODEL_LEN  = int(os.environ.get("MAX_MODEL_LEN",  "32768"))
 
-# Stage 1 = REFS model (v16.4 NVFP4 gemma); Stage 2 = ANSWER model (v16.1 A3B).
-# Each worker is its own process loading one model on a fresh GPU, so the
-# per-stage util/mnbt are EXACTLY the single-model values v16.4 / v16.1
-# validated → byte-identical engine config:
-#   Stage 1 gemma NVFP4 — v16.4: util 0.90 + mnbt 8192 (0.90 avoids the
-#     sampling-buffer OOM at 0.95 with the lighter ~18 GiB NVFP4 weights).
-#   Stage 2 A3B         — v16.1: util 0.95 + mnbt 16384.
+# Stage 1 = REFS model (v16.4 NVFP4 gemma); Stage 2 = ANSWER model (v15.2
+# Qwen3-32B-AWQ). Each worker is its own process loading one model on a fresh
+# GPU, so the per-stage util/mnbt/max_new are EXACTLY the single-model values
+# v16.4 / v15.2 validated → byte-identical engine config:
+#   Stage 1 gemma NVFP4 — v16.4: util 0.90 + mnbt 8192 + max_new 1024 (0.90
+#     avoids the sampling-buffer OOM at 0.95 with the lighter ~18 GiB weights).
+#   Stage 2 32B-AWQ     — v15.2: util 0.90 + mnbt 16384 + max_new 512 (0.95
+#     OOM'd at MLP activation; 16384 = 1 prefill chunk for the median prompt).
 # Memory/throughput knobs only — greedy decode output unchanged.
-MODEL_STAGE1 = os.environ.get("LLM_MODEL_STAGE_1", "nvidia/Gemma-4-26B-A4B-NVFP4")          # refs  (v16.4)
-MODEL_STAGE2 = os.environ.get("LLM_MODEL_STAGE_2", "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8")  # answer(v16.1)
+MODEL_STAGE1 = os.environ.get("LLM_MODEL_STAGE_1", "nvidia/Gemma-4-26B-A4B-NVFP4")  # refs  (v16.4)
+MODEL_STAGE2 = os.environ.get("LLM_MODEL_STAGE_2", "Qwen/Qwen3-32B-AWQ")            # answer(v15.2)
 STAGE1_UTIL  = float(os.environ.get("STAGE1_UTIL", "0.90"))   # gemma NVFP4 (v16.4)
-STAGE2_UTIL  = float(os.environ.get("STAGE2_UTIL", "0.95"))   # A3B (v16.1)
+STAGE2_UTIL  = float(os.environ.get("STAGE2_UTIL", "0.90"))   # 32B-AWQ (v15.2)
 STAGE1_MNBT  = int(os.environ.get("STAGE1_MNBT", "8192"))     # gemma NVFP4 (v16.4)
-STAGE2_MNBT  = int(os.environ.get("STAGE2_MNBT", "16384"))    # A3B (v16.1)
+STAGE2_MNBT  = int(os.environ.get("STAGE2_MNBT", "16384"))    # 32B-AWQ (v15.2)
+STAGE1_MAXNEW = int(os.environ.get("STAGE1_MAX_NEW_TOKENS", "1024"))  # gemma (v16.4)
+STAGE2_MAXNEW = int(os.environ.get("STAGE2_MAX_NEW_TOKENS", "512"))   # 32B-AWQ (v15.2)
 
+# Per-stage: (model, util, mnbt, max_new, prompt_style, label). prompt_style
+# selects the instruction wording — "v10" (V10_factual, gemma/v16.4) vs "e5"
+# (v15.2's exp37/exp38 E5 prompt).
 STAGE_CFG = {
-    1: (MODEL_STAGE1, STAGE1_UTIL, STAGE1_MNBT, "gemma NVFP4 refs"),
-    2: (MODEL_STAGE2, STAGE2_UTIL, STAGE2_MNBT, "A3B answer"),
+    1: (MODEL_STAGE1, STAGE1_UTIL, STAGE1_MNBT, STAGE1_MAXNEW, "v10", "gemma NVFP4 refs (v16.4)"),
+    2: (MODEL_STAGE2, STAGE2_UTIL, STAGE2_MNBT, STAGE2_MAXNEW, "e5",  "32B-AWQ answer (v15.2)"),
 }
 
 SYSTEM_MSG = (
@@ -143,8 +157,9 @@ SYSTEM_MSG = (
 )
 
 # Few-shot pair — both from held-out doc_050. Shot 1 = exp08 single-ref,
-# Shot 2 = exp38 multi-ref (Q0746). IDENTICAL to v16.1 and v16.4 (both stages
-# run the SAME cold prompt — no hint variant, that is the whole point of v17.2).
+# Shot 2 = exp38 multi-ref (Q0746). The SHOT text is byte-identical across
+# v16.4 and v15.2; only the per-stage instruction wording differs (see
+# build_prompt). No hint variant — each stage is an independent cold run.
 _SHOT1_QUERY = "ในการประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้นที่ใด"
 _SHOT1_PARAS = [
     "ครั้งที่ ๔๙",
@@ -197,7 +212,7 @@ def build_kv_neutralized_model(model_name):
     too — this MoE selects TRITON_ATTN, whose kernel asserts kv_cache_dtype ∈
     {"auto","fp8*"}. The only universal, JIT-free path is to make "auto"
     resolve to bf16 by STRIPPING the directive. Idempotent. A no-op for
-    checkpoints with no kv directive (e.g. the A3B FP8 Stage-2 model) → returns
+    checkpoints with no kv directive (e.g. the 32B-AWQ Stage-2 model) → returns
     the snapshot/repo path unchanged.
     """
     if os.path.isdir(model_name):
@@ -249,12 +264,12 @@ def build_kv_neutralized_model(model_name):
     return ovr
 
 
-def build_prompt(query, paras):
+def build_prompt_v10(query, paras):
     """V10_factual — CONTEXT FIRST, then query, then instruction. Cold (no hint).
 
-    IDENTICAL to v16.1 and v16.4: answer "สั้นและตรงประเด็น", state only facts
-    present, then cite [อ้างอิง: X]. Both stages use this exact prompt — v17.2's
-    whole premise is two INDEPENDENT cold runs.
+    Stage 1 (gemma / v16.4): answer "สั้นและตรงประเด็น", state only facts
+    present, then cite [อ้างอิง: X]. The terse V10 instruction is the ref-picker
+    prompt — it maximises citation IoU.
     """
     context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
     return (
@@ -267,8 +282,34 @@ def build_prompt(query, paras):
     )
 
 
-def build_messages(query, paras):
-    """System + 2 few-shot turns + the final user turn (cold)."""
+def build_prompt_e5(query, paras):
+    """E5 prompt — CONTEXT FIRST, then query, then instruction (v15.2 verbatim).
+
+    Stage 2 (32B-AWQ / v15.2): answer "อย่างกระชับและครอบคลุม" (concise AND
+    comprehensive), then cite. This is the strong answer-writer prompt — it
+    maximises RougeL/SS (exp37/exp38). Byte-identical to v15.2's build_prompt.
+    """
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: โปรดสรุปคำตอบเป็นภาษาไทยอย่างกระชับและครอบคลุม "
+        f"โดยอ้างอิงจากข้อมูลที่ให้มาเท่านั้น "
+        f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y]\n"
+        f"คำตอบ:"
+    )
+
+
+_PROMPT_BUILDERS = {"v10": build_prompt_v10, "e5": build_prompt_e5}
+
+
+def build_messages(query, paras, prompt_style):
+    """System + 2 few-shot turns + the final user turn (cold).
+
+    prompt_style picks the instruction wording ("v10" gemma / "e5" 32B-AWQ);
+    the shot text is identical across stages, only the wording differs.
+    """
+    build_prompt = _PROMPT_BUILDERS[prompt_style]
     return [
         {"role": "system",    "content": SYSTEM_MSG},
         {"role": "user",      "content": build_prompt(_SHOT1_QUERY, _SHOT1_PARAS)},
@@ -299,14 +340,14 @@ def split_answer(text):
 
 def stage_csv_path(stage):
     # In RESULT_DIR (guaranteed writable on every backend), not SCRATCH. Each
-    # is a full single-model submission — score _v17_2_stage1.csv against v16.4
-    # and _v17_2_stage2.csv against v16.1 to confirm per-column bit-identity.
-    return os.path.join(RESULT_DIR, f"_v17_2_stage{stage}.csv")
+    # is a full single-model submission — score _v17_3_stage1.csv against v16.4
+    # and _v17_3_stage2.csv against v15.2 to confirm per-column bit-identity.
+    return os.path.join(RESULT_DIR, f"_v17_3_stage{stage}.csv")
 
 
 # ============================================================================
 # WORKER — loads ONE model, writes a full single-model submission CSV.
-# Byte-for-byte the v16.4 (stage 1) / v16.1 (stage 2) image.
+# Byte-for-byte the v16.4 (stage 1) / v15.2 (stage 2) image.
 # ============================================================================
 def run_worker(stage):
     # Heavy imports live ONLY here so the orchestrator process never touches
@@ -315,7 +356,7 @@ def run_worker(stage):
     from transformers import AutoTokenizer
     from vllm import LLMEngine, EngineArgs, SamplingParams
 
-    model_name, gpu_mem_util, mnbt, label = STAGE_CFG[stage]
+    model_name, gpu_mem_util, mnbt, max_new, prompt_style, label = STAGE_CFG[stage]
     data = load_data(TEST_DIR)
     doc_index = {doc["doc_id"]: doc["paragraphs"] for doc in data["docs"]}
     queries = data["queries"]
@@ -342,7 +383,7 @@ def run_worker(stage):
             gen_pids  = [p["para_id"] for p in valid]
             gen_texts = [p["text"]    for p in valid]
             pool_sizes.append(len(valid))
-            msgs = build_messages(q_text, gen_texts)
+            msgs = build_messages(q_text, gen_texts, prompt_style)
         else:
             gen_pids, gen_texts, msgs = [], [], None
         items.append((k, query["ID"], gen_pids, gen_texts, msgs, q_text))
@@ -350,25 +391,44 @@ def run_worker(stage):
         print(f"  pool sizes — mean={sum(pool_sizes)/len(pool_sizes):.2f}, "
               f"min={min(pool_sizes)}, max={max(pool_sizes)}", flush=True)
 
-    # Stage 1 (gemma NVFP4) needs the fp8-KV directive stripped → override dir
-    # (exactly v16.4). Stage 2 (A3B) carries no kv directive and v16.1 passed
-    # the bare repo id to EngineArgs/AutoTokenizer → do the SAME here (don't
-    # route it through the override resolver) so the answer stage is the v16.1
-    # process verbatim.
-    model_path = build_kv_neutralized_model(model_name) if stage == 1 else model_name
-    engine = LLMEngine.from_engine_args(EngineArgs(
-        model=model_path,
-        max_model_len=MAX_MODEL_LEN,
-        gpu_memory_utilization=gpu_mem_util,
-        max_num_batched_tokens=mnbt,
-        dtype="bfloat16",
-        enforce_eager=True,
-        enable_prefix_caching=True,
-        trust_remote_code=True,
-        limit_mm_per_prompt={"image": 0, "video": 0},
-    ))
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS,
+    # Each stage builds the EXACT EngineArgs/tokenizer its single-model image
+    # validated, so each stage CSV is byte-identical to that standalone image.
+    if stage == 1:
+        # gemma NVFP4 (v16.4): strip the baked fp8-KV directive → override dir;
+        # bf16 KV, multimodal arch (trust_remote_code + limit_mm to disable the
+        # image/video towers), NVFP4 weights load via MARLIN.
+        model_path = build_kv_neutralized_model(model_name)
+        engine_args = EngineArgs(
+            model=model_path,
+            max_model_len=MAX_MODEL_LEN,
+            gpu_memory_utilization=gpu_mem_util,
+            max_num_batched_tokens=mnbt,
+            dtype="bfloat16",
+            enforce_eager=True,
+            enable_prefix_caching=True,
+            trust_remote_code=True,
+            limit_mm_per_prompt={"image": 0, "video": 0},
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    else:
+        # 32B-AWQ (v15.2 verbatim): awq_marlin quant, dtype="half", no
+        # trust_remote_code / limit_mm (text-only dense model). Bare repo id to
+        # EngineArgs/AutoTokenizer — no override resolver — so the answer stage
+        # is the v15.2 process byte-for-byte.
+        model_path = model_name
+        engine_args = EngineArgs(
+            model=model_path,
+            quantization="awq_marlin",
+            max_model_len=MAX_MODEL_LEN,
+            gpu_memory_utilization=gpu_mem_util,
+            max_num_batched_tokens=mnbt,
+            dtype="half",
+            enforce_eager=True,
+            enable_prefix_caching=True,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+    engine = LLMEngine.from_engine_args(engine_args)
+    sampling = SamplingParams(temperature=0.0, max_tokens=max_new,
                               repetition_penalty=1.05)
 
     for k, it in enumerate(items):
@@ -445,7 +505,7 @@ def orchestrate():
     data = load_data(TEST_DIR)
     queries = data["queries"]
     n = len(queries)
-    print(f"v17.2 orchestrator: {n} queries | "
+    print(f"v17.3 orchestrator: {n} queries | "
           f"REFS(stage1)={MODEL_STAGE1} → ANSWER(stage2)={MODEL_STAGE2} | "
           f"one process per stage (fresh GPU each)", flush=True)
     benchmark_lib(0)
@@ -458,9 +518,9 @@ def orchestrate():
         subprocess.run([sys.executable, os.path.abspath(__file__),
                         "--stage", str(stage)], check=True)
 
-    # Merge: abstractive from stage 2 (A3B), refs from stage 1 (gemma).
-    refs_src = read_stage_csv(1)   # gemma → refs
-    ans_src  = read_stage_csv(2)   # A3B   → answer
+    # Merge: abstractive from stage 2 (32B-AWQ), refs from stage 1 (gemma).
+    refs_src = read_stage_csv(1)   # gemma   → refs
+    ans_src  = read_stage_csv(2)   # 32B-AWQ → answer
     results = [{"ID": q["ID"],
                 "abstractive": ans_src[q["ID"]]["abstractive"],
                 "refs":        refs_src[q["ID"]]["refs"]}
@@ -472,7 +532,7 @@ def orchestrate():
         writer = csv.DictWriter(f, fieldnames=["ID", "abstractive", "refs"])
         writer.writeheader()
         writer.writerows(results)
-    print(f"\nMerged {len(results)} rows (A3B answer + gemma refs) → {out_path}",
+    print(f"\nMerged {len(results)} rows (32B-AWQ answer + gemma refs) → {out_path}",
           flush=True)
     benchmark_lib(n)   # final "fully done, CSV ready" ping
 
