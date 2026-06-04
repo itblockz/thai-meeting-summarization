@@ -1,19 +1,22 @@
-# Build the v15.1 single-model image (~18 GB weights, one Qwen3-32B-AWQ INT4
+# Build the v15.2 single-model image (~18 GB weights, one Qwen3-32B-AWQ INT4
 # weight embedded) on Google Cloud Build, then push to the competition registry.
-# v15.1 = the v15 container base with the EXACT exp37 model+prompt (Qwen3-32B-AWQ,
-# context-first E5 prompt, exp08 single-ref shot pair). exp37 = 0.6944 leak-free.
-# GitHub Actions can't do even this (runner disk ~14 GB); LANTA podman is blocked
+# v15.2 = the v15 container base with the EXACT exp38 model+prompt (Qwen3-32B-AWQ,
+# context-first E5 prompt, exp08 shot1 + the multi-ref shot2 Q0746). exp38 =
+# 0.6987 leak-free. It differs from v15.1 (= exp37, 0.6944) ONLY in shot2, so
+# v15.2-vs-v15.1 isolates the exp37→exp38 delta inside the container. GitHub
+# Actions can't do even this (runner disk ~14 GB); LANTA podman is blocked
 # (no /etc/subuid). GCB gives a configurable disk.
 #
-# PERSISTENT MODEL CACHE VIA GCS (same scheme as v16.4/v22): the model weight is
-# NOT downloaded inside `docker build`. A GCS tar ($_HF_BUCKET/v15.1/hf-cache.tar)
-# holds a HuggingFace cache; each build (1) restores it into the workspace,
-# (2) snapshot_download's the model only if missing, (3) re-uploads if changed,
-# then (4) bakes it into the image via `COPY hf-cache`. The heavy, flaky HF pull
-# happens at most ONCE, ever — warm rebuilds (e.g. a run.py edit) skip it.
-# This image uses its OWN tar (v15.1/ prefix), SEPARATE from v16.x and v22's
-# tars — Qwen3-32B-AWQ is the only weight, so a separate prefix keeps the image
-# at ~18 GB instead of inheriting v22's two-model ~40 GB cache.
+# PERSISTENT MODEL CACHE VIA GCS (same scheme as v15.1/v16.4/v22): the model
+# weight is NOT downloaded inside `docker build`. A GCS tar holds a HuggingFace
+# cache; each build (1) restores it, (2) snapshot_download's the model only if
+# missing, (3) re-uploads if changed, then (4) bakes it via `COPY hf-cache`.
+# v15.2 SHARES v15.1's tar (${_HF_BUCKET}/v15.1/hf-cache.tar): the weight is
+# byte-identical (Qwen3-32B-AWQ), so the v15.1 tar is already populated → step 2
+# is a pure cache hit, NO download. We also `--cache-from $IMG:v15.1`, so every
+# Docker layer (apt/pip/torch/vllm + the ~18 GB COPY hf-cache) is reused; only
+# the tiny final `COPY model` layer (the run.py shot2 change) is rebuilt. Net:
+# a near-instant layer swap, no HF pull, no duplicate 18 GB GCS object.
 #
 # Region: asia-southeast1 is the persistent default (gcloud config builds/region
 # + the regional default staging bucket) — submit with a bare
@@ -23,12 +26,14 @@
 
 substitutions:
   _HF_BUCKET: 'gs://textsum-hf-cache-437476422274/hf'   # GCS path holding the HF cache (asia-southeast1)
+  _HF_PREFIX: 'v15.1'                                    # SHARED model tar (same Qwen3-32B-AWQ weight as v15.1)
 
 steps:
-  # 1. Restore the v15.1 HF cache from a single tar in GCS. Stored as a TAR
-  #    (not an rsync'd tree) because the HF layout is blobs/ + snapshots/
+  # 1. Restore the shared (v15.1) HF cache from a single tar in GCS. Stored as a
+  #    TAR (not an rsync'd tree) because the HF layout is blobs/ + snapshots/
   #    symlinks; GCS can't hold symlinks, so rsync would store every file twice.
-  #    tar keeps the symlinks intact. First build: no tar yet → start empty.
+  #    tar keeps the symlinks intact. The v15.1 build already populated this tar,
+  #    so this is a hit; the else-branch only fires if v15.1 was never built.
   - name: 'gcr.io/cloud-builders/gsutil'
     entrypoint: 'bash'
     args:
@@ -36,17 +41,17 @@ steps:
       - |
         set -euo pipefail
         mkdir -p textsum/hf-cache
-        if gsutil -q stat "${_HF_BUCKET}/v15.1/hf-cache.tar"; then
-          gsutil -m cp "${_HF_BUCKET}/v15.1/hf-cache.tar" /workspace/hf-cache.tar
+        if gsutil -q stat "${_HF_BUCKET}/${_HF_PREFIX}/hf-cache.tar"; then
+          gsutil -m cp "${_HF_BUCKET}/${_HF_PREFIX}/hf-cache.tar" /workspace/hf-cache.tar
           tar -xf /workspace/hf-cache.tar -C textsum
-          echo "restored v15.1 HF cache from tar"
+          echo "restored ${_HF_PREFIX} HF cache from tar"
         else
-          echo "no v15.1 cache tar yet (first build) — will download the model"
+          echo "no ${_HF_PREFIX} cache tar yet — will download the model"
         fi
 
   # 2. Download the model only if not already present (restored by step 1).
   #    Keep this in sync with run.py's LLM_MODEL default. snapshot_download
-  #    skips a repo already complete in the cache.
+  #    skips a repo already complete in the cache → no-op for the shared tar.
   - name: 'python:3.11-slim'
     entrypoint: 'bash'
     args:
@@ -69,7 +74,8 @@ steps:
           snapshot_download('Qwen/Qwen3-32B-AWQ')"
 
   # 3. Repack the cache as a single tar (symlinks preserved, no -h → ~18 GB not
-  #    ~36) and upload, replacing the previous tar.
+  #    ~36) and re-upload to the SHARED v15.1 tar. Idempotent: the content is the
+  #    same Qwen3-32B-AWQ weight v15.1 already stored, so this just refreshes it.
   - name: 'gcr.io/cloud-builders/gsutil'
     entrypoint: 'bash'
     args:
@@ -77,8 +83,8 @@ steps:
       - |
         set -euo pipefail
         tar -cf /workspace/hf-cache.tar -C textsum hf-cache
-        gsutil -m cp /workspace/hf-cache.tar "${_HF_BUCKET}/v15.1/hf-cache.tar"
-        echo "uploaded v15.1 cache tar: $(du -h /workspace/hf-cache.tar | cut -f1)"
+        gsutil -m cp /workspace/hf-cache.tar "${_HF_BUCKET}/${_HF_PREFIX}/hf-cache.tar"
+        echo "uploaded ${_HF_PREFIX} cache tar: $(du -h /workspace/hf-cache.tar | cut -f1)"
 
   # 4. Build the image (weights come from the context via COPY hf-cache) + push.
   - name: 'gcr.io/cloud-builders/docker'
@@ -92,15 +98,16 @@ steps:
         IMG=registry.ai.in.th/2026-textsum/47b13a1c/nontapat.jf0n
         echo "$$REGISTRY_PASSWORD" | docker login registry.ai.in.th \
           -u nontapat.jf0n --password-stdin
-        # Inline cache from the previous image reuses the apt/pip/torch base
-        # layers; the COPY hf-cache layer is cache-hit when the weight is
-        # unchanged, so a run.py edit busts only the tiny final COPY model layer.
-        # --cache-from on a missing tag (first v15.1 build) is a no-op warning.
+        # Cache from the v15.1 image: identical apt/pip/torch/vllm layers AND the
+        # ~18 GB COPY hf-cache layer (same weight) are cache-hit; only the final
+        # COPY model layer (the run.py shot2 change → exp38) is rebuilt. This is
+        # the whole point of building v15.2 off v15.1 — a near-instant layer swap.
         DOCKER_BUILDKIT=1 docker build \
           --cache-from $$IMG:v15.1 \
+          --cache-from $$IMG:v15.2 \
           --build-arg BUILDKIT_INLINE_CACHE=1 \
-          -t $$IMG:v15.1 .
-        docker push $$IMG:v15.1
+          -t $$IMG:v15.2 .
+        docker push $$IMG:v15.2
 
 availableSecrets:
   secretManager:
@@ -110,14 +117,14 @@ availableSecrets:
 options:
   # workspace hf-cache (~18 GB extracted) + the repacked hf-cache.tar (~18 GB) +
   # docker layers (base+torch+vllm ~30 GB) + the COPY hf-cache image layer
-  # (~18 GB) + transient COPY scratch peak. 250 GB (matches v16.4/v22) leaves
-  # ample headroom for this smaller single-model image.
+  # (~18 GB) + transient COPY scratch peak. 250 GB (matches v15.1/v16.4/v22)
+  # leaves ample headroom for this smaller single-model image.
   diskSizeGb: 250
   # HIGHCPU_8 = faster pip install + better network for the GCS sync. Bumping
   # machineType/disk above defaults exits the free 120 min/day tier (billed from
   # minute 1) — covered by the $300 trial credit.
   machineType: 'E2_HIGHCPU_8'
 
-# First build (cold cache) ~1 h (HF download). Warm builds skip the download —
-# only the GCS restore + docker layer assembly, ~10-20 min. 4 h ceiling.
+# Warm build (shares v15.1's cache + Docker layers): no HF download, only the
+# GCS restore + final COPY model layer + push, ~10-15 min. 4 h ceiling.
 timeout: 14400s

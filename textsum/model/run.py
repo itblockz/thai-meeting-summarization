@@ -17,14 +17,13 @@ query-first order of exp35).
 Train-set composite **0.6944 leak-free** (1218 queries, doc_050
 excluded) — +0.0015 over exp35 and +0.0297 over exp22.
 
-v15.1 = the v15 container base (deadsnakes python 3.11.x, surgical Triton
-bypass, the v13 infra below) but the EXACT exp37 model+prompt: Qwen3-32B-AWQ
-with exp08's single-ref shot pair. v15-K had swapped shot2 for a multi-ref
-example (Q0746) to lift IoU — that change IS the exp37→exp38 delta (exp38 =
-0.6987 leak-free). v15.1 reverts it so the recipe is exp37, not exp38; the
-model and every prompt token now match exp37 byte-for-byte. Use v15.1 to
-A/B the single-ref (exp37) vs multi-ref (exp38, = v15-K) shot2 inside the
-container, holding the infra constant.
+v15.2 = the v15 container base (deadsnakes python 3.11.x, surgical Triton
+bypass, the v13 infra below) with the EXACT exp38 model+prompt: Qwen3-32B-AWQ
++ exp08's shot1 (single-ref) PLUS the multi-ref shot2 (Q0746). This restores
+v15-K's multi-ref shot2 that v15.1 had reverted — i.e. v15.2 = exp38 (0.6987
+leak-free), v15.1 = exp37 (0.6944). The two are byte-identical except for
+shot2, so v15.2 vs v15.1 isolates the exp37→exp38 delta inside the container,
+holding the infra (and the never-shipped v15-K image) constant.
 
 v14 = v13 infra (sort by doc_id, streaming progress, KV opts) PLUS
 context-first prompt order. The infra changes alone were no-op for
@@ -86,16 +85,21 @@ SYSTEM_MSG = (
     "ตอบคำถามโดยอ้างอิงจากย่อหน้าที่ให้มาเท่านั้น ห้ามแต่งเติม"
 )
 
-# Two worked few-shot examples (exp08's pair, both from held-out doc_050),
-# rendered in E5 form: a 5-paragraph numbered context and an answer that
-# ends with the [อ้างอิง: N] tag. Both gold answers cite a single
-# paragraph — matching the dataset prior that 71.8% of queries have one
-# gold ref — which keeps the model from over-citing.
+# Two worked few-shot examples (both from held-out doc_050), rendered in
+# E5 form: a 5-paragraph numbered context and an answer ending with the
+# [อ้างอิง: N] tag.
 #
-# v15.1 reverts v15-K's multi-ref shot2 (Q0746) back to exp08's single-ref
-# shot2 so the few-shot pair is byte-identical to exp37 (the 0.6944
-# leak-free recipe this image ports). v15-K's multi-ref shot2 is the
-# exp37→exp38 delta; dropping it makes this image exp37, not exp38.
+# Shot 1 (exp08 carry-over): single-ref — matches the 71.8% single-ref
+# dataset prior, teaches "cite exactly the source paragraph."
+# Shot 2 (v15-K / exp38, restored in v15.2): multi-ref subset — replaces
+# exp08's single-ref shot2 because the 153 missed-tag queries in the v15
+# train eval were overwhelmingly multi-ref gold (model emits a comprehensive
+# answer but forgets to cite anything). Q0746 from doc_050: 4 of 5 context
+# paragraphs are gold (P21-P24, absentee list); P20 is a same-section
+# distractor (attendee #12). Teaches "structured answer covers several
+# paragraphs → cite them all" + "don't cite paragraphs the answer didn't
+# use." This multi-ref shot2 IS the exp37→exp38 delta (IoU 0.6669→0.6906);
+# v15.1 dropped it (= exp37), v15.2 keeps it (= exp38).
 _SHOT1_QUERY = "ในการประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้นที่ใด"
 _SHOT1_PARAS = [
     "ครั้งที่ ๔๙",
@@ -106,15 +110,15 @@ _SHOT1_PARAS = [
 ]
 _SHOT1_ANSWER = "การประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้น ณ ห้องประชุมกรรมาธิการ N 406 ชั้น ๔ อาคารรัฐสภา [อ้างอิง: 3]"
 
-_SHOT2_QUERY = "การจัดทำแบบสำรวจความพึงพอใจและไม่พึงพอใจของคณะกรรมาธิการจัดขึ้นเพื่ออะไร"
+_SHOT2_QUERY = "ในการประชุมคณะกรรมาธิการการเงิน การคลัง สถาบันการเงินและตลาดการเงิน ครั้งที่ 49 มีกรรมการผู้ที่ไม่มาประชุมมีจำนวนกี่คน"
 _SHOT2_PARAS = [
-    "เริ่มประชุมเวลา ๐๙.๔๖ นาฬิกา",
-    "เมื่อกรรมาธิการมาครบองค์ประชุมแล้ว ประธานคณะกรรมาธิการได้กล่าวเปิดประชุม และดำเนินการประชุมตามระเบียบวาระการประชุม สรุปสาระสำคัญได้ ดังนี้",
-    "ระเบียบวาระที่ ๑ เรื่องที่ประธานแจ้งต่อที่ประชุม",
-    "สำนักงานเลขาธิการสภาผู้แทนราษฎรขอความอนุเคราะห์ตอบแบบสำรวจความพึงพอใจและความไม่พึงพอใจของคณะกรรมาธิการต่อการบริหารจัดการด้านการประชุม การศึกษาดูงาน และการจัดสัมมนา เพื่อนำผลการประเมินความพึงพอใจและความไม่พึงพอใจมาเป็นข้อมูลในการทบทวน ปรับปรุง และพัฒนาการปฏิบัติงานให้มีประสิทธิภาพต่อไป",
-    "ที่ประชุมรับทราบ",
+    "๑๒. นางสาวแอนศิริ วลัยกนก กรรมาธิการ",
+    "กรรมาธิการผู้ไม่มาประชุม",
+    "๑. นายพิบูลย์ รัชกิจประการ (ลาการประชุม)",
+    "๒. นายธนยศ ทิมสุวรรณ (ลาการประชุม)",
+    "๓. นายอัคร ทองใจสด (ลาการประชุม)",
 ]
-_SHOT2_ANSWER = "การจัดทำแบบสำรวจความพึงพอใจและไม่พึงพอใจของคณะกรรมการในครั้งนี้ มีการจัดทำขึ้นเพื่อนำข้อมูลที่ได้มาทบทวน ปรับปรุง รวมถึงนำไปพัฒนาการปฏิบัติงานให้มีประสิทธิภาพยิ่งขึ้น [อ้างอิง: 4]"
+_SHOT2_ANSWER = "ในการประชุมคณะกรรมาธิการการเงิน การคลัง สถาบันการเงินและตลาดการเงิน ครั้งที่ 49 มีกรรมการผู้ที่ไม่มาประชุมจำนวน 3 คน [อ้างอิง: 2, 3, 4, 5]"
 
 
 def benchmark_lib(i):
