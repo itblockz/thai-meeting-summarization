@@ -604,6 +604,84 @@ def _build_prompt_r3cite_complete(query, paras):
         f"คำตอบ:"
     )
 
+# ---- Round 8: exp77 IoU failure-mode fixes (gemma NVFP4 ref-picker) ----
+# Two levers from the exp77 IoU error analysis (train, IoU 0.8156):
+#   FM1 block under-citation — gold is often a contiguous block (roster / list /
+#        multi-item resolution); the model cites only the lead/heading paragraph
+#        (292 block queries @ meanIoU 0.66, covers only 69% of the block).
+#   FM2 heading-grab — for single-ref answers the model cites the agenda-title
+#        line (ระเบียบวาระ / "๕.๑ พิจารณา…") instead of the actual outcome/มติ
+#        paragraph (45% of single-gold misses include a header line).
+# _BLOCK / _OUTCOME / _DEDUP are the reusable clause strings.
+_CLAUSE_BLOCK = (
+    "**หากคำตอบอ้างถึงรายการ รายชื่อ หรือหลายข้อย่อยที่เรียงต่อเนื่องกัน "
+    "(เช่น รายชื่อกรรมการ มาตรการหลายข้อ หรือมติหลายข้อ) "
+    "ให้อ้างอิงย่อหน้าทุกย่อหน้าในช่วงนั้นให้ครบ ไม่ใช่เฉพาะย่อหน้าหัวเรื่อง**"
+)
+_CLAUSE_OUTCOME = (
+    "**ให้อ้างอิงย่อหน้าที่มีเนื้อหาคำตอบหรือมติ/ผลสรุปจริง "
+    "ไม่ใช่บรรทัดหัวข้อระเบียบวาระหรือชื่อหัวข้อ (เช่น 'ระเบียบวาระที่ ๔' หรือ '๕.๑ พิจารณา…') "
+    "เว้นแต่หัวข้อนั้นเป็นคำตอบโดยตรง**"
+)
+_CLAUSE_DEDUP = (
+    "หากข้อความเดียวกันปรากฏซ้ำในหลายย่อหน้า (เช่น ในสารบัญและในเนื้อการประชุม) "
+    "ให้เลือกย่อหน้าที่อยู่ในเนื้อการอภิปราย/มติจริง"
+)
+
+
+def _factual_with_clauses(query, paras, clauses):
+    """V10_factual (exp77's deployed answer+cite prompt) + extra citation clauses."""
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    extra = (" " + " ".join(clauses)) if clauses else ""
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: ตอบคำถามเป็นภาษาไทย**สั้นและตรงประเด็น** "
+        f"ระบุข้อเท็จจริงที่ปรากฏในย่อหน้าเท่านั้น ห้ามตีความหรือสรุปเกินขอบเขต "
+        f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y]{extra}\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_g1_factual_block(query, paras):
+    return _factual_with_clauses(query, paras, [_CLAUSE_BLOCK])
+
+def _build_prompt_g2_factual_outcome(query, paras):
+    return _factual_with_clauses(query, paras, [_CLAUSE_OUTCOME])
+
+def _build_prompt_g3_factual_block_outcome(query, paras):
+    return _factual_with_clauses(query, paras, [_CLAUSE_OUTCOME, _CLAUSE_BLOCK])
+
+
+def _cite_only_with_rules(query, paras, rules):
+    """Citation-only output (refs IoU only); `rules` is a list of bullet strings."""
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    body = " ".join(rules)
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: เลือกเลขย่อหน้าที่เป็นหลักฐานโดยตรงของคำตอบ {body} "
+        f"ตอบเฉพาะรูปแบบ [อ้างอิง: X, Y] เท่านั้น ห้ามเขียนสรุป\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_g4_cite_block(query, paras):
+    return _cite_only_with_rules(query, paras, [
+        "หากคำตอบเป็นรายการ รายชื่อ หรือหลายข้อย่อยที่เรียงต่อเนื่องกัน "
+        "ให้รวมย่อหน้าทุกย่อหน้าในช่วงนั้นให้ครบ ไม่ใช่เฉพาะย่อหน้าหัวเรื่อง"])
+
+def _build_prompt_g5_cite_outcome(query, paras):
+    return _cite_only_with_rules(query, paras, [
+        "อ้างย่อหน้าที่มีเนื้อหาคำตอบหรือมติ/ผลสรุปจริง "
+        "หลีกเลี่ยงบรรทัดหัวข้อระเบียบวาระหรือชื่อหัวข้อ (เช่น 'ระเบียบวาระที่ ๔', '๕.๑ พิจารณา…') "
+        "เว้นแต่หัวข้อนั้นเป็นคำตอบโดยตรง"])
+
+def _build_prompt_g6_cite_block_outcome(query, paras):
+    return _cite_only_with_rules(query, paras, [
+        "ตามหลักต่อไปนี้:",
+        "(1) อ้างย่อหน้าที่มีเนื้อหาคำตอบหรือมติ/ผลสรุปจริง ไม่ใช่บรรทัดหัวข้อระเบียบวาระหรือชื่อหัวข้อ เว้นแต่หัวข้อนั้นเป็นคำตอบโดยตรง",
+        "(2) หากคำตอบเป็นรายการ รายชื่อ หรือหลายข้อย่อยที่เรียงต่อเนื่องกัน ให้รวมย่อหน้าทุกย่อหน้าในช่วงนั้นให้ครบ",
+        "(3) " + _CLAUSE_DEDUP])
+
 # variants registry
 PROMPT_VARIANTS = [
     ('V1_brevity', SYSTEM_BASELINE, _build_prompt_brevity),               # winner baseline
@@ -649,6 +727,13 @@ PROMPT_VARIANTS = [
     ('R3C14_named_entities', SYSTEM_CITATION_ONLY, _build_prompt_r3cite_named_entities, _CITE_SHOTS),
     ('R3C15_no_redundant', SYSTEM_CITATION_ONLY, _build_prompt_r3cite_no_redundant, _CITE_SHOTS),
     ('R3C16_complete', SYSTEM_CITATION_RECALL, _build_prompt_r3cite_complete, _CITE_SHOTS),
+    # Round 8 — exp77 IoU failure-mode fixes; answer+cite (G1-3, base V10_factual) + citation-only (G4-6)
+    ('G1_factual_block', SYSTEM_BASELINE, _build_prompt_g1_factual_block, _DEFAULT_SHOTS),
+    ('G2_factual_outcome', SYSTEM_BASELINE, _build_prompt_g2_factual_outcome, _DEFAULT_SHOTS),
+    ('G3_factual_block_outcome', SYSTEM_BASELINE, _build_prompt_g3_factual_block_outcome, _DEFAULT_SHOTS),
+    ('G4_cite_block', SYSTEM_CITATION_ONLY, _build_prompt_g4_cite_block, _CITE_SHOTS),
+    ('G5_cite_outcome', SYSTEM_CITATION_ONLY, _build_prompt_g5_cite_outcome, _CITE_SHOTS),
+    ('G6_cite_block_outcome', SYSTEM_CITATION_RECALL, _build_prompt_g6_cite_block_outcome, _CITE_SHOTS),
 ]
 
 # Filter via env var (e.g. VARIANTS=V10_factual,V6_brevity_minimal)
@@ -697,7 +782,9 @@ def main():
 
     llm = LLM(
         model=MODEL_NAME, max_model_len=32768,
-        tensor_parallel_size=1, gpu_memory_utilization=0.95,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=float(os.environ.get('GPU_MEM_UTIL', '0.95')),
+        enable_prefix_caching=True,  # output-neutral; reuses the ~14K doc prefix
         dtype='bfloat16', enforce_eager=True, trust_remote_code=True,
         limit_mm_per_prompt={'image': 0, 'video': 0},
     )
