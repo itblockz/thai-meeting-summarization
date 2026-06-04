@@ -1,7 +1,9 @@
 """
 Prompt-tuning lab — fast variant comparison on 100-query dev sample.
-Loads Qwen3-30B-A3B-Instruct-2507-FP8 once, runs N prompt variants.
-Outputs RougeL + IoU table (no SS-score for speed).
+Loads the LLM once, runs N prompt variants, then frees the LLM and loads
+bge-m3 to compute the real SS-score (mirrors eval_train/score.py).
+Outputs RougeL + SS + IoU, the answer sub-score (0.35·RougeL + 0.45·SS),
+and the full competition composite. Default ranking: answer_sub.
 
 To add a new variant, append to PROMPT_VARIANTS list at bottom.
 """
@@ -739,6 +741,65 @@ def _build_prompt_h4_complete_entities(query, paras):
         f"คำตอบ:"
     )
 
+# ---- Round 10: answer-quality / length calibration (maximize 0.35·RougeL + 0.45·SS) ----
+# exp51 per-query error analysis (leak-free 1218): within correct-ref (IoU=1)
+# queries, SS peaks when pred/gold length is 0.8-1.3x (SS 0.913 / RougeL 0.636)
+# and falls on BOTH tails — under-answer (<0.8x: SS 0.861, RougeL 0.442) and
+# over-answer (1.3-2.5x: SS 0.858; >2.5x: SS 0.794). 558/793 correct-ref queries
+# sit outside the sweet band. V10's blanket "สั้น" under-answers "why/how"
+# queries; A3B over-generates (371 q >1.3x) by dumping the whole paragraph.
+# These variants target gold length: answer the asked point FULLY (incl. the
+# reason/outcome a why/how query wants) but add NO adjacent paragraph facts.
+def _build_prompt_n1_precise(query, paras):
+    """E5 baseline + answer ONLY what is asked (incl. reason/outcome), no adjacent facts."""
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: ตอบคำถามเป็นภาษาไทยให้**ตรงประเด็นที่ถูกถามโดยตรงและครบถ้วน** "
+        f"หากคำถามถามว่าทำไมหรืออย่างไร ให้ระบุเหตุผลหรือผลลัพธ์นั้นให้ครบ "
+        f"แต่**อย่าเพิ่มรายละเอียดอื่นในย่อหน้าที่ไม่เกี่ยวกับคำถาม** "
+        f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y]\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_n2_no_padding(query, paras):
+    """V10_factual base + explicit no-padding (don't summarize the whole paragraph)."""
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: ตอบคำถามเป็นภาษาไทย**ตรงประเด็น** ระบุข้อเท็จจริงที่ปรากฏในย่อหน้าเท่านั้น "
+        f"**ตอบเฉพาะสิ่งที่คำถามถาม ไม่ต้องสรุปทั้งย่อหน้าหรือเพิ่มบริบทที่ไม่ถูกถาม** "
+        f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y]\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_n3_complete_concise(query, paras):
+    """Cover every asked point fully but concisely — no repetition, no tangents."""
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: ตอบคำถามเป็นภาษาไทยให้**ครอบคลุมทุกประเด็นที่คำถามถามอย่างครบถ้วน** "
+        f"ด้วยถ้อยคำกระชับ ไม่ซ้ำความ และไม่ใส่ข้อมูลที่ไม่เกี่ยวกับคำถาม "
+        f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y]\n"
+        f"คำตอบ:"
+    )
+
+def _build_prompt_n4_length_band(query, paras):
+    """Explicit length guidance: ~1-3 sentences unless the answer is a list."""
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"คำสั่ง: ตอบคำถามเป็นภาษาไทยตรงประเด็น โดยทั่วไปความยาวประมาณ 1-3 ประโยค "
+        f"เว้นแต่คำถามต้องการรายการหลายข้อจึงระบุให้ครบทุกข้อ "
+        f"ใช้ข้อเท็จจริงจากย่อหน้าเท่านั้น ไม่เพิ่มบริบทที่ไม่ถูกถาม "
+        f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y]\n"
+        f"คำตอบ:"
+    )
+
 # variants registry
 PROMPT_VARIANTS = [
     ('V1_brevity', SYSTEM_BASELINE, _build_prompt_brevity),               # winner baseline
@@ -796,6 +857,14 @@ PROMPT_VARIANTS = [
     ('H2_complete_block', SYSTEM_BASELINE, _build_prompt_h2_complete_block, _DEFAULT_SHOTS),
     ('H3_exhaustive_list', SYSTEM_BASELINE, _build_prompt_h3_exhaustive_list, _DEFAULT_SHOTS),
     ('H4_complete_entities', SYSTEM_BASELINE, _build_prompt_h4_complete_entities, _DEFAULT_SHOTS),
+    # Round 10 — answer-quality / length calibration (rank by 0.35·RougeL + 0.45·SS)
+    # baselines for direct comparison: V10_factual (=exp51 prompt) + E5 baseline
+    ('B_v10_factual', SYSTEM_BASELINE, _build_prompt_brevity_factual, _DEFAULT_SHOTS),
+    ('B_e5_baseline', SYSTEM_BASELINE, _build_prompt_baseline, _DEFAULT_SHOTS),
+    ('N1_precise', SYSTEM_BASELINE, _build_prompt_n1_precise, _DEFAULT_SHOTS),
+    ('N2_no_padding', SYSTEM_BASELINE, _build_prompt_n2_no_padding, _DEFAULT_SHOTS),
+    ('N3_complete_concise', SYSTEM_BASELINE, _build_prompt_n3_complete_concise, _DEFAULT_SHOTS),
+    ('N4_length_band', SYSTEM_BASELINE, _build_prompt_n4_length_band, _DEFAULT_SHOTS),
 ]
 
 # Filter via env var (e.g. VARIANTS=V10_factual,V6_brevity_minimal)
@@ -872,6 +941,7 @@ def main():
         outputs = llm.generate(prompts, sampling)
 
         rouges, ious = [], []
+        answers = []  # kept for the SS pass (after vLLM is freed)
         n_explicit = 0
         n_think_stripped = 0
         n_think_missing = 0
@@ -890,30 +960,61 @@ def main():
             if re.search(r'\[อ้างอิง[:\s]+[0-9,\s]+\]', raw):
                 n_explicit += 1
             ref_counts.append(len(pred_refs))
+            # fallback mirrors exp51 run.py so empty answers aren't scored as ''
+            if not ans:
+                ans = it['gen_texts'][0] if it['gen_texts'] else it['query']
+            answers.append(ans)
             rouges.append(rouge_l(ans, it['gold_abs']))
             ious.append(iou(pred_refs, it['gold_refs']))
 
         r_avg = sum(rouges)/len(rouges)
         i_avg = sum(ious)/len(ious)
-        # composite proxy (no SS): 0.55×RougeL + 0.45×IoU (rebalanced w/o SS)
-        # For ranking, also report what composite WOULD be assuming SS≈0.85 (typical)
-        proxy = 0.55 * r_avg + 0.45 * i_avg
-        full_proxy = 0.45 * 0.85 + 0.35 * r_avg + 0.20 * i_avg  # assume SS=0.85
-        print(f"RougeL={r_avg:.4f}  IoU={i_avg:.4f}  citations={n_explicit}/{len(items)}  avg_refs={sum(ref_counts)/len(ref_counts):.2f}  think_stripped={n_think_stripped}/{len(items)}  think_missing={n_think_missing}/{len(items)}", flush=True)
-        print(f"proxy (no SS) = {proxy:.4f}  proxy(SS=0.85) = {full_proxy:.4f}", flush=True)
-        results.append({'name': name, 'rougeL': r_avg, 'IoU': i_avg, 'cites': n_explicit, 'avg_refs': sum(ref_counts)/len(ref_counts), 'proxy': proxy, 'think_stripped': n_think_stripped, 'think_missing': n_think_missing})
+        pred_len = sum(len(a) for a in answers)/len(answers)
+        print(f"RougeL={r_avg:.4f}  IoU={i_avg:.4f}  citations={n_explicit}/{len(items)}  avg_refs={sum(ref_counts)/len(ref_counts):.2f}  pred_len={pred_len:.0f}  think_stripped={n_think_stripped}/{len(items)}  think_missing={n_think_missing}/{len(items)}", flush=True)
+        results.append({'name': name, 'rougeL': r_avg, 'IoU': i_avg, 'cites': n_explicit,
+                        'avg_refs': sum(ref_counts)/len(ref_counts), 'pred_len': pred_len,
+                        'think_stripped': n_think_stripped, 'think_missing': n_think_missing,
+                        '_answers': answers})
 
-    # final summary table
-    rank_by = os.environ.get('RANK_BY', 'proxy').strip()
-    rank_key = {'iou': 'IoU', 'rougel': 'rougeL', 'proxy': 'proxy'}.get(rank_by.lower(), 'proxy')
+    # ===== SS-score pass: free vLLM, load bge-m3 on the now-free GPU =====
+    # Mirrors textsum/eval_train/score.py exactly: BAAI/bge-m3, normalize, cosine.
+    # Two-phase (del llm first) so the embedder gets the VRAM vLLM held at util 0.95.
+    import gc, torch
+    del llm
+    gc.collect(); torch.cuda.empty_cache()
+    from sentence_transformers import SentenceTransformer
+    import torch.nn.functional as F
+    print("\n=== SS-score pass (bge-m3) ===", flush=True)
+    emb_model = SentenceTransformer("BAAI/bge-m3")
+    gold_abs = [it['gold_abs'] for it in items]
+    gold_emb = emb_model.encode(gold_abs, batch_size=32, convert_to_tensor=True,
+                                normalize_embeddings=True)
+    gold_len = sum(len(g) for g in gold_abs)/len(gold_abs)
+    print(f"gold avg char-len = {gold_len:.0f}", flush=True)
+    for r in results:
+        preds = [a if a.strip() else ' ' for a in r.pop('_answers')]
+        pred_emb = emb_model.encode(preds, batch_size=32, convert_to_tensor=True,
+                                    normalize_embeddings=True)
+        r['SS'] = F.cosine_similarity(pred_emb, gold_emb, dim=1).mean().item()
+        # objective the user is optimizing + full competition composite
+        r['answer_sub'] = 0.35 * r['rougeL'] + 0.45 * r['SS']
+        r['full'] = 0.45 * r['SS'] + 0.35 * r['rougeL'] + 0.20 * r['IoU']
+        print(f"{r['name']:<24} SS={r['SS']:.4f}  answer_sub(0.35R+0.45SS)={r['answer_sub']:.4f}  full={r['full']:.4f}", flush=True)
+
+    # final summary table — default rank by the answer sub-score (0.35R+0.45SS)
+    rank_by = os.environ.get('RANK_BY', 'answer_sub').strip()
+    rank_key = {'iou': 'IoU', 'rougel': 'rougeL', 'ss': 'SS',
+                'answer_sub': 'answer_sub', 'answer': 'answer_sub',
+                'full': 'full'}.get(rank_by.lower(), 'answer_sub')
     print("\n\n=== SUMMARY ===", flush=True)
     print(f"Ranked by: {rank_key}", flush=True)
-    print(f"{'variant':<28} {'RougeL':>8} {'IoU':>8} {'cites':>8} {'refs':>6} {'proxy':>8}", flush=True)
+    print(f"{'variant':<24} {'RougeL':>8} {'SS':>8} {'IoU':>8} {'ansSub':>8} {'full':>8} {'len':>5} {'cites':>7}", flush=True)
     for r in sorted(results, key=lambda x: -x[rank_key]):
-        print(f"{r['name']:<28} {r['rougeL']:>8.4f} {r['IoU']:>8.4f} {r['cites']:>6}/{len(items)} {r['avg_refs']:>6.2f} {r['proxy']:>8.4f}", flush=True)
+        print(f"{r['name']:<24} {r['rougeL']:>8.4f} {r['SS']:>8.4f} {r['IoU']:>8.4f} {r['answer_sub']:>8.4f} {r['full']:>8.4f} {r['pred_len']:>5.0f} {r['cites']:>5}/{len(items)}", flush=True)
     if results:
-        best_iou = max(results, key=lambda x: x['IoU'])
-        print(f"\nBest IoU: {best_iou['name']} = {best_iou['IoU']:.4f} (avg_refs={best_iou['avg_refs']:.2f})", flush=True)
+        best = max(results, key=lambda x: x['answer_sub'])
+        print(f"\nBest answer_sub (0.35R+0.45SS): {best['name']} = {best['answer_sub']:.4f} "
+              f"(RougeL={best['rougeL']:.4f} SS={best['SS']:.4f} len={best['pred_len']:.0f})", flush=True)
 
     with open(RESULT_DIR / 'summary.json', 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
