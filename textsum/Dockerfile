@@ -1,19 +1,17 @@
 # syntax=docker/dockerfile:1
 #
-# v22 — two-stage hybrid (exp56 port). Stage A picks refs with
-# gemma-4-31B-it-NVFP4 (4-bit NVFP4, ~22 GB — the exp73 model, swapped in
-# for v21's Qwen3.6-27B-FP8); Stage B writes the answer with Qwen3-32B-AWQ
-# (~18 GB INT4). Both stages share one 40 GB GPU sequentially (combined
-# weights ~40 GB → cannot coexist; `del + empty_cache` between).
-#
 # MODEL WEIGHTS ARE NOT DOWNLOADED HERE. cloudbuild.yaml seeds them from a
-# persistent GCS bucket (a HuggingFace cache that accumulates every model we
-# have ever pulled), so a rebuild never re-fetches from HF — even after
-# switching the Stage-A model away and back. The build context therefore
-# carries `hf-cache/` (synced from GCS by the earlier Cloud Build steps), and
-# we just COPY it in. Order matters: COPY hf-cache BEFORE COPY model so a
-# run.py edit invalidates only the tiny final layer, never the ~40 GB weights.
-
+# persistent GCS tar (a HuggingFace cache), so a rebuild never re-fetches from
+# HF. The build context carries `hf-cache/` (restored from GCS by the earlier
+# Cloud Build steps) and we just COPY it in. Order matters: COPY hf-cache
+# BEFORE COPY model so a run.py edit invalidates only the tiny final layer,
+# never the ~47 GB weights.
+#
+# v17.2 = independent column-merge (NOT v17.1's coupled hint pipe). Two single-
+# model images run independently; the final CSV takes the ANSWER from v16.1 and
+# the REFS from v16.4. The hf-cache holds BOTH models: nvidia/Gemma-4-26B-A4B-
+# NVFP4 (refs, Stage 1, ~18 GB) + Qwen3-30B-A3B-Instruct-2507-FP8 (answer,
+# Stage 2, ~29 GB); cloudbuild downloads both into the cache tar.
 FROM docker.io/nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -29,17 +27,12 @@ RUN apt-get update && apt-get install -y python3.11 python3.11-dev python3.11-di
     rm -rf /var/lib/apt/lists/*
 RUN ln -sf /usr/bin/python3.11 /usr/bin/python3
 
-# v21: the base image is CUDA *runtime* (no nvcc). On the H100 benchmark backend
-# vLLM's Hopper FP8 fast paths (DeepGEMM + FlashInfer fp8 KV) JIT-compile CUDA
-# kernels with nvcc+ninja at first use — v19 died here with `nvcc: not found`.
-# Install the matching CUDA 12.8 compiler toolkit (nvcc + headers) + ninja so
-# that JIT succeeds. cuda-minimal-build pulls nvcc/cudart-dev without the full
-# ~6GB toolkit. run.py routes all JIT caches (TORCH_EXTENSIONS_DIR,
-# CUDA_CACHE_PATH, FLASHINFER_WORKSPACE_BASE, HOME) to writable /scratch.
-RUN apt-get update && apt-get install -y cuda-minimal-build-12-8 ninja-build && \
-    rm -rf /var/lib/apt/lists/*
-ENV CUDA_HOME=/usr/local/cuda \
-    PATH=/usr/local/cuda/bin:$PATH
+# v17.2 needs NO nvcc: run.py sets VLLM_USE_DEEP_GEMM=0 and keeps
+# kv_cache_dtype="auto" (Stage 1's NVFP4 gemma has its baked fp8-KV directive
+# stripped at runtime by build_kv_neutralized_model so "auto" → bf16), forcing
+# the precompiled CUTLASS/Marlin/NVFP4 path on both A100 and H100 (no runtime
+# JIT). The v21 hybrid's cuda-minimal-build/nvcc bake + CUDA_HOME env are
+# dropped here — keeps the image lean.
 
 COPY requirements.txt ./
 # torch 2.10.0 wheels on cu128 index (matches CUDA 12.8.1 base)
@@ -47,20 +40,29 @@ RUN pip3 install --no-cache-dir --timeout 300 --retries 5 \
     torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 RUN pip3 install --no-cache-dir --timeout 300 --retries 5 -r requirements.txt
 
-# Bake both models' HF cache (gemma-4-31B-NVFP4 + Qwen3-32B-AWQ), seeded from
-# GCS by cloudbuild.yaml. This is the ~40 GB layer; it only changes when the
-# model set changes, so run.py edits leave it cache-hit.
+# v17.2: independent column-merge (A3B answer + gemma-NVFP4 refs; exp80-85
+# "best of both" cell). Stage 1 = nvidia/Gemma-4-26B-A4B-NVFP4 (cold V10 → REFS
+# only), Stage 2 = Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 (cold V10 → ANSWER
+# only). NO hint between them — each runs as its single-model image (v16.4 /
+# v16.1). run.py runs each stage in its OWN subprocess (the orchestrator never
+# touches CUDA); the worker process exits between stages so the GPU is genuinely
+# fresh for the second model → each stage CSV is byte-identical to v16.4 / v16.1
+# standalone, then the orchestrator merges columns.
+#
+# Bake both models' HF cache, seeded from the GCS tar by cloudbuild.yaml (NOT
+# downloaded here — see the header). This is the ~47 GB layer; it only changes
+# when the model set changes, so a run.py edit leaves it cache-hit (COPY model
+# below is the only busted layer).
 COPY hf-cache /root/.cache/huggingface
 
 RUN mkdir -p /scratch && chmod 1777 /scratch
 
-# vllm 0.19.1 is V1-ONLY (V0 removed; `VLLM_USE_V1` is no longer a recognised env
-# var — setting it just warns). The two-stage handoff RELIES on V1 multiprocessing:
-# each stage's EngineCore runs in a child process, so `del engine` tears that
-# process down and the OS reclaims ALL its GPU memory before the next stage loads.
-# In-process mode (VLLM_ENABLE_V1_MULTIPROCESSING=0) leaves Stage A's ~22 GB
-# resident after del+empty_cache → Stage B OOMs on init (verified job 5824350:
-# "Free memory 3.27/39.5 GiB"). Pin it ON so a future default flip can't break us.
+# GPU teardown between stages is handled by the OS: run.py spawns one process
+# per stage, and a worker's full exit reclaims ALL its VRAM before the next
+# worker spawns (no in-process `del engine` / empty_cache needed). vllm 0.19.1
+# is V1-ONLY (`VLLM_USE_V1` is a dead env var). VLLM_ENABLE_V1_MULTIPROCESSING=1
+# is kept (harmless; each worker still spawns its EngineCore child) but is no
+# longer load-bearing for the handoff — the subprocess boundary is.
 ENV HF_HOME=/root/.cache/huggingface \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \

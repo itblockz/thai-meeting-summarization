@@ -1,58 +1,62 @@
 """
-v22 — exp56 hybrid with the Stage-A ref-picker swapped to gemma-4-31B-NVFP4
-(the exp73 model). H100 40GB single-GPU optimised.
+v17.2 — independent column-merge: ANSWER from v16.1, REFS from v16.4.
 
-NO RETRIEVAL: the full list of *valid* paragraphs from `doc_id` is fed to
-both stages in document order. Two sequential LLMs share one 40 GB GPU
-(weights together ≈ 22 + 18 = 40 GB at the edge, so they cannot coexist —
-loaded one at a time with del + empty_cache between):
+NOT v17.1. v17.1 was a *coupled* two-stage pipe — Stage 1's refs were fed to
+Stage 2 as a hint line. v17.2 runs the two single-model images **independently**
+(no hint, no handoff) and merges their CSVs column-wise: abstractive from one
+model, refs from the other. Score decomposes linearly under greedy decode, so
+the merged composite = answerModel(RougeL,SS) + refModel(IoU).
 
-  Stage A — RedHatAI/gemma-4-31B-it-NVFP4 (4-bit NVFP4 weights ≈ 22 GB via
-            NvFp4LinearBackend.MARLIN) with the V10_factual prompt + the
-            exp38 multi-ref shot pair. Picks *refs* via [อ้างอิง: …] tags
-            from the full doc. (v21 used Qwen3.6-27B-FP8 here.)
-  --- free weights, gc.collect(), torch.cuda.empty_cache() ---
-  Stage B — Qwen/Qwen3-32B-AWQ (INT4 AWQ-Marlin, ≈ 18 GB) with exp38's
-            E5 prompt + a "เน้นย่อหน้าหมายเลข [X, Y, Z]" hint pointing
-            at Stage A's selection. Writes the abstractive answer on
-            the FULL doc context. Its emitted citations are parsed but
-            DISCARDED — final `refs` are FIXED to Stage A's selection.
+  Stage 1 — REFS source = v16.4 = nvidia/Gemma-4-26B-A4B-NVFP4 (26B MoE,
+            ~4B active, NVFP4 experts ~18 GB load). Cold V10_factual + exp38
+            shots, full doc. Record single-model citation IoU (exp77 0.8155).
+  Stage 2 — ANSWER source = v16.1 = Qwen/Qwen3-30B-A3B-Instruct-2507-FP8
+            (the v16/exp42 model). SAME cold V10_factual + exp38 shots, full
+            doc. Strongest ~4B-active answer-writer here (exp51 0.7110).
 
-Leak-free composite **0.7215** on A100 (exp56, +0.0228 over v16's 0.7087).
+Each stage's CSV column we keep is its strength; the other column is discarded.
+Final = A3B answer + gemma refs (the exp80-85 "best of both" cell, A3B-answer
+variant of exp86's recipe).
 
-H100 40 GB optimisations (vs the A100-targeted exp56 reference):
-  - Native FP8 GEMM: A100 has no FP8 tensor cores, so 27B-FP8 falls back
-    to MarlinFP8 dequant kernels (~1.5–2× slower). H100 SM 9.0 runs the
-    FP8 GEMM directly; vLLM auto-selects the native path.
-  - FlashAttention 3: H100-only TMA + WGMMA attention path, 1.5–2× faster
-    than FA2 on the long-context (~14K-tok) doc prompts.
-  - FP8 KV cache (`kv_cache_dtype="fp8"`): H100-only, halves KV cache
-    memory → roughly 2× concurrent prompts in flight.
-  - gpu_memory_utilization 0.92 (vs A100's 0.90): H100 firmware is
-    stable enough at higher mem util. Stage A budget: 36.8 GB → 30 GB
-    weights + ~5–6 GB FP8 KV. Stage B: 18 GB weights + ~17 GB FP8 KV.
-  - vllm 0.19.1 is V1-ONLY (V0 was removed; `VLLM_USE_V1` is a dead env var).
-    The two-stage handoff DEPENDS on V1 multiprocessing being ON
-    (VLLM_ENABLE_V1_MULTIPROCESSING=1, set in the Dockerfile): each stage's
-    EngineCore is a child process, so `del engine` tears it down and the OS
-    reclaims its GPU memory before the next stage loads. In-process mode
-    leaves Stage A's weights resident → Stage B OOMs (job 5824350). Verified
-    end-to-end on A100 under apptainer --containall (job 5824281).
-  - enforce_eager remains True: keeps the torch.compile/CUDAGraph path out of
-    the picture inside Apptainer (the v15 V1-bump attempt, job 5787048, saw
-    FLASHINFER/TRITON_ATTN/FLEX_ATTENTION SIGSEGV with compile on). ~0 latency
-    cost at this batch size.
-  - max_num_batched_tokens 16384: long-context (full doc ≈ 14K tok)
-    throughput is bound by prefill chunking, not decode.
+PROCESS MODEL — one OS process PER STAGE (the bit-identical fix)
+---------------------------------------------------------------
+This file runs in two modes:
+  * ORCHESTRATOR (default, `python3 run.py`): imports NOTHING CUDA-related.
+    It spawns `python3 run.py --stage 1`, waits for it to FULLY exit, spawns
+    `--stage 2`, then merges the two stage CSVs into submission.csv.
+  * WORKER (`python3 run.py --stage N`): loads exactly ONE model and writes a
+    FULL single-model submission (answer + refs) — byte-for-byte the v16.4
+    (stage 1) / v16.1 (stage 2) image. vLLM/torch/transformers are imported
+    ONLY here, so the orchestrator never creates a CUDA context.
 
-A100 fallback (auto-detected): `kv_cache_dtype="auto"` keeps FP16 KV
-and we stay on MarlinFP8 dequant. Runtime ≈ exp56's measured 2h45m on
-A100. The same SIF runs on either GPU — no rebuild required.
+Why a subprocess per stage instead of `del engine; empty_cache()` in one
+process: in V1 multiprocessing the EngineCore already runs in a child, so the
+model's VRAM is reclaimed when that child exits — NOT by the parent's
+`torch.cuda.empty_cache()`, which only ever created a ~0.4 GiB context in the
+parent and left it resident. That residual context made Stage 2 measure
+slightly less free VRAM than a standalone v16.1 run → a marginally smaller KV
+pool → different scheduler batching → rare greedy token flips. Running each
+stage as its own process means the GPU is genuinely fresh for the second
+model: the worker is born, loads one model on a clean card, writes its CSV, and
+dies — identical to v16.1/v16.4 standalone BY CONSTRUCTION (no shared
+process/CUDA state, independent of vLLM teardown timing). Each stage CSV is
+therefore an independently scoreable v16.x submission: stage1 ↔ v16.4, stage2
+↔ v16.1.
 
-Doc-grouping (carry over from v16): both stages submit queries sorted
-by doc_id so vLLM's prefix cache reuses the full-doc prefilled KV blocks
-across all queries from the same doc (~5% → ~90% cache hit ceiling).
-CSV is written in the ORIGINAL queries order at the end.
+NO RETRIEVAL: the full list of *valid* paragraphs from `doc_id` is fed in
+document order. Both stages use the IDENTICAL cold V10_factual prompt.
+
+Container infra (carried from v16.1/v16.4):
+ - VLLM_USE_DEEP_GEMM=0 (before any torch/vllm import): forces the precompiled
+   CUTLASS/Marlin/NVFP4 path on the benchmark H100 (no nvcc JIT).
+ - Stage 1 (gemma NVFP4) strips the baked fp8-KV directive via
+   build_kv_neutralized_model so kv_cache_dtype="auto" → bf16 on A100 + H100.
+   A no-op for the A3B FP8 checkpoint.
+ - Each worker streams via LLMEngine.step() and pings the benchmark `progress`
+   binary per finished query (Stage 1 → 0..n/2, Stage 2 → n/2..n). The
+   orchestrator pings 0 at the start and n at the very end.
+ - Queries sorted by doc_id before submission (prefix-cache reuse); CSVs
+   written in ORIGINAL query order.
 
 Output: submission.csv with columns ID, abstractive, refs.
 """
@@ -61,174 +65,86 @@ import os
 import re
 import json
 import csv
-import gc
-import time
+import sys
+import glob
 import shutil
+import time
+import subprocess
 
-# --- Writable scratch for Triton's JIT kernel cache (MUST run before torch/
-# vllm/triton import) ---------------------------------------------------------
-# Qwen3.6-27B is a qwen3_next (linear-attention / Mamba-GDN) model: it
-# runtime-compiles many Triton FLA kernels at startup and writes them to a
-# cache dir. The benchmark backend launches the container with `--containall`,
-# whose session /tmp (and read-only /root/.triton) is a tiny tmpfs — the cache
-# write hits `OSError: [Errno 28] No space left on device` and the vLLM
-# EngineCore dies during profile_run (verified: job 5815781).
-#
-# v18 briefly anchored TMPDIR under RESULT_DIR. That fixed ENOSPC but polluted
-# the result upload tree with runtime temp/IPC files (e.g. sockets under
-# .cache/tmp), and the benchmark uploader later failed with "no such device or
-# address" before any progress was reported. v19 therefore keeps all runtime
-# scratch outside RESULT_DIR. Local Apptainer tests use a sibling of RESULT_DIR;
-# the Docker image provides /scratch for the benchmark backend.
-_result_dir_for_cache = Path(os.environ.get("RESULT_DIR", "/result/")).resolve()
-
-
-def _is_relative_to(path, parent):
-    try:
-        path.resolve().relative_to(parent.resolve())
-        return True
-    except ValueError:
-        return False
-    except OSError:
-        return False
-
-
-def _is_writable_dir(path):
-    try:
-        path.mkdir(parents=True, exist_ok=True)
-        marker = path / ".write_test"
-        with open(marker, "w", encoding="utf-8") as f:
-            f.write("ok")
-        marker.unlink(missing_ok=True)
-        return True
-    except OSError:
-        return False
-
-
-def _runtime_cache_candidates(result_dir):
-    for var in ("TEXTSUM_SCRATCH_DIR", "AIBENCHMARK_SCRATCH_DIR", "SCRATCH_DIR"):
-        root = os.environ.get(var)
-        if root:
-            yield Path(root) / "textsum-runtime-cache"
-
-    # If RESULT_DIR is a real path such as /lustre/.../result, its parent is the
-    # safest large writable filesystem while staying outside the upload root.
-    if result_dir.parent != result_dir and str(result_dir.parent) != os.sep:
-        yield result_dir.parent / "textsum-runtime-cache"
-
-    # Docker benchmark path. The Dockerfile creates /scratch with mode 1777.
-    yield Path("/scratch/textsum-runtime-cache")
-    yield Path("/var/tmp/textsum-runtime-cache")
-    yield Path("/tmp/textsum-runtime-cache")
-    yield Path("/textsum-runtime-cache")
-
-
-def _configure_runtime_cache():
-    seen = set()
-    for candidate in _runtime_cache_candidates(_result_dir_for_cache):
-        candidate = candidate.resolve()
-        key = str(candidate)
-        if key in seen:
-            continue
-        seen.add(key)
-        if _is_relative_to(candidate, _result_dir_for_cache):
-            continue
-        if _is_writable_dir(candidate):
-            break
-    else:
-        # Last resort: allow the job to attempt inference, but keep this path
-        # clean before exit so successful runs upload only submission.csv.
-        candidate = _result_dir_for_cache / ".cache" / "runtime"
-        candidate.mkdir(parents=True, exist_ok=True)
-
-    # The first three are the original Triton/XDG/tmp anchors. The rest (v21)
-    # are for the Hopper FP8 JIT path — DeepGEMM, FlashInfer and torch's
-    # cpp_extension all compile CUDA at first use and write caches under
-    # HOME/.cache, TORCH_EXTENSIONS_DIR, or CUDA_CACHE_PATH; under --containall
-    # those default to read-only or tiny tmpfs → ENOSPC/permission failure.
-    # Setting HOME here also redirects any ~/.cache/<tool> path we didn't name
-    # explicitly. HF_HOME is set separately in the image, so the baked weights
-    # are unaffected by the HOME change.
-    for _sub, _var in (("triton",     "TRITON_CACHE_DIR"),
-                       ("xdg",        "XDG_CACHE_HOME"),
-                       ("tmp",        "TMPDIR"),
-                       ("torch_ext",  "TORCH_EXTENSIONS_DIR"),
-                       ("cuda",       "CUDA_CACHE_PATH"),
-                       ("flashinfer", "FLASHINFER_WORKSPACE_BASE"),
-                       ("home",       "HOME")):
-        _d = candidate / _sub
-        _d.mkdir(parents=True, exist_ok=True)
-        os.environ[_var] = str(_d)
-    print(f"Runtime cache dir: {candidate}", flush=True)
-    return candidate
-
-
-def _cleanup_result_cache():
-    cache_dir = _result_dir_for_cache / ".cache"
-    if cache_dir.exists() and _is_relative_to(cache_dir, _result_dir_for_cache):
-        shutil.rmtree(cache_dir, ignore_errors=True)
-
-
-def _cleanup_runtime_cache():
-    if _runtime_cache_dir.exists():
-        shutil.rmtree(_runtime_cache_dir, ignore_errors=True)
-
-
-_cleanup_result_cache()
-_runtime_cache_dir = _configure_runtime_cache()
-for _sub, _var in (("triton", "TRITON_CACHE_DIR"),
-                   ("xdg",    "XDG_CACHE_HOME"),
-                   ("tmp",    "TMPDIR")):
-    _d = Path(os.environ[_var])
-    try:
-        _d.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
-
-# --- Hopper/H100: KEEP the native FP8 fast path (DeepGEMM + FlashInfer) -------
-# v19 crashed on the H100 benchmark backend because those Hopper-only kernels
-# JIT-compile with nvcc+ninja at first use and the runtime base image had no
-# nvcc (`nvcc: not found` / `ninja: build stopped`). v20 sidestepped it by
-# forcing the precompiled path; v21 instead KEEPS the FP8 path and makes it
-# work: the Dockerfile bakes cuda-toolkit (nvcc) into the image, and
-# _configure_runtime_cache() below routes EVERY JIT/compile cache
-# (TORCH_EXTENSIONS_DIR, CUDA_CACHE_PATH, FlashInfer workspace, HOME/.cache)
-# to writable scratch so the compile succeeds under --containall. The A100
-# backend-sim still exercises the precompiled path (SM 8.0 has no native FP8),
-# so the Hopper JIT branch is validated only by the real H100 submission.
-# (No VLLM_USE_DEEP_GEMM override — vLLM's Hopper default enables it.)
-
-import torch
-from transformers import AutoTokenizer
-from vllm import LLMEngine, EngineArgs, SamplingParams
+# --- H100/no-nvcc: force the precompiled FP8/NVFP4 path (see docstring) ------
+# Set in BOTH orchestrator and worker, BEFORE any torch/vllm import (the worker
+# imports vllm lazily; this guarantees the env is in place first).
+os.environ.setdefault("VLLM_USE_DEEP_GEMM", "0")
 
 TEST_DIR     = os.environ.get("TEST_DIR",     "/model/test")
 RESULT_DIR   = os.environ.get("RESULT_DIR",   "/result/")
 PROGRESS_LIB = os.environ.get("PROGRESS_LIB", "/benchmark_lib/progress")
 
-MAX_NEW_TOKENS         = int(os.environ.get("MAX_NEW_TOKENS",         "1024"))
-MAX_MODEL_LEN          = int(os.environ.get("MAX_MODEL_LEN",          "32768"))
-MAX_NUM_BATCHED_TOKENS = int(os.environ.get("MAX_NUM_BATCHED_TOKENS", "16384"))
-GPU_MEM_UTIL           = float(os.environ.get("GPU_MEM_UTIL",         "0.92"))
 
-# v22: Stage A ref-picker swapped Qwen3.6-27B-FP8 → gemma-4-31B-it-NVFP4
-# (the exp73 model). Loads at ~22 GB via vLLM's NvFp4LinearBackend.MARLIN
-# (auto-detected from config.json — no `quantization` arg). The Stage A
-# extra_kwargs below (dtype="bfloat16" + limit_mm_per_prompt to skip the
-# gemma-4 vision encoder) are already exactly exp73's loader, so only the
-# model name changes. Stage B (answer-writer) stays 32B-AWQ.
-MODEL_A   = os.environ.get("LLM_MODEL_STAGE_A", "RedHatAI/gemma-4-31B-it-NVFP4")
-MODEL_AWQ = os.environ.get("LLM_MODEL_STAGE_B", "Qwen/Qwen3-32B-AWQ")
+def _pick_writable_dir(candidates):
+    """First candidate we can actually create+write a file in.
+
+    Under apptainer --containall the image rootfs is read-only, so the baked
+    /scratch is NOT writable unless the host binds a dir over it; on the real
+    (docker) backend it IS. RESULT_DIR is the one location guaranteed writable
+    everywhere (the benchmark mounts it for submission.csv). Probe in
+    preference order and fall back to it so the gemma KV override never fails
+    for lack of a writable scratch."""
+    for d in candidates:
+        if not d:
+            continue
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".w_probe")
+            with open(probe, "w") as f:
+                f.write("x")
+            os.remove(probe)
+            return d
+        except OSError:
+            continue
+    return candidates[-1]
+
+
+# SCRATCH is ONLY for the gemma KV-override dir (tiny: symlinks + 2 small JSON).
+# stage CSVs go to RESULT_DIR directly (see stage_csv_path).
+SCRATCH = _pick_writable_dir([
+    os.environ.get("TEXTSUM_SCRATCH_DIR"),
+    "/scratch",
+    os.path.join(RESULT_DIR, "_scratch"),
+    "/tmp",
+])
+
+MAX_NEW_TOKENS = int(os.environ.get("MAX_NEW_TOKENS", "1024"))
+MAX_MODEL_LEN  = int(os.environ.get("MAX_MODEL_LEN",  "32768"))
+
+# Stage 1 = REFS model (v16.4 NVFP4 gemma); Stage 2 = ANSWER model (v16.1 A3B).
+# Each worker is its own process loading one model on a fresh GPU, so the
+# per-stage util/mnbt are EXACTLY the single-model values v16.4 / v16.1
+# validated → byte-identical engine config:
+#   Stage 1 gemma NVFP4 — v16.4: util 0.90 + mnbt 8192 (0.90 avoids the
+#     sampling-buffer OOM at 0.95 with the lighter ~18 GiB NVFP4 weights).
+#   Stage 2 A3B         — v16.1: util 0.95 + mnbt 16384.
+# Memory/throughput knobs only — greedy decode output unchanged.
+MODEL_STAGE1 = os.environ.get("LLM_MODEL_STAGE_1", "nvidia/Gemma-4-26B-A4B-NVFP4")          # refs  (v16.4)
+MODEL_STAGE2 = os.environ.get("LLM_MODEL_STAGE_2", "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8")  # answer(v16.1)
+STAGE1_UTIL  = float(os.environ.get("STAGE1_UTIL", "0.90"))   # gemma NVFP4 (v16.4)
+STAGE2_UTIL  = float(os.environ.get("STAGE2_UTIL", "0.95"))   # A3B (v16.1)
+STAGE1_MNBT  = int(os.environ.get("STAGE1_MNBT", "8192"))     # gemma NVFP4 (v16.4)
+STAGE2_MNBT  = int(os.environ.get("STAGE2_MNBT", "16384"))    # A3B (v16.1)
+
+STAGE_CFG = {
+    1: (MODEL_STAGE1, STAGE1_UTIL, STAGE1_MNBT, "gemma NVFP4 refs"),
+    2: (MODEL_STAGE2, STAGE2_UTIL, STAGE2_MNBT, "A3B answer"),
+}
 
 SYSTEM_MSG = (
     "คุณเป็นผู้ช่วยสรุปเอกสารภาษาไทย "
     "ตอบคำถามโดยอ้างอิงจากย่อหน้าที่ให้มาเท่านั้น ห้ามแต่งเติม"
 )
 
-# Few-shot pair — both from held-out doc_050, both stages reuse the same
-# shot QUERY/PARA/ANSWER triples; only the wrapping prompt differs.
-# Shot 1 = exp08 single-ref. Shot 2 = exp38 multi-ref (Q0746, 4 of 5
-# context paras are gold).
+# Few-shot pair — both from held-out doc_050. Shot 1 = exp08 single-ref,
+# Shot 2 = exp38 multi-ref (Q0746). IDENTICAL to v16.1 and v16.4 (both stages
+# run the SAME cold prompt — no hint variant, that is the whole point of v17.2).
 _SHOT1_QUERY = "ในการประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้นที่ใด"
 _SHOT1_PARAS = [
     "ครั้งที่ ๔๙",
@@ -270,24 +186,76 @@ def filter_valid_paragraphs(paragraphs):
     return [p for p in paragraphs if is_valid(p)]
 
 
-def is_hopper_or_newer():
-    """Return True if the visible GPU is H100 (SM 9.0) or newer.
+def build_kv_neutralized_model(model_name):
+    """Return a model path whose configs carry NO fp8-KV directive.
 
-    Drives the FP8-KV-cache + V1-friendly decisions below. We probe at
-    runtime rather than at build time because the SIF is shared across
-    A100 (LANTA local test) and H100 (benchmark backend) without rebuild.
+    nvidia/Gemma-4-26B-A4B-NVFP4 bakes "kv_cache_quant_algo": "FP8" into
+    hf_quant_config.json. With it present, vLLM's kv_cache_dtype="auto" promotes
+    KV to fp8_e4m3 → on A100 (sm80) there is no fp8e4nv reshape_and_cache
+    kernel, and on the H100 backend fp8-KV pulls the FlashInfer/DeepGEMM JIT
+    that needs nvcc. The exp75 dense fix (kv_cache_dtype="bfloat16") is rejected
+    too — this MoE selects TRITON_ATTN, whose kernel asserts kv_cache_dtype ∈
+    {"auto","fp8*"}. The only universal, JIT-free path is to make "auto"
+    resolve to bf16 by STRIPPING the directive. Idempotent. A no-op for
+    checkpoints with no kv directive (e.g. the A3B FP8 Stage-2 model) → returns
+    the snapshot/repo path unchanged.
     """
-    if not torch.cuda.is_available():
-        return False
-    try:
-        major, _ = torch.cuda.get_device_capability(0)
-    except Exception:
-        return False
-    return major >= 9
+    if os.path.isdir(model_name):
+        return model_name
+
+    hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    repo_dir = "models--" + model_name.replace("/", "--")
+    snap_glob = os.path.join(hf_home, "hub", repo_dir, "snapshots", "*")
+    snaps = sorted(glob.glob(snap_glob))
+    if not snaps:
+        return model_name
+    snap = snaps[-1]
+
+    quant_cfg = os.path.join(snap, "hf_quant_config.json")
+    has_kv_directive = False
+    if os.path.isfile(quant_cfg):
+        try:
+            qj = json.load(open(quant_cfg, encoding="utf-8"))
+            has_kv_directive = "kv_cache_quant_algo" in qj.get("quantization", {})
+        except (ValueError, OSError):
+            has_kv_directive = False
+    if not has_kv_directive:
+        return snap
+
+    ovr = os.path.join(SCRATCH, "model_override_" + model_name.replace("/", "--"))
+    shutil.rmtree(ovr, ignore_errors=True)
+    os.makedirs(ovr, exist_ok=True)
+    rewrite = {"config.json", "hf_quant_config.json"}
+    for name in os.listdir(snap):
+        if name in rewrite:
+            continue
+        os.symlink(os.path.join(snap, name), os.path.join(ovr, name))
+
+    qj = json.load(open(quant_cfg, encoding="utf-8"))
+    qj.get("quantization", {}).pop("kv_cache_quant_algo", None)
+    json.dump(qj, open(os.path.join(ovr, "hf_quant_config.json"), "w",
+                       encoding="utf-8"), indent=2)
+
+    cfg_path = os.path.join(snap, "config.json")
+    cj = json.load(open(cfg_path, encoding="utf-8"))
+    qc = cj.get("quantization_config", {})
+    qc.pop("kv_cache_scheme", None)
+    qc.pop("kv_cache_quant_algo", None)
+    json.dump(cj, open(os.path.join(ovr, "config.json"), "w",
+                       encoding="utf-8"), indent=2)
+
+    print(f"KV override: stripped fp8-KV directive → {ovr} (symlinked {snap})",
+          flush=True)
+    return ovr
 
 
-def build_prompt_v10(query, paras):
-    """Stage A — exp50/V10_factual prompt for ref-picking."""
+def build_prompt(query, paras):
+    """V10_factual — CONTEXT FIRST, then query, then instruction. Cold (no hint).
+
+    IDENTICAL to v16.1 and v16.4: answer "สั้นและตรงประเด็น", state only facts
+    present, then cite [อ้างอิง: X]. Both stages use this exact prompt — v17.2's
+    whole premise is two INDEPENDENT cold runs.
+    """
     context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
     return (
         f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
@@ -299,55 +267,15 @@ def build_prompt_v10(query, paras):
     )
 
 
-def build_prompt_exp38(query, paras):
-    """Stage B shot template (no hint) — exp38's E5 prompt."""
-    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
-    return (
-        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
-        f"คำถาม: {query}\n\n"
-        f"คำสั่ง: โปรดสรุปคำตอบเป็นภาษาไทยอย่างกระชับและครอบคลุม "
-        f"โดยอ้างอิงจากข้อมูลที่ให้มาเท่านั้น "
-        f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y]\n"
-        f"คำตอบ:"
-    )
-
-
-def build_prompt_exp38_with_hint(query, paras, hint_idx):
-    """Stage B — exp38's E5 prompt + the 'focus on paragraphs [...]' hint
-    pointing at Stage A's 1-based picks within the full doc.
-    """
-    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
-    hint_str = ", ".join(str(i) for i in hint_idx) if hint_idx else "—"
-    return (
-        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
-        f"คำถาม: {query}\n\n"
-        f"คำสั่ง: โปรดสรุปคำตอบเป็นภาษาไทยอย่างกระชับและครอบคลุม "
-        f"โดยอ้างอิงจากข้อมูลที่ให้มาเท่านั้น "
-        f"**โดยเน้นย่อหน้าหมายเลข [{hint_str}] เป็นข้อมูลหลัก** "
-        f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y]\n"
-        f"คำตอบ:"
-    )
-
-
-def build_messages_v10(query, paras):
+def build_messages(query, paras):
+    """System + 2 few-shot turns + the final user turn (cold)."""
     return [
         {"role": "system",    "content": SYSTEM_MSG},
-        {"role": "user",      "content": build_prompt_v10(_SHOT1_QUERY, _SHOT1_PARAS)},
+        {"role": "user",      "content": build_prompt(_SHOT1_QUERY, _SHOT1_PARAS)},
         {"role": "assistant", "content": _SHOT1_ANSWER},
-        {"role": "user",      "content": build_prompt_v10(_SHOT2_QUERY, _SHOT2_PARAS)},
+        {"role": "user",      "content": build_prompt(_SHOT2_QUERY, _SHOT2_PARAS)},
         {"role": "assistant", "content": _SHOT2_ANSWER},
-        {"role": "user",      "content": build_prompt_v10(query, paras)},
-    ]
-
-
-def build_messages_exp38_hint(query, paras, hint_idx):
-    return [
-        {"role": "system",    "content": SYSTEM_MSG},
-        {"role": "user",      "content": build_prompt_exp38(_SHOT1_QUERY, _SHOT1_PARAS)},
-        {"role": "assistant", "content": _SHOT1_ANSWER},
-        {"role": "user",      "content": build_prompt_exp38(_SHOT2_QUERY, _SHOT2_PARAS)},
-        {"role": "assistant", "content": _SHOT2_ANSWER},
-        {"role": "user",      "content": build_prompt_exp38_with_hint(query, paras, hint_idx)},
+        {"role": "user",      "content": build_prompt(query, paras)},
     ]
 
 
@@ -369,115 +297,43 @@ def split_answer(text):
     return re.sub(r'\s*\[อ้างอิง[^\]]*\]', '', text).strip()
 
 
-def make_engine_args(model_name, extra_kwargs):
-    """Build EngineArgs with H100-aware defaults.
-
-    Both stages share gpu_memory_utilization, max_model_len,
-    max_num_batched_tokens, enable_prefix_caching, enforce_eager,
-    and (on H100) kv_cache_dtype="fp8". Stage-specific knobs
-    (quantization, dtype, MM caps) come in via extra_kwargs.
-    """
-    # v21: re-enable the Hopper FP8 KV path (fp8 on H100, auto on A100). On
-    # Hopper this pulls in FlashInfer, which JIT-compiles with nvcc — now
-    # present in the image (cuda-toolkit baked in the Dockerfile) and with all
-    # JIT caches routed to writable scratch (see _configure_runtime_cache). On
-    # A100 "auto" keeps the precompiled path (the config that passed the sim).
-    kv = "fp8" if is_hopper_or_newer() else "auto"
-    base = dict(
-        model=model_name,
-        max_model_len=MAX_MODEL_LEN,
-        gpu_memory_utilization=GPU_MEM_UTIL,
-        max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
-        enable_prefix_caching=True,
-        enforce_eager=True,        # V0 in Apptainer; no torch.compile path
-        trust_remote_code=True,
-        kv_cache_dtype=kv,
-    )
-    base.update(extra_kwargs)
-    return EngineArgs(**base)
+def stage_csv_path(stage):
+    # In RESULT_DIR (guaranteed writable on every backend), not SCRATCH. Each
+    # is a full single-model submission — score _v17_2_stage1.csv against v16.4
+    # and _v17_2_stage2.csv against v16.1 to confirm per-column bit-identity.
+    return os.path.join(RESULT_DIR, f"_v17_2_stage{stage}.csv")
 
 
-def run_stage(stage_label, model_name, extra_kwargs, items, progress_fn):
-    """Load model, stream all `items` through engine.step(), free GPU.
+# ============================================================================
+# WORKER — loads ONE model, writes a full single-model submission CSV.
+# Byte-for-byte the v16.4 (stage 1) / v16.1 (stage 2) image.
+# ============================================================================
+def run_worker(stage):
+    # Heavy imports live ONLY here so the orchestrator process never touches
+    # CUDA / imports vllm. (torch is NOT imported — process exit frees the GPU,
+    # so no empty_cache() is needed; vLLM pulls its own torch internally.)
+    from transformers import AutoTokenizer
+    from vllm import LLMEngine, EngineArgs, SamplingParams
 
-    items: list of (key, messages) tuples — key is the stable index used
-    to map the raw output back to the caller's data structures.
-
-    progress_fn(n_done_in_stage): called once per finished request so
-    the benchmark `progress` binary keeps emitting heartbeats during
-    the stage. The caller decides how to translate stage-local progress
-    into overall 0..N progress (see split between Stages A and B in
-    main()).
-    """
-    print(f"\n=== {stage_label}: {model_name} ===", flush=True)
-    print(f"  H100 detected: {is_hopper_or_newer()} | "
-          f"kv_cache_dtype: {'fp8' if is_hopper_or_newer() else 'auto'} | "
-          f"gpu_mem_util: {GPU_MEM_UTIL} | "
-          f"max_num_batched_tokens: {MAX_NUM_BATCHED_TOKENS}",
-          flush=True)
-
-    engine = LLMEngine.from_engine_args(make_engine_args(model_name, extra_kwargs))
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS,
-                              repetition_penalty=1.05)
-
-    n = len(items)
-    for key, msgs in items:
-        prompt = tokenizer.apply_chat_template(
-            msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-        engine.add_request(request_id=str(key), prompt=prompt, params=sampling)
-
-    raw_by_key = {}
-    n_done = 0
-    t0 = time.time()
-    while engine.has_unfinished_requests():
-        for o in engine.step():
-            if o.finished:
-                raw_by_key[int(o.request_id)] = o.outputs[0].text.strip()
-                n_done += 1
-                progress_fn(n_done)
-                if n_done == 1 or n_done % 50 == 0 or n_done == n:
-                    elapsed = time.time() - t0
-                    rate = n_done / max(elapsed, 1e-6)
-                    eta = (n - n_done) / max(rate, 1e-6)
-                    print(f"  [{stage_label} {n_done}/{n}] {rate:.2f} q/s, eta {eta:.0f}s",
-                          flush=True)
-
-    # Free GPU before the next stage's weights land.
-    del engine, tokenizer
-    gc.collect()
-    torch.cuda.empty_cache()
-    return raw_by_key
-
-
-def main():
+    model_name, gpu_mem_util, mnbt, label = STAGE_CFG[stage]
     data = load_data(TEST_DIR)
     doc_index = {doc["doc_id"]: doc["paragraphs"] for doc in data["docs"]}
     queries = data["queries"]
     n = len(queries)
     half = n // 2
-    print(f"v22 hybrid (exp56 port, gemma Stage A): {n} queries, {len(doc_index)} docs | "
-          f"Stage A = {MODEL_A} | Stage B = {MODEL_AWQ} | "
-          f"max_model_len={MAX_MODEL_LEN}",
-          flush=True)
-    benchmark_lib(0)
+    print(f"[worker stage {stage}: {label}] {model_name} | {n} queries, "
+          f"{len(doc_index)} docs | util={gpu_mem_util} mnbt={mnbt} "
+          f"max_model_len={MAX_MODEL_LEN}", flush=True)
 
-    # Pre-build full-doc paragraph lists (in document order) once per doc.
-    doc_paras = {}
-    for doc_id, paragraphs in doc_index.items():
-        doc_paras[doc_id] = filter_valid_paragraphs(paragraphs)
+    doc_paras = {doc_id: filter_valid_paragraphs(paras)
+                 for doc_id, paras in doc_index.items()}
 
-    # Sort indices by doc_id so queries from the same doc are submitted
-    # contiguously to BOTH stages — vLLM's prefix cache then reuses the
-    # full-doc prefilled KV blocks across them. CSV is written in
-    # ORIGINAL queries order at the end (sort is internal only).
+    # Sort by doc_id so same-doc queries submit contiguously (prefix-cache).
+    # CSV is written in ORIGINAL query order at the end.
     order = sorted(range(n), key=lambda i: queries[i]["doc_id"])
 
-    # ----- Stage A items (key = position in sorted order) -----
+    items = []   # (k, qid, gen_pids, gen_texts, msgs, q_text) in submission order
     pool_sizes = []
-    stage_a_items = []
-    stage_a_gen_pids = {}
-    stage_a_gen_texts = {}
     for k, idx in enumerate(order):
         query = queries[idx]
         valid = doc_paras.get(query["doc_id"], [])
@@ -486,103 +342,143 @@ def main():
             gen_pids  = [p["para_id"] for p in valid]
             gen_texts = [p["text"]    for p in valid]
             pool_sizes.append(len(valid))
-            msgs = build_messages_v10(q_text, gen_texts)
+            msgs = build_messages(q_text, gen_texts)
         else:
-            gen_pids, gen_texts = [], []
-            msgs = [{"role": "user", "content": q_text}]
-        stage_a_items.append((k, msgs))
-        stage_a_gen_pids[k] = gen_pids
-        stage_a_gen_texts[k] = gen_texts
+            gen_pids, gen_texts, msgs = [], [], None
+        items.append((k, query["ID"], gen_pids, gen_texts, msgs, q_text))
     if pool_sizes:
-        print(f"pool sizes — mean={sum(pool_sizes)/len(pool_sizes):.2f}, "
+        print(f"  pool sizes — mean={sum(pool_sizes)/len(pool_sizes):.2f}, "
               f"min={min(pool_sizes)}, max={max(pool_sizes)}", flush=True)
 
-    # Progress: Stage A occupies the 0..n/2 half of the overall heartbeat
-    # range. Map stage-local n_done → overall via integer halving so the
-    # benchmark sees a smooth monotonic count.
-    raws_A = run_stage(
-        "Stage A (refs)", MODEL_A,
-        dict(dtype="bfloat16",
-             limit_mm_per_prompt={"image": 0, "video": 0}),
-        stage_a_items,
-        progress_fn=lambda i: benchmark_lib(i // 2),
-    )
+    # Stage 1 (gemma NVFP4) needs the fp8-KV directive stripped → override dir
+    # (exactly v16.4). Stage 2 (A3B) carries no kv directive and v16.1 passed
+    # the bare repo id to EngineArgs/AutoTokenizer → do the SAME here (don't
+    # route it through the override resolver) so the answer stage is the v16.1
+    # process verbatim.
+    model_path = build_kv_neutralized_model(model_name) if stage == 1 else model_name
+    engine = LLMEngine.from_engine_args(EngineArgs(
+        model=model_path,
+        max_model_len=MAX_MODEL_LEN,
+        gpu_memory_utilization=gpu_mem_util,
+        max_num_batched_tokens=mnbt,
+        dtype="bfloat16",
+        enforce_eager=True,
+        enable_prefix_caching=True,
+        trust_remote_code=True,
+        limit_mm_per_prompt={"image": 0, "video": 0},
+    ))
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    sampling = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS,
+                              repetition_penalty=1.05)
 
-    # Parse Stage A → refs + hint indices (per submission-order key k).
-    stage_a_refs = {}   # k -> list of para_id strings
-    stage_a_hint = {}   # k -> list of 1-based positions within full doc
-    for k in range(n):
-        raw = raws_A.get(k, "")
-        gen_pids = stage_a_gen_pids[k]
-        cited_idx = parse_citation(raw, len(gen_pids))
-        valid_idx = [j for j in cited_idx if j < len(gen_pids)]
-        ref_pids = [gen_pids[j] for j in valid_idx]
-        if not ref_pids and gen_pids:
-            ref_pids = [gen_pids[0]]
-            valid_idx = [0]
-        stage_a_refs[k] = ref_pids
-        stage_a_hint[k] = [j + 1 for j in valid_idx]
-    avg_refs_A = (sum(len(r) for r in stage_a_refs.values()) /
-                  max(len(stage_a_refs), 1))
-    print(f"Stage A: avg refs/query = {avg_refs_A:.2f}", flush=True)
-    del stage_a_items, raws_A
+    for k, it in enumerate(items):
+        msgs = it[4] if it[4] is not None else [{"role": "user", "content": it[5]}]
+        prompt = tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+        engine.add_request(request_id=str(k), prompt=prompt, params=sampling)
 
-    # ----- Stage B items (same submission order; carries the hint) -----
-    stage_b_items = []
-    for k, idx in enumerate(order):
-        query = queries[idx]
-        valid = doc_paras.get(query["doc_id"], [])
-        q_text = query["query"]
-        gen_texts = stage_a_gen_texts[k]
-        if valid:
-            msgs = build_messages_exp38_hint(q_text, gen_texts, stage_a_hint[k])
-        else:
-            msgs = [{"role": "user", "content": q_text}]
-        stage_b_items.append((k, msgs))
+    # Heartbeat: stage 1 fills 0..n/2, stage 2 fills n/2..n.
+    def ping(done):
+        benchmark_lib(done // 2 if stage == 1 else half + done // 2)
 
-    # Progress: Stage B occupies n/2..n half of the heartbeat range.
-    raws_B = run_stage(
-        "Stage B (answer)", MODEL_AWQ,
-        dict(quantization="awq_marlin", dtype="half"),
-        stage_b_items,
-        progress_fn=lambda i: benchmark_lib(half + i // 2),
-    )
+    raw_by_k = {}
+    n_done = 0
+    t0 = time.time()
+    while engine.has_unfinished_requests():
+        for o in engine.step():
+            if o.finished:
+                raw_by_k[int(o.request_id)] = o.outputs[0].text.strip()
+                n_done += 1
+                ping(n_done)
+                if n_done == 1 or n_done % 50 == 0 or n_done == n:
+                    elapsed = time.time() - t0
+                    rate = n_done / max(elapsed, 1e-6)
+                    eta = (n - n_done) / max(rate, 1e-6)
+                    print(f"  [stage {stage} {n_done}/{n}] {rate:.2f} q/s, eta {eta:.0f}s",
+                          flush=True)
 
-    # ----- Assemble final results (refs FIXED to Stage A) -----
-    empty_answers = 0
+    # Parse → full single-model submission (answer + refs), like v16.x.
+    cite_re = re.compile(r'\[อ้างอิง[:\s]+[0-9,\s]+\]')
+    n_explicit = 0
+    ref_counts = []
     results_by_qid = {}
-    for k, idx in enumerate(order):
-        query = queries[idx]
-        qid = query["ID"]
-        q_text = query["query"]
-        gen_texts = stage_a_gen_texts[k]
-        ref_pids = stage_a_refs[k]
-        raw = raws_B.get(k, "")
+    for k, it in enumerate(items):
+        _idx_k, qid, gen_pids, gen_texts, _m, q_text = it
+        raw = raw_by_k.get(k, "")
         answer = split_answer(raw)
+        cited_idx = parse_citation(raw, len(gen_pids))
+        if gen_pids:
+            ref_ids = [gen_pids[j] for j in cited_idx if j < len(gen_pids)]
+            if not ref_ids:
+                ref_ids = [gen_pids[0]]
+        else:
+            ref_ids = []
+        if cite_re.search(raw):
+            n_explicit += 1
         if not answer:
             answer = gen_texts[0] if gen_texts else q_text
-            empty_answers += 1
+        ref_counts.append(len(ref_ids))
         results_by_qid[qid] = {"ID": qid, "abstractive": answer,
-                               "refs": ",".join(ref_pids)}
-    print(f"empty_answers={empty_answers}", flush=True)
+                               "refs": ",".join(ref_ids)}
+    print(f"  [stage {stage}] citations: {n_explicit}/{n} tagged | "
+          f"avg refs/query {sum(ref_counts)/max(n,1):.2f}", flush=True)
 
-    # Write CSV in ORIGINAL queries order (not sorted submission order)
-    results = [results_by_qid[q["ID"]] for q in queries]
+    # Write this stage's full submission in ORIGINAL query order.
+    os.makedirs(RESULT_DIR, exist_ok=True)
+    out = stage_csv_path(stage)
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["ID", "abstractive", "refs"])
+        writer.writeheader()
+        writer.writerows(results_by_qid[q["ID"]] for q in queries)
+    print(f"  [stage {stage}] wrote {n} rows → {out}", flush=True)
+
+
+# ============================================================================
+# ORCHESTRATOR — spawns one process per stage, merges columns. NO CUDA here.
+# ============================================================================
+def read_stage_csv(stage):
+    with open(stage_csv_path(stage), encoding="utf-8") as f:
+        return {row["ID"]: row for row in csv.DictReader(f)}
+
+
+def orchestrate():
+    data = load_data(TEST_DIR)
+    queries = data["queries"]
+    n = len(queries)
+    print(f"v17.2 orchestrator: {n} queries | "
+          f"REFS(stage1)={MODEL_STAGE1} → ANSWER(stage2)={MODEL_STAGE2} | "
+          f"one process per stage (fresh GPU each)", flush=True)
+    benchmark_lib(0)
+
+    # Run each stage in its own process. check=True → any stage crash aborts
+    # before a half-baked submission is written. Each child fully exits before
+    # the next spawns, so the GPU is genuinely fresh for stage 2.
+    for stage in (1, 2):
+        print(f"\n=== spawning worker for stage {stage} ===", flush=True)
+        subprocess.run([sys.executable, os.path.abspath(__file__),
+                        "--stage", str(stage)], check=True)
+
+    # Merge: abstractive from stage 2 (A3B), refs from stage 1 (gemma).
+    refs_src = read_stage_csv(1)   # gemma → refs
+    ans_src  = read_stage_csv(2)   # A3B   → answer
+    results = [{"ID": q["ID"],
+                "abstractive": ans_src[q["ID"]]["abstractive"],
+                "refs":        refs_src[q["ID"]]["refs"]}
+               for q in queries]
+
     out_path = Path(RESULT_DIR) / "submission.csv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["ID", "abstractive", "refs"])
         writer.writeheader()
         writer.writerows(results)
-    print(f"Written {len(results)} rows to {out_path}", flush=True)
-    return n
+    print(f"\nMerged {len(results)} rows (A3B answer + gemma refs) → {out_path}",
+          flush=True)
+    benchmark_lib(n)   # final "fully done, CSV ready" ping
 
 
 if __name__ == "__main__":
-    try:
-        n = main()
-        _cleanup_result_cache()
-        benchmark_lib(n)   # final "fully done, CSV ready" ping
-    finally:
-        _cleanup_result_cache()
-        _cleanup_runtime_cache()
+    if "--stage" in sys.argv:
+        run_worker(int(sys.argv[sys.argv.index("--stage") + 1]))
+    else:
+        orchestrate()
