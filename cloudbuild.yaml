@@ -1,11 +1,11 @@
-# Build the v17.3 two-stage image (~36 GB of weights embedded: nvidia/Gemma-4-
+# Build the v17.4 two-stage image (~36 GB of weights embedded: nvidia/Gemma-4-
 # 26B-A4B-NVFP4 Stage 1 refs + Qwen/Qwen3-32B-AWQ Stage 2 answer) on Google
-# Cloud Build, then push to the competition registry. This is the independent
-# column-merge (32B-AWQ answer + gemma-NVFP4 refs = exp86's recipe, NEW BEST
-# 0.7235); v17.3 = v17.2 with Stage 2 swapped from v16.1's A3B to v15.2's
-# Qwen3-32B-AWQ answer-writer. Built on the v16.3 lean NO-nvcc base. GitHub
-# Actions can't do this (runner disk ~14 GB); LANTA podman is blocked (no
-# /etc/subuid). GCB gives a configurable disk.
+# Cloud Build, then push to the competition registry. This is the COUPLED ref-
+# hint pipe (32B-AWQ hinted answer + gemma-NVFP4 refs = exp86's ansB_refA, NEW
+# BEST 0.7235); v17.4 = v17.3 + Stage 1's ref indices hinting Stage 2 (v17.3 ran
+# the two models independently and column-merged). Built on the v16.3 lean
+# NO-nvcc base. GitHub Actions can't do this (runner disk ~14 GB); LANTA podman
+# is blocked (no /etc/subuid). GCB gives a configurable disk.
 #
 # PERSISTENT MODEL CACHE VIA GCS (same scheme as v16.3/v22): the weights are NOT
 # downloaded inside `docker build`. A GCS tar ($_HF_BUCKET/v17.3/hf-cache.tar)
@@ -13,9 +13,9 @@
 # (2) snapshot_download's only the models still missing, (3) re-uploads if
 # changed, then (4) bakes it into the image via `COPY hf-cache`. The heavy,
 # flaky HF pull happens at most ONCE, ever — warm rebuilds (e.g. a run.py edit)
-# skip it. This image uses its OWN tar (v17.3/ prefix — a FRESH cache so the
-# baked image carries the 32B-AWQ weights and no stale A3B), SEPARATE from
-# v17.2's, v17.1's and v16.x's tars.
+# skip it. v17.4's model SET is byte-identical to v17.3 (same gemma + 32B-AWQ),
+# so it REUSES the v17.3/ cache tar — no fresh 47 GB download/upload; only the
+# pushed image tag changes to :v17.4.
 #
 # Region: asia-southeast1 is the persistent default (gcloud config
 # builds/region + the regional default staging bucket) — submit with a bare
@@ -88,11 +88,15 @@ steps:
         # Inline cache from the previous image reuses the apt/pip/torch base
         # layers; the COPY hf-cache layer is cache-hit when the weights are
         # unchanged, so a run.py edit busts only the tiny final COPY model layer.
+        # cache-from v17.3 too: base/torch/vllm + the COPY hf-cache layer are
+        # identical (same weight set), so v17.4 reuses them and only the final
+        # COPY model layer (the edited run.py) rebuilds.
         DOCKER_BUILDKIT=1 docker build \
+          --cache-from $$IMG:v17.4 \
           --cache-from $$IMG:v17.3 \
           --build-arg BUILDKIT_INLINE_CACHE=1 \
-          -t $$IMG:v17.3 .
-        docker push $$IMG:v17.3
+          -t $$IMG:v17.4 .
+        docker push $$IMG:v17.4
 
 availableSecrets:
   secretManager:

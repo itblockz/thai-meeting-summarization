@@ -1,59 +1,63 @@
 """
-v17.3 — independent column-merge: ANSWER from v15.2, REFS from v16.4.
+v17.4 — COUPLED ref-hint pipe: gemma refs (Stage 1) HINT the 32B-AWQ answer
+(Stage 2). Final = ANSWER from Stage 2, REFS from Stage 1 (= exp86 `ansB_refA`).
 
-NOT v17.1. v17.1 was a *coupled* two-stage pipe — Stage 1's refs were fed to
-Stage 2 as a hint line. v17.3 runs the two single-model images **independently**
-(no hint, no handoff) and merges their CSVs column-wise: abstractive from one
-model, refs from the other. Score decomposes linearly under greedy decode, so
-the merged composite = answerModel(RougeL,SS) + refModel(IoU).
+v17.4 = v17.3 + ref-INDEX hint to Stage 2. v17.3 ran the two single-model
+images **independently** (no handoff) and column-merged their CSVs — that
+realizes the "paper" column-merge ceiling (~0.7243) where exp37's cold answer
+never saw a hint. v17.4 is the TRUE exp86 recipe: Stage 2's answer is actually
+generated WITH Stage 1's cited paragraph indices as a hint line (exp81's
+"ย่อหน้าที่เกี่ยวข้องเบื้องต้น: [X, Y]"), exactly as exp86 measured 0.7235
+leak-free. Ref-hinting costs ~−0.0008 vs the invalid column-merge ceiling but
+is the recipe that was actually scored (the answer was produced under the hint).
 
   Stage 1 — REFS source = v16.4 = nvidia/Gemma-4-26B-A4B-NVFP4 (26B MoE,
             ~4B active, NVFP4 experts ~18 GB load). Cold V10_factual + exp38
             shots, full doc. Record single-model citation IoU (exp77 0.8155).
-  Stage 2 — ANSWER source = v15.2 = Qwen/Qwen3-32B-AWQ (awq_marlin, dense).
-            exp37/exp38 E5 prompt + exp08 shot1 + exp38 multi-ref shot2,
-            full doc, max_new 512, util 0.90. The strong dense answer-writer
-            (v15.2 = exp38 single-model 0.6987 leak-free).
+            Emits refs AND a per-query HINT = 1-based positions of the paragraphs
+            it cited (a sidecar JSON the orchestrator hands to Stage 2). Still
+            byte-identical to v16.4 standalone (cold — the hint is derived from
+            its citations, it does not change Stage 1's generation).
+  Stage 2 — ANSWER source = Qwen/Qwen3-32B-AWQ (awq_marlin, dense). exp37 E5
+            prompt + exp08 shot1 + exp38 multi-ref shot2, full doc, max_new 512,
+            util 0.90. The final query turn now carries the exp81 hint line built
+            from Stage 1's indices (the SHOTS stay non-hinted, as in exp86). NO
+            LONGER byte-identical to v15.2 standalone — the hint is the point.
 
-This makes the merged image **exp86's recipe** (NEW BEST 0.7235): NVFP4 gemma
-Stage-A refs (IoU 0.8155) + Qwen3-32B-AWQ E5 Stage-B answer (RougeL/SS near
-exp37/exp38), the answer column from the 32B-AWQ dense model rather than
-v16.1's ~4B-active A3B. Each stage's CSV column we keep is its strength; the
-other column is discarded. Final = 32B-AWQ answer + gemma refs.
+Final = 32B-AWQ hinted answer + gemma refs (`ansB_refA`, exp86's best cell).
 
-The two stages NO LONGER share a prompt: Stage 1 (gemma) keeps V10_factual,
-Stage 2 (32B-AWQ) uses v15.2's E5 prompt. The shots (shot1 single-ref + shot2
-multi-ref Q0746) are byte-identical between v16.4 and v15.2, so only the
-instruction wording, model, and engine config diverge by stage.
+The two stages do NOT share a prompt: Stage 1 (gemma) keeps V10_factual, Stage
+2 (32B-AWQ) uses exp37's E5 prompt + the hint line. The shots (shot1 single-ref
++ shot2 multi-ref Q0746) are byte-identical across stages.
 
 PROCESS MODEL — one OS process PER STAGE (the bit-identical fix)
 ---------------------------------------------------------------
 This file runs in two modes:
   * ORCHESTRATOR (default, `python3 run.py`): imports NOTHING CUDA-related.
-    It spawns `python3 run.py --stage 1`, waits for it to FULLY exit, spawns
-    `--stage 2`, then merges the two stage CSVs into submission.csv.
-  * WORKER (`python3 run.py --stage N`): loads exactly ONE model and writes a
-    FULL single-model submission (answer + refs) — byte-for-byte the v16.4
-    (stage 1) / v15.2 (stage 2) image. vLLM/torch/transformers are imported
-    ONLY here, so the orchestrator never creates a CUDA context.
+    It spawns `python3 run.py --stage 1`, waits for it to FULLY exit (Stage 1
+    has by then written its refs CSV + the hint sidecar), spawns `--stage 2`,
+    then merges the two stage CSVs into submission.csv.
+  * WORKER (`python3 run.py --stage N`): loads exactly ONE model. Stage 1 writes
+    a full single-model submission (== v16.4) PLUS the hint sidecar; Stage 2
+    reads the hint sidecar and writes its hinted answer CSV. vLLM/torch/
+    transformers are imported ONLY here, so the orchestrator never creates a
+    CUDA context.
 
 Why a subprocess per stage instead of `del engine; empty_cache()` in one
 process: in V1 multiprocessing the EngineCore already runs in a child, so the
 model's VRAM is reclaimed when that child exits — NOT by the parent's
 `torch.cuda.empty_cache()`, which only ever created a ~0.4 GiB context in the
 parent and left it resident. That residual context made Stage 2 measure
-slightly less free VRAM than a standalone v15.2 run → a marginally smaller KV
-pool → different scheduler batching → rare greedy token flips. Running each
-stage as its own process means the GPU is genuinely fresh for the second
-model: the worker is born, loads one model on a clean card, writes its CSV, and
-dies — identical to v15.2/v16.4 standalone BY CONSTRUCTION (no shared
-process/CUDA state, independent of vLLM teardown timing). Each stage CSV is
-therefore an independently scoreable submission: stage1 ↔ v16.4, stage2 ↔
-v15.2.
+slightly less free VRAM than a standalone run → a marginally smaller KV pool →
+different scheduler batching → rare greedy token flips. Running each stage as
+its own process means the GPU is genuinely fresh for the second model: the
+worker is born, loads one model on a clean card, writes its CSV, and dies. The
+Stage 2 → Stage 1 handoff is the hint sidecar JSON on disk (RESULT_DIR), not
+shared process state, so the GPU is still reclaimed by OS process teardown.
 
 NO RETRIEVAL: the full list of *valid* paragraphs from `doc_id` is fed in
 document order. Stage 1 (gemma) uses the cold V10_factual prompt; Stage 2
-(32B-AWQ) uses v15.2's E5 prompt.
+(32B-AWQ) uses exp37's E5 prompt + Stage 1's ref-index hint.
 
 Container infra (carried from v15.2/v16.4):
  - VLLM_USE_DEEP_GEMM=0 (before any torch/vllm import): forces the precompiled
@@ -144,12 +148,17 @@ STAGE1_MAXNEW = int(os.environ.get("STAGE1_MAX_NEW_TOKENS", "1024"))  # gemma (v
 STAGE2_MAXNEW = int(os.environ.get("STAGE2_MAX_NEW_TOKENS", "512"))   # 32B-AWQ (v15.2)
 
 # Per-stage: (model, util, mnbt, max_new, prompt_style, label). prompt_style
-# selects the instruction wording — "v10" (V10_factual, gemma/v16.4) vs "e5"
-# (v15.2's exp37/exp38 E5 prompt).
+# selects the instruction wording — "v10" (V10_factual, gemma/v16.4) vs
+# "e5_hinted" (exp37's E5 prompt + Stage 1's ref-index hint on the query turn).
+# Stage 2 reads the hint sidecar Stage 1 wrote; the shot turns stay non-hinted.
 STAGE_CFG = {
-    1: (MODEL_STAGE1, STAGE1_UTIL, STAGE1_MNBT, STAGE1_MAXNEW, "v10", "gemma NVFP4 refs (v16.4)"),
-    2: (MODEL_STAGE2, STAGE2_UTIL, STAGE2_MNBT, STAGE2_MAXNEW, "e5",  "32B-AWQ answer (v15.2)"),
+    1: (MODEL_STAGE1, STAGE1_UTIL, STAGE1_MNBT, STAGE1_MAXNEW, "v10",       "gemma NVFP4 refs (v16.4)"),
+    2: (MODEL_STAGE2, STAGE2_UTIL, STAGE2_MNBT, STAGE2_MAXNEW, "e5_hinted", "32B-AWQ hinted answer (exp86 Stage B)"),
 }
+
+# Sidecar JSON the orchestrator hands Stage 1 → Stage 2: {ID: [1-based positions
+# of the paragraphs Stage 1 cited]}. In RESULT_DIR (writable on every backend).
+HINT_PATH = os.path.join(RESULT_DIR, "_v17_4_hint.json")
 
 SYSTEM_MSG = (
     "คุณเป็นผู้ช่วยสรุปเอกสารภาษาไทย "
@@ -158,8 +167,9 @@ SYSTEM_MSG = (
 
 # Few-shot pair — both from held-out doc_050. Shot 1 = exp08 single-ref,
 # Shot 2 = exp38 multi-ref (Q0746). The SHOT text is byte-identical across
-# v16.4 and v15.2; only the per-stage instruction wording differs (see
-# build_prompt). No hint variant — each stage is an independent cold run.
+# stages; only the per-stage instruction wording differs (see build_prompt).
+# The shot turns are ALWAYS non-hinted — the ref-index hint (exp81/exp86) is
+# added to the FINAL query turn only, and only for Stage 2 ("e5_hinted").
 _SHOT1_QUERY = "ในการประชุมสถาบันการเงินครั้งที่ 49 มีการจัดประชุมขึ้นที่ใด"
 _SHOT1_PARAS = [
     "ครั้งที่ ๔๙",
@@ -300,23 +310,54 @@ def build_prompt_e5(query, paras):
     )
 
 
-_PROMPT_BUILDERS = {"v10": build_prompt_v10, "e5": build_prompt_e5}
+def build_prompt_e5_hinted(query, paras, hint_idx):
+    """exp37 E5 prompt + exp81/exp86 ref-INDEX hint line (Stage 2, v17.4).
+
+    Inserts "ย่อหน้าที่เกี่ยวข้องเบื้องต้น: [X, Y]" between the query and the
+    instruction, and adds the "ใช้ย่อหน้าที่เกี่ยวข้องข้างต้นเป็นแนวทาง" clause —
+    byte-identical to exp86's build_prompt_B_hinted. hint_idx = Stage 1's 1-based
+    cited positions; empty → "—". The hint guides the answer; refs are still
+    fixed to Stage 1 (refA) in the merge, so a wrong hint can't corrupt refs.
+    """
+    context = "\n".join(f"[{i + 1}] {t}" for i, t in enumerate(paras))
+    hint_str = ", ".join(str(i) for i in hint_idx) if hint_idx else "—"
+    return (
+        f"ข้อมูลอ้างอิงจากเอกสาร:\n{context}\n\n"
+        f"คำถาม: {query}\n\n"
+        f"ย่อหน้าที่เกี่ยวข้องเบื้องต้น: [{hint_str}]\n\n"
+        f"คำสั่ง: โปรดสรุปคำตอบเป็นภาษาไทยอย่างกระชับและครอบคลุม "
+        f"โดยใช้ย่อหน้าที่เกี่ยวข้องข้างต้นเป็นแนวทาง "
+        f"โดยอ้างอิงจากข้อมูลที่ให้มาเท่านั้น "
+        f"จากนั้นระบุเลขย่อหน้าที่ใช้ในรูปแบบ [อ้างอิง: X] หรือ [อ้างอิง: X, Y]\n"
+        f"คำตอบ:"
+    )
 
 
-def build_messages(query, paras, prompt_style):
-    """System + 2 few-shot turns + the final user turn (cold).
+# "e5_hinted" reuses build_prompt_e5 for the (non-hinted) shot turns; the hinted
+# builder is applied to the FINAL query turn only (see build_messages).
+_PROMPT_BUILDERS = {"v10": build_prompt_v10, "e5": build_prompt_e5,
+                    "e5_hinted": build_prompt_e5}
 
-    prompt_style picks the instruction wording ("v10" gemma / "e5" 32B-AWQ);
-    the shot text is identical across stages, only the wording differs.
+
+def build_messages(query, paras, prompt_style, hint_idx=None):
+    """System + 2 few-shot turns + the final user turn.
+
+    prompt_style picks the instruction wording ("v10" gemma / "e5" cold /
+    "e5_hinted" Stage 2). The shot turns are ALWAYS non-hinted; for "e5_hinted"
+    the FINAL query turn carries Stage 1's ref-index hint (exp81/exp86).
     """
     build_prompt = _PROMPT_BUILDERS[prompt_style]
+    if prompt_style == "e5_hinted":
+        final_turn = build_prompt_e5_hinted(query, paras, hint_idx)
+    else:
+        final_turn = build_prompt(query, paras)
     return [
         {"role": "system",    "content": SYSTEM_MSG},
         {"role": "user",      "content": build_prompt(_SHOT1_QUERY, _SHOT1_PARAS)},
         {"role": "assistant", "content": _SHOT1_ANSWER},
         {"role": "user",      "content": build_prompt(_SHOT2_QUERY, _SHOT2_PARAS)},
         {"role": "assistant", "content": _SHOT2_ANSWER},
-        {"role": "user",      "content": build_prompt(query, paras)},
+        {"role": "user",      "content": final_turn},
     ]
 
 
@@ -339,15 +380,17 @@ def split_answer(text):
 
 
 def stage_csv_path(stage):
-    # In RESULT_DIR (guaranteed writable on every backend), not SCRATCH. Each
-    # is a full single-model submission — score _v17_3_stage1.csv against v16.4
-    # and _v17_3_stage2.csv against v15.2 to confirm per-column bit-identity.
-    return os.path.join(RESULT_DIR, f"_v17_3_stage{stage}.csv")
+    # In RESULT_DIR (guaranteed writable on every backend), not SCRATCH.
+    # stage1.csv is a full single-model submission == v16.4 standalone (cold);
+    # stage2.csv is the 32B-AWQ submission generated UNDER the stage-1 hint (NOT
+    # == v15.2 anymore — the hint is the v17.4 change).
+    return os.path.join(RESULT_DIR, f"_v17_4_stage{stage}.csv")
 
 
 # ============================================================================
 # WORKER — loads ONE model, writes a full single-model submission CSV.
-# Byte-for-byte the v16.4 (stage 1) / v15.2 (stage 2) image.
+# Stage 1 == v16.4 standalone (cold) + writes the ref-index hint sidecar;
+# Stage 2 = 32B-AWQ generated under that hint (exp86 Stage B).
 # ============================================================================
 def run_worker(stage):
     # Heavy imports live ONLY here so the orchestrator process never touches
@@ -369,6 +412,14 @@ def run_worker(stage):
     doc_paras = {doc_id: filter_valid_paragraphs(paras)
                  for doc_id, paras in doc_index.items()}
 
+    # Stage 2 reads Stage 1's ref-index hint (written when stage 1 fully exited).
+    hint_by_qid = {}
+    if prompt_style == "e5_hinted":
+        with open(HINT_PATH, encoding="utf-8") as f:
+            hint_by_qid = json.load(f)
+        print(f"  loaded ref-index hints for {len(hint_by_qid)} queries "
+              f"← {HINT_PATH}", flush=True)
+
     # Sort by doc_id so same-doc queries submit contiguously (prefix-cache).
     # CSV is written in ORIGINAL query order at the end.
     order = sorted(range(n), key=lambda i: queries[i]["doc_id"])
@@ -383,7 +434,8 @@ def run_worker(stage):
             gen_pids  = [p["para_id"] for p in valid]
             gen_texts = [p["text"]    for p in valid]
             pool_sizes.append(len(valid))
-            msgs = build_messages(q_text, gen_texts, prompt_style)
+            hint_idx = hint_by_qid.get(query["ID"]) if prompt_style == "e5_hinted" else None
+            msgs = build_messages(q_text, gen_texts, prompt_style, hint_idx)
         else:
             gen_pids, gen_texts, msgs = [], [], None
         items.append((k, query["ID"], gen_pids, gen_texts, msgs, q_text))
@@ -462,17 +514,21 @@ def run_worker(stage):
     n_explicit = 0
     ref_counts = []
     results_by_qid = {}
+    hint_by_qid = {}   # stage 1 only: ID → 1-based cited positions (exp86 hint)
     for k, it in enumerate(items):
         _idx_k, qid, gen_pids, gen_texts, _m, q_text = it
         raw = raw_by_k.get(k, "")
         answer = split_answer(raw)
         cited_idx = parse_citation(raw, len(gen_pids))
         if gen_pids:
-            ref_ids = [gen_pids[j] for j in cited_idx if j < len(gen_pids)]
-            if not ref_ids:
-                ref_ids = [gen_pids[0]]
+            cited = [j for j in cited_idx if j < len(gen_pids)]
+            if not cited:
+                cited = [0]   # fallback to para 1, like v16.x / exp86
+            ref_ids = [gen_pids[j] for j in cited]
         else:
-            ref_ids = []
+            cited, ref_ids = [], []
+        # exp86 hint = 1-based positions of the paragraphs Stage 1 cited.
+        hint_by_qid[qid] = [j + 1 for j in cited]
         if cite_re.search(raw):
             n_explicit += 1
         if not answer:
@@ -492,6 +548,14 @@ def run_worker(stage):
         writer.writerows(results_by_qid[q["ID"]] for q in queries)
     print(f"  [stage {stage}] wrote {n} rows → {out}", flush=True)
 
+    # Stage 1 hands its ref-index hint to Stage 2 via a sidecar JSON. Written
+    # AFTER the CSV so its presence implies stage 1 fully succeeded.
+    if stage == 1:
+        with open(HINT_PATH, "w", encoding="utf-8") as f:
+            json.dump(hint_by_qid, f, ensure_ascii=False)
+        print(f"  [stage 1] wrote ref-index hints for {len(hint_by_qid)} "
+              f"queries → {HINT_PATH}", flush=True)
+
 
 # ============================================================================
 # ORCHESTRATOR — spawns one process per stage, merges columns. NO CUDA here.
@@ -505,22 +569,25 @@ def orchestrate():
     data = load_data(TEST_DIR)
     queries = data["queries"]
     n = len(queries)
-    print(f"v17.3 orchestrator: {n} queries | "
-          f"REFS(stage1)={MODEL_STAGE1} → ANSWER(stage2)={MODEL_STAGE2} | "
+    print(f"v17.4 orchestrator: {n} queries | "
+          f"REFS+hint(stage1)={MODEL_STAGE1} → hinted ANSWER(stage2)={MODEL_STAGE2} | "
           f"one process per stage (fresh GPU each)", flush=True)
     benchmark_lib(0)
 
     # Run each stage in its own process. check=True → any stage crash aborts
     # before a half-baked submission is written. Each child fully exits before
-    # the next spawns, so the GPU is genuinely fresh for stage 2.
+    # the next spawns, so the GPU is genuinely fresh for stage 2. Stage 1 writes
+    # the ref-index hint sidecar before it exits; stage 2 reads it on startup.
     for stage in (1, 2):
         print(f"\n=== spawning worker for stage {stage} ===", flush=True)
         subprocess.run([sys.executable, os.path.abspath(__file__),
                         "--stage", str(stage)], check=True)
 
-    # Merge: abstractive from stage 2 (32B-AWQ), refs from stage 1 (gemma).
-    refs_src = read_stage_csv(1)   # gemma   → refs
-    ans_src  = read_stage_csv(2)   # 32B-AWQ → answer
+    # Merge = exp86 ansB_refA: abstractive from stage 2 (32B-AWQ, hinted), refs
+    # from stage 1 (gemma). Refs stay fixed to Stage 1 — Stage 2's own citations
+    # (refB) are discarded — so the hint can only move the answer, never the refs.
+    refs_src = read_stage_csv(1)   # gemma         → refs
+    ans_src  = read_stage_csv(2)   # 32B-AWQ hinted → answer
     results = [{"ID": q["ID"],
                 "abstractive": ans_src[q["ID"]]["abstractive"],
                 "refs":        refs_src[q["ID"]]["refs"]}
@@ -532,8 +599,8 @@ def orchestrate():
         writer = csv.DictWriter(f, fieldnames=["ID", "abstractive", "refs"])
         writer.writeheader()
         writer.writerows(results)
-    print(f"\nMerged {len(results)} rows (32B-AWQ answer + gemma refs) → {out_path}",
-          flush=True)
+    print(f"\nMerged {len(results)} rows (32B-AWQ hinted answer + gemma refs, "
+          f"exp86 ansB_refA) → {out_path}", flush=True)
     benchmark_lib(n)   # final "fully done, CSV ready" ping
 
 
