@@ -421,8 +421,15 @@ def run_worker(stage):
               f"← {HINT_PATH}", flush=True)
 
     # Sort by doc_id so same-doc queries submit contiguously (prefix-cache).
-    # CSV is written in ORIGINAL query order at the end.
-    order = sorted(range(n), key=lambda i: queries[i]["doc_id"])
+    # CSV is written in ORIGINAL query order at the end. TEXTSUM_SUBMIT_ORDER=
+    # original disables the sort (matches exp77's unsorted llm.generate path) —
+    # a diagnostic toggle; "doc_id" (default) is the production prefix-cache mode.
+    submit_order = os.environ.get("TEXTSUM_SUBMIT_ORDER", "doc_id")
+    if submit_order == "original":
+        order = list(range(n))
+    else:
+        order = sorted(range(n), key=lambda i: queries[i]["doc_id"])
+    print(f"  submit order = {submit_order}", flush=True)
 
     items = []   # (k, qid, gen_pids, gen_texts, msgs, q_text) in submission order
     pool_sizes = []
