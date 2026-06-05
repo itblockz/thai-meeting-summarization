@@ -31,7 +31,9 @@ module load cray-python/3.11.7
 source "$SHARED/venv/bin/activate"
 
 export TEST_DIR="$PROJECT/textsum/eval_train"
-export RESULT_DIR="$PROJECT/textsum/eval_train/result_v17.4"
+# RESULT_DIR overridable (e.g. an order-diagnostic run into a separate dir):
+#   sbatch --export=ALL,RESULT_DIR=...,TEXTSUM_SUBMIT_ORDER=original submit_eval_train_v17.4.sh
+export RESULT_DIR="${RESULT_DIR:-$PROJECT/textsum/eval_train/result_v17.4}"
 export PROGRESS_LIB="$PROJECT/textsum/benchmark_lib/progress"
 export MAX_MODEL_LEN="32768"
 # gemma NVFP4 bakes an fp8-KV directive that run.py strips into a scratch
