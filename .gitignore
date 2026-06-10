@@ -16,3 +16,8 @@ prompt_lab/dev_sample.json
 exp_hybrid_*/submission.csv
 hybrid_*/submission.csv
 model_override/
+
+# purged competition data (do not re-commit)
+textsum/model/test/test.json
+*.npz
+eval_retrieval/cache/
